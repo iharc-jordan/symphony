@@ -21,6 +21,7 @@ defmodule SymphonyElixir.AppServerTest do
       File.write!(codex_binary, """
       #!/bin/sh
       trace_file="$SYMP_TEST_CODEx_TRACE"
+      printf '%s\\n' "$@" > "$trace_file.args"
       count=0
       while IFS= read -r line; do
         count=$((count + 1))
@@ -92,6 +93,20 @@ defmodule SymphonyElixir.AppServerTest do
                         thread_id: "thread-managed",
                         turn_id: "turn-managed"
                       }}
+
+      permission_config =
+        (trace_file <> ".args")
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.find(&String.starts_with?(&1, "permissions.symphony_worker.filesystem="))
+
+      assert {:ok, parsed_permissions} = TomlElixir.decode(permission_config)
+      filesystem = get_in(parsed_permissions, ["permissions", "symphony_worker", "filesystem"])
+      assert filesystem[workspace] == "write"
+      assert filesystem[Path.join(workspace, ".git")] == "write"
+      assert filesystem[workspace_root] == "deny"
+      assert filesystem["~/.codex"] == "deny"
+      assert filesystem["~/.config/codex-orchestration"] == "deny"
 
       payloads =
         trace_file

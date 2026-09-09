@@ -741,7 +741,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     filesystem =
       managed_filesystem_paths(workspace)
       |> Enum.map(&{&1, "deny"})
-      |> Kernel.++([{workspace, "write"}, {":workspace_roots", {:table, [{".", "write"}]}}])
+      |> Kernel.++([
+        {workspace, "write"},
+        {Path.join(workspace, ".git"), "write"},
+        {":workspace_roots", {:table, [{".", "write"}]}}
+      ])
       |> toml_inline_table()
 
     config_overrides = [
