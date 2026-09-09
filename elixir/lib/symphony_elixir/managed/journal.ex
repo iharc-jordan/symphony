@@ -32,7 +32,6 @@ defmodule SymphonyElixir.Managed.Journal do
     case :disk_log.log(name, record) do
       :ok -> sync(name)
       {:error, reason} -> {:error, reason}
-      other -> {:error, other}
     end
   end
 
@@ -50,17 +49,14 @@ defmodule SymphonyElixir.Managed.Journal do
       {:ok, ^name} ->
         {:ok, name}
 
-      {:repaired, ^name, _recovered, 0} ->
+      {:repaired, ^name, {:recovered, _recovered}, {:badbytes, 0}} ->
         {:ok, name}
 
-      {:repaired, ^name, _recovered, bad_bytes} ->
+      {:repaired, ^name, {:recovered, _recovered}, {:badbytes, bad_bytes}} ->
         {:error, {:managed_journal_corrupt, bad_bytes}}
 
       {:error, reason} ->
         {:error, {:managed_journal_open_failed, reason}}
-
-      other ->
-        {:error, {:managed_journal_open_failed, other}}
     end
   end
 
@@ -78,12 +74,6 @@ defmodule SymphonyElixir.Managed.Journal do
 
       {next, records} when is_list(records) ->
         continue_records(name, next, records, latest)
-
-      {next, records, bad_bytes} when is_list(records) and bad_bytes == 0 ->
-        continue_records(name, next, records, latest)
-
-      {_next, _records, bad_bytes} ->
-        {:error, {:managed_journal_corrupt, bad_bytes}}
 
       {:error, reason} ->
         {:error, reason}
@@ -113,11 +103,7 @@ defmodule SymphonyElixir.Managed.Journal do
   end
 
   defp sync(name) do
-    case :disk_log.sync(name) do
-      :ok -> :ok
-      {:error, reason} -> {:error, reason}
-      other -> {:error, other}
-    end
+    :disk_log.sync(name)
   end
 
   defp ensure_parent(path) do

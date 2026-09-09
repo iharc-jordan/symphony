@@ -19,14 +19,16 @@ defmodule SymphonyElixir.Managed.Control do
     call(orchestrator, {:managed_events, after_cursor, min(limit, 100)}, timeout)
   end
 
-  @spec submit(GenServer.server(), map(), timeout()) :: {:ok, map()} | {:error, term()}
+  @spec submit(GenServer.server(), map(), timeout()) ::
+          {:ok, map()} | {:error, term()} | {:error, atom(), map()}
   def submit(orchestrator \\ SymphonyElixir.Orchestrator, envelope, timeout \\ 15_000)
       when is_map(envelope) do
     call(orchestrator, {:managed_control, envelope}, timeout)
   end
 
   @doc false
-  @spec reconcile(GenServer.server(), String.t(), map(), timeout()) :: {:ok, map()} | {:error, term()}
+  @spec reconcile(GenServer.server(), String.t(), map(), timeout()) ::
+          {:ok, map()} | {:error, term()} | {:error, atom(), map()}
   def reconcile(orchestrator \\ SymphonyElixir.Orchestrator, assignment_id, facts, timeout \\ 15_000)
       when is_binary(assignment_id) and is_map(facts) do
     call(orchestrator, {:managed_reconcile, assignment_id, facts}, timeout)
