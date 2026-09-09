@@ -1190,7 +1190,11 @@ defmodule SymphonyElixir.Orchestrator do
       observed_repository_id = source_native_repository_id(issue)
       observed_project_item_id = source_native_value(issue, :project_item_id)
 
-      stop_pending = Map.has_key?(state.running, assignment_id)
+      # A source refresh may legitimately observe the provider's state change
+      # that the managed dispatch just requested. Only a phase mismatch or an
+      # already pending stop invalidates the owned run; metadata refreshes must
+      # be journaled without killing a healthy worker.
+      stop_pending = assignment[:stop_pending] == true or target != assignment[:phase]
 
       source_changed? =
         target != assignment[:phase] or assignment[:stop_pending] == true or
@@ -1230,8 +1234,9 @@ defmodule SymphonyElixir.Orchestrator do
 
         case persist_managed_data(state, data) do
           {:ok, reconciled_state} ->
+            next_state = if stop_pending, do: managed_stop_owned_process(reconciled_state, assignment_id), else: reconciled_state
             result = if target == assignment[:phase] and not stop_pending, do: :unchanged, else: {:changed, target}
-            {:ok, managed_stop_owned_process(reconciled_state, assignment_id), result}
+            {:ok, next_state, result}
 
           {:error, reason} ->
             {:error, state, {:managed_journal_write_failed, reason}}

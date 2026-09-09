@@ -214,7 +214,7 @@ defmodule SymphonyElixir.Managed.Rules do
   end
 
   @spec phase(atom() | String.t()) :: atom()
-  @known_phases ~w(idle bound ready active waiting review accepted cancelled)a
+  @known_phases ~w(idle bound ready active waiting review rework accepted cancelled)a
   @phase_aliases %{
     "idle" => :idle,
     "bound" => :bound,
@@ -225,6 +225,7 @@ defmodule SymphonyElixir.Managed.Rules do
     "in-progress" => :active,
     "waiting" => :waiting,
     "blocked" => :waiting,
+    "rework" => :rework,
     "review" => :review,
     "in_review" => :review,
     "in-review" => :review,
@@ -388,7 +389,7 @@ defmodule SymphonyElixir.Managed.Rules do
              :ok <- evidence_present(evidence),
              :ok <- dependencies_accepted(assignment, state),
              :ok <- external_effects_reconciled(context) do
-          {:ok, :accepted, %{evidence: normalize_evidence(evidence), issue_close: :ok}, %{operation: :review, disposition: :accepted, issue_close: :ok}}
+          {:ok, :accepted, %{board_state: :accepted, evidence: normalize_evidence(evidence), issue_close: :ok}, %{operation: :review, disposition: :accepted, issue_close: :ok}}
         end
 
       disposition in [:waiting, :rework] ->
@@ -396,14 +397,14 @@ defmodule SymphonyElixir.Managed.Rules do
 
         with :ok <- present(reason, :reason) do
           next_phase = if disposition == :waiting, do: :waiting, else: :ready
-          {:ok, next_phase, %{disposition_reason: reason}, %{operation: :review, disposition: disposition, reason: reason}}
+          {:ok, next_phase, %{board_state: next_phase, disposition_reason: reason}, %{operation: :review, disposition: disposition, reason: reason}}
         end
 
       disposition == :blocked ->
         reason = text_value(args, :reason)
 
         with :ok <- present(reason, :reason) do
-          {:ok, :waiting, %{blocked_reason: reason}, %{operation: :review, disposition: :blocked, reason: reason}}
+          {:ok, :waiting, %{board_state: :waiting, blocked_reason: reason}, %{operation: :review, disposition: :blocked, reason: reason}}
         end
 
       true ->

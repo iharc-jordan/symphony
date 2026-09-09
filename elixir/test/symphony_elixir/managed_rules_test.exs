@@ -65,8 +65,47 @@ defmodule SymphonyElixir.ManagedRulesTest do
     assert Rules.phase("READY") == :ready
     assert Rules.phase("in-progress") == :active
     assert Rules.phase("blocked") == :waiting
+    assert Rules.phase("rework") == :rework
     assert Rules.phase("attacker_supplied_atom_name") == :unknown
     assert Rules.phase(:attacker_supplied_atom_name) == :unknown
+  end
+
+  test "review dispositions map rework to READY and blocked to WAITING" do
+    state =
+      enrolled_state("issue-1")
+      |> put_in([:assignments, "issue-1", :phase], :review)
+      |> put_in([:assignments, "issue-1", :board_state], :review)
+      |> put_in([:assignments, "issue-1", :revision], 2)
+
+    rework =
+      envelope("review-rework", :review, %{
+        assignment_id: "issue-1",
+        expected_revision: 2,
+        disposition: "rework",
+        reason: "needs changes"
+      })
+
+    assert {:ok, intent} = Rules.prepare_review(state, rework)
+    assert intent.disposition == :rework
+    refute intent.requires_effects
+
+    assert {:ok, reworked, rework_response} = Rules.apply(state, rework)
+    assert rework_response.phase == :ready
+    assert reworked.assignments["issue-1"].phase == :ready
+    assert reworked.assignments["issue-1"].board_state == :ready
+
+    blocked =
+      envelope("review-blocked", :review, %{
+        assignment_id: "issue-1",
+        expected_revision: 2,
+        disposition: "blocked",
+        reason: "waiting on dependency"
+      })
+
+    assert {:ok, blocked_state, blocked_response} = Rules.apply(state, blocked)
+    assert blocked_response.phase == :waiting
+    assert blocked_state.assignments["issue-1"].phase == :waiting
+    assert blocked_state.assignments["issue-1"].board_state == :waiting
   end
 
   test "request ids replay the recorded response and reject changed input" do

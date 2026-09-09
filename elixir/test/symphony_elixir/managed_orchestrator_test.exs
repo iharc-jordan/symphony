@@ -507,7 +507,7 @@ defmodule SymphonyElixir.ManagedOrchestratorSourceReconciliationTest do
     }
   end
 
-  test "source refresh persists native IDs and rejects changed material before a turn" do
+  test "source polling persists READY to ACTIVE and metadata refreshes without stopping the worker" do
     workflow_path = Workflow.workflow_file_path()
     write_workflow_file!(workflow_path, tracker_kind: "github_projects")
 
@@ -583,21 +583,55 @@ defmodule SymphonyElixir.ManagedOrchestratorSourceReconciliationTest do
             generation: 1,
             attempt_id: "attempt-1",
             turn_limit: 2,
-            turns_reserved: 0
+            turns_reserved: 0,
+            source_authoritative: true,
+            source_state: "READY"
           })
         )
 
-      %{state | managed: %{journal: journal, data: data, effects: SymphonyElixir.ManagedReviewEffectsStub, source_fetcher: fn _ids -> {:ok, [issue]} end}, poll_check_in_progress: true}
+      fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+      running = %{
+        pid: fake_pid,
+        ref: make_ref(),
+        managed_attempt: %{assignment_id: "item-1", revision: 1, generation: 1, attempt_id: "attempt-1"}
+      }
+
+      %{
+        state
+        | managed: %{journal: journal, data: data, effects: SymphonyElixir.ManagedReviewEffectsStub, source_fetcher: fn _ids -> {:ok, [issue]} end},
+          running: %{"item-1" => running},
+          poll_check_in_progress: true
+      }
     end)
 
     attempt = %{assignment_id: "item-1", revision: 1, generation: 1, attempt_id: "attempt-1"}
     assert :allow = GenServer.call(pid, {:managed_before_turn, %{attempt: attempt}})
+    assert Process.alive?(:sys.get_state(pid).running["item-1"].pid)
 
     assert {:ok, snapshot} = Control.state(pid)
     assignment = snapshot.assignments["item-1"]
     assert assignment.native_issue_id == "I_1"
     assert assignment.native_repository_id == "R_1"
     assert assignment.project_item_id == "item-1"
+    assert assignment.source_state == "ACTIVE"
+    assert assignment.revision == 1
+    assert snapshot.revision == 2
+
+    metadata_refresh = %{issue | state: "active"}
+
+    :sys.replace_state(pid, fn state ->
+      %{state | managed: %{state.managed | source_fetcher: fn _ids -> {:ok, [metadata_refresh]} end}}
+    end)
+
+    assert :allow = GenServer.call(pid, {:managed_before_turn, %{attempt: attempt}})
+    assert Process.alive?(:sys.get_state(pid).running["item-1"].pid)
+
+    assert {:ok, refreshed_snapshot} = Control.state(pid)
+    assert refreshed_snapshot.assignments["item-1"].source_state == "active"
+    assert refreshed_snapshot.assignments["item-1"].phase == :active
+    assert refreshed_snapshot.assignments["item-1"].revision == 1
+    assert refreshed_snapshot.revision == 2
 
     changed_issue = %{issue | description: "changed"}
 
@@ -607,6 +641,8 @@ defmodule SymphonyElixir.ManagedOrchestratorSourceReconciliationTest do
 
     assert {:stop, :managed_source_material_changed} =
              GenServer.call(pid, {:managed_before_turn, %{attempt: attempt}})
+
+    Process.exit(:sys.get_state(pid).running["item-1"].pid, :kill)
   end
 end
 
