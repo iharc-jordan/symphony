@@ -13,8 +13,7 @@ defmodule SymphonyElixir.HookContext do
 
   @type issue_like :: map() | String.t() | nil
   @type encode_error ::
-          :invalid_issue_context
-          | {:invalid_native_ref, term()}
+          {:invalid_native_ref, term()}
           | {:too_large, non_neg_integer(), pos_integer()}
 
   @forbidden_key ~r/(?:^|[_-])(?:api[_-]?key|auth|authorization|access[_-]?token|refresh[_-]?token|bearer[_-]?token|client[_-]?secret|credential(?:s)?|password|passwd|private[_-]?key(?:[_-]?file)?|secret|token|cookie|body|description|title|command(?:s)?|executable|payload|user(?:[_-]?info)?|author)(?:$|[_-])/i
@@ -56,15 +55,12 @@ defmodule SymphonyElixir.HookContext do
   end
 
   defp encode_context(context) do
-    case Jason.encode(context) do
-      {:ok, encoded} when byte_size(encoded) <= @max_bytes ->
-        {:ok, encoded}
+    encoded = Jason.encode!(context)
 
-      {:ok, encoded} ->
-        {:error, {:too_large, byte_size(encoded), @max_bytes}}
-
-      {:error, _reason} ->
-        {:error, :invalid_issue_context}
+    if byte_size(encoded) <= @max_bytes do
+      {:ok, encoded}
+    else
+      {:error, {:too_large, byte_size(encoded), @max_bytes}}
     end
   end
 
