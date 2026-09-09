@@ -25,6 +25,16 @@ defmodule SymphonyElixir.ManagedDeferredTransitionStub do
   end
 end
 
+defmodule SymphonyElixir.ManagedCountingTransitionStub do
+  def transition(assignment, target, _context) do
+    if is_pid(assignment[:transition_observer]) do
+      send(assignment[:transition_observer], {:managed_transition_effect, assignment.assignment_id, target})
+    end
+
+    {:ok, %{provider_state: target, reconciled: true, external_effects: %{status: :ok}}}
+  end
+end
+
 defmodule SymphonyElixir.ManagedOrchestratorTest do
   use SymphonyElixir.TestSupport
 
@@ -65,7 +75,8 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
 
     :sys.replace_state(pid, fn state ->
       data = Rules.new(disabled: Keyword.get(opts, :disabled, false))
-      %{state | managed: %{journal: journal, data: data, effects: SymphonyElixir.ManagedReviewEffectsStub}, poll_check_in_progress: true}
+      managed = %{journal: journal, data: data, effects: SymphonyElixir.ManagedReviewEffectsStub}
+      %{state | managed: managed, poll_check_in_progress: true}
     end)
 
     on_exit(fn ->
@@ -665,6 +676,117 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
 
     state = :sys.get_state(pid)
     assert state.managed.data.effect_intents["auto-ready"].status == :effect_reconciled
+  end
+
+  test "startup recovery does not replay completed automatic transitions and creates a fresh intent" do
+    name = Module.concat(__MODULE__, :recovery_once)
+    path = Path.join(System.tmp_dir!(), "managed-recovery-once-#{System.unique_integer([:positive])}.log")
+    {:ok, pid} = Orchestrator.start_link(name: name, managed_effects: SymphonyElixir.ManagedCountingTransitionStub)
+    {:ok, journal, %{}} = Journal.open(path, name: String.to_atom("managed_recovery_once_#{System.unique_integer([:positive])}"))
+
+    :sys.replace_state(pid, fn state ->
+      %{state | managed: %{journal: journal, data: Rules.new(), effects: SymphonyElixir.ManagedCountingTransitionStub}, poll_check_in_progress: true}
+    end)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      File.rm(path)
+    end)
+
+    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+
+    state = :sys.get_state(pid)
+
+    data =
+      state.managed.data
+      |> update_in([:assignments, "item-1"], &Map.merge(&1, %{transition_observer: self()}))
+      |> put_in([:effect_intents, "auto-active"], %{
+        request_id: "auto-active",
+        request: nil,
+        assignment_id: "item-1",
+        target: :active,
+        status: :pending
+      })
+
+    recovered = Orchestrator.recover_managed_transitions_for_test(%{state | managed: %{state.managed | data: data}})
+    assert_receive {:managed_transition_effect, "item-1", :active}
+    assert recovered.managed.data.effect_intents["auto-active"].status == :effect_reconciled
+
+    data =
+      recovered.managed.data
+      |> update_in([:assignments, "item-1"], &Map.merge(&1, %{phase: :active, board_state: :active}))
+      |> put_in([:effect_intents, "auto-ready"], %{
+        request_id: "auto-ready",
+        request: nil,
+        assignment_id: "item-1",
+        target: :ready,
+        status: :pending
+      })
+
+    recovered =
+      Orchestrator.recover_managed_transitions_for_test(%{
+        recovered
+        | managed: %{recovered.managed | data: data}
+      })
+
+    assert_receive {:managed_transition_effect, "item-1", :ready}
+    assert recovered.managed.data.effect_intents["auto-ready"].status == :effect_reconciled
+
+    event_cursor = recovered.managed.data.event_cursor
+    events = recovered.managed.data.events
+    recovered_again = Orchestrator.recover_managed_transitions_for_test(recovered)
+    refute_receive {:managed_transition_effect, "item-1", _target}, 100
+    assert recovered_again.managed.data.event_cursor == event_cursor
+    assert recovered_again.managed.data.events == events
+
+    :sys.replace_state(pid, fn _ -> recovered_again end)
+    fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(fake_pid), do: Process.exit(fake_pid, :kill) end)
+    ref = make_ref()
+
+    :sys.replace_state(pid, fn state ->
+      assignment =
+        Map.merge(state.managed.data.assignments["item-1"], %{
+          phase: :active,
+          board_state: :active,
+          attempt_id: "attempt-2",
+          generation: 1,
+          turns_reserved: 0,
+          retry_count: 0
+        })
+
+      running = %{
+        pid: fake_pid,
+        ref: ref,
+        managed_attempt: %{assignment_id: "item-1", revision: 1, generation: 1, attempt_id: "attempt-2"},
+        session_id: nil,
+        codex_input_tokens: 0,
+        codex_output_tokens: 0,
+        codex_total_tokens: 0,
+        started_at: DateTime.utc_now()
+      }
+
+      %{
+        state
+        | managed: %{state.managed | data: put_in(state.managed.data, [:assignments, "item-1"], assignment)},
+          running: %{"item-1" => running}
+      }
+    end)
+
+    send(pid, {:DOWN, ref, :process, fake_pid, {:managed_agent_failed, :spawn_failed}})
+    _ = Control.state(pid)
+    assert_receive {:managed_transition_effect, "item-1", :ready}
+
+    state = :sys.get_state(pid)
+
+    ready_intents =
+      state.managed.data.effect_intents
+      |> Enum.filter(fn {_id, intent} -> intent[:target] == :ready and is_nil(intent[:request]) end)
+
+    assert length(ready_intents) == 2
+    assert Enum.any?(ready_intents, fn {id, _intent} -> id != "auto-ready" end)
+    Process.exit(fake_pid, :kill)
   end
 
   test "managed dispatch failures retry twice then block" do

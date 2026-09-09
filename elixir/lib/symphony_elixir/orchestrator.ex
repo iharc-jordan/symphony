@@ -706,7 +706,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     case Enum.find(intents, fn {_id, intent} ->
            is_map(intent) and intent[:assignment_id] == assignment.assignment_id and
-             intent[:target] == target and intent[:status] in [:pending, :effect_reconciled]
+             intent[:target] == target and managed_transition_intent_reusable?(intent)
          end) do
       {intent_id, _intent} ->
         {:ok, state, intent_id}
@@ -741,6 +741,13 @@ defmodule SymphonyElixir.Orchestrator do
         end
     end
   end
+
+  defp managed_transition_intent_reusable?(intent) when is_map(intent) do
+    intent[:status] == :pending or
+      (intent[:status] == :effect_reconciled and is_map(intent[:request]))
+  end
+
+  defp managed_transition_intent_reusable?(_intent), do: false
 
   defp managed_provider_transition_failed(%State{} = state, assignment, target, reason, intent_id) do
     data =
@@ -1642,7 +1649,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp recover_managed_transitions(%State{managed: %{data: data}} = state) do
     data[:effect_intents]
     |> Enum.filter(fn {_request_id, intent} ->
-      is_map(intent) and intent[:status] in [:pending, :effect_reconciled]
+      managed_transition_intent_reusable?(intent)
     end)
     |> Enum.reduce(state, &recover_managed_transition/2)
   end
