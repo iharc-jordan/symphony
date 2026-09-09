@@ -57,14 +57,15 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     }
   end
 
-  defp managed_server do
+  defp managed_server(opts \\ []) do
     name = Module.concat(__MODULE__, :"server_#{System.unique_integer([:positive])}")
     path = Path.join(System.tmp_dir!(), "managed-orchestrator-#{System.unique_integer([:positive])}.log")
     {:ok, pid} = Orchestrator.start_link(name: name, managed_effects: SymphonyElixir.ManagedReviewEffectsStub)
     {:ok, journal, %{}} = Journal.open(path, name: String.to_atom("managed_test_#{System.unique_integer([:positive])}"))
 
     :sys.replace_state(pid, fn state ->
-      %{state | managed: %{journal: journal, data: Rules.new(), effects: SymphonyElixir.ManagedReviewEffectsStub}, poll_check_in_progress: true}
+      data = Rules.new(disabled: Keyword.get(opts, :disabled, false))
+      %{state | managed: %{journal: journal, data: data, effects: SymphonyElixir.ManagedReviewEffectsStub}, poll_check_in_progress: true}
     end)
 
     on_exit(fn ->
@@ -143,7 +144,7 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
       }
 
       Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
-      {pid, _path} = managed_server()
+      {pid, _path} = managed_server(disabled: true)
 
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
@@ -170,6 +171,11 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
         args = %{assignment_id: "item-1", expected_revision: 1, changes: changes}
         assert {:ok, _} = Control.submit(pid, %{request_id: "escalate", operation: :revise, args: args})
       end
+
+      :sys.replace_state(pid, fn state ->
+        data = %{state.managed.data | disabled: false}
+        %{state | managed: %{state.managed | data: data}}
+      end)
 
       send(pid, :run_poll_cycle)
 
