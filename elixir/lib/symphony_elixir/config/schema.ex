@@ -284,14 +284,43 @@ defmodule SymphonyElixir.Config.Schema do
       field(:control_token_env, :string, default: "SYMPHONY_MANAGED_TOKEN")
       field(:event_limit, :integer, default: 100)
       field(:event_wait_ms, :integer, default: 5_000)
+      # Managed attempts must prepare their trusted checkout before the worker
+      # can run. These paths are service configuration; they are never read
+      # from a control request or an issue body.
+      field(:checkout_node, :string)
+      field(:checkout_helper_path, :string)
+      field(:checkout_policy_file, :string)
+      field(:usage_limit_tokens, :integer)
+      # Accept the shorter name for existing deployments and normalize it to
+      # usage_limit_tokens at runtime.
+      field(:token_limit, :integer)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:enabled, :journal_path, :control_token, :control_token_file, :control_token_env, :event_limit, :event_wait_ms], empty_values: [])
+      |> cast(
+        attrs,
+        [
+          :enabled,
+          :journal_path,
+          :control_token,
+          :control_token_file,
+          :control_token_env,
+          :event_limit,
+          :event_wait_ms,
+          :checkout_node,
+          :checkout_helper_path,
+          :checkout_policy_file,
+          :usage_limit_tokens,
+          :token_limit
+        ],
+        empty_values: []
+      )
       |> validate_number(:event_limit, greater_than: 0, less_than_or_equal_to: 100)
       |> validate_number(:event_wait_ms, greater_than_or_equal_to: 0, less_than_or_equal_to: 60_000)
+      |> validate_number(:usage_limit_tokens, greater_than: 0)
+      |> validate_number(:token_limit, greater_than: 0)
       |> validate_required([:journal_path])
       |> validate_change(:journal_path, fn :journal_path, value ->
         if is_binary(value) and String.trim(value) != "", do: [], else: [journal_path: "must not be blank"]
@@ -499,7 +528,11 @@ defmodule SymphonyElixir.Config.Schema do
       settings.managed
       | journal_path: resolve_path_value(settings.managed.journal_path, Path.join(System.tmp_dir!(), "symphony_managed/journal.log")),
         control_token_file: resolve_path_value(settings.managed.control_token_file, nil),
-        control_token: managed_control_token(settings.managed)
+        control_token: managed_control_token(settings.managed),
+        checkout_node: resolve_path_value(settings.managed.checkout_node, nil),
+        checkout_helper_path: resolve_path_value(settings.managed.checkout_helper_path, nil),
+        checkout_policy_file: resolve_path_value(settings.managed.checkout_policy_file, nil),
+        usage_limit_tokens: settings.managed.usage_limit_tokens || settings.managed.token_limit
     }
 
     codex = %{
@@ -526,12 +559,26 @@ defmodule SymphonyElixir.Config.Schema do
           managed.control_token
       end
 
-    if is_binary(token) and token != "" do
-      :ok
-    else
-      {:error, "managed.enabled=true requires a readable non-empty control_token_file or control_token"}
+    cond do
+      not (is_binary(token) and token != "") ->
+        {:error, "managed.enabled=true requires a readable non-empty control_token_file or control_token"}
+
+      not present_string?(managed.checkout_node) ->
+        {:error, "managed.enabled=true requires managed.checkout_node"}
+
+      not present_string?(managed.checkout_helper_path) ->
+        {:error, "managed.enabled=true requires managed.checkout_helper_path"}
+
+      not present_string?(managed.checkout_policy_file) ->
+        {:error, "managed.enabled=true requires managed.checkout_policy_file"}
+
+      true ->
+        :ok
     end
   end
+
+  defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_string?(_value), do: false
 
   defp managed_control_token(%Managed{} = managed) do
     token_from_file =

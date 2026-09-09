@@ -74,6 +74,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         case initialize_managed(config, state, opts) do
           {:ok, state} ->
+            state = if is_nil(state.managed), do: state, else: recover_managed_active_assignments(state)
             if is_nil(state.managed), do: run_terminal_workspace_cleanup()
             state = schedule_tick(state, 0)
             {:ok, state}
@@ -172,24 +173,33 @@ defmodule SymphonyElixir.Orchestrator do
     {:reply, {:error, :managed_mode_disabled}, state}
   end
 
-  def handle_call({:managed_report, payload}, _from, %State{managed: managed} = state)
+  def handle_call({:managed_report, payload}, _from, %State{managed: _managed} = state)
       when is_map(payload) do
-    case record_managed_report(managed.data, payload) do
-      {:ok, data} ->
-        case persist_managed_data(state, data) do
-          {:ok, next_state} ->
-            case managed_report_provider_effect(next_state, payload) do
-              {:ok, provider_state} -> {:reply, :ok, provider_state}
-              {:error, provider_state, {code, details}} -> {:reply, {:error, {code, details}}, provider_state}
-              {:error, provider_state, reason} -> {:reply, {:error, reason}, provider_state}
+    case managed_source_reconcile(state, payload) do
+      {:ok, source_state, :unchanged} ->
+        case record_managed_report(source_state.managed.data, payload) do
+          {:ok, report_data} ->
+            case persist_managed_data(source_state, report_data) do
+              {:ok, next_state} ->
+                case managed_report_provider_effect(next_state, payload) do
+                  {:ok, provider_state} -> {:reply, :ok, provider_state}
+                  {:error, provider_state, {code, details}} -> {:reply, {:error, {code, details}}, provider_state}
+                  {:error, provider_state, reason} -> {:reply, {:error, reason}, provider_state}
+                end
+
+              {:error, reason} ->
+                {:reply, {:error, reason}, source_state}
             end
 
-          {:error, reason} ->
-            {:reply, {:error, reason}, state}
+          {:error, code, details} ->
+            {:reply, {:error, {code, details}}, source_state}
         end
 
-      {:error, code, details} ->
-        {:reply, {:error, {code, details}}, state}
+      {:ok, source_state, {:changed, target}} ->
+        {:reply, {:error, {:managed_source_state_changed, target}}, source_state}
+
+      {:error, source_state, reason} ->
+        {:reply, {:error, reason}, source_state}
     end
   end
 
@@ -200,6 +210,7 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_call({:managed_control, envelope}, _from, %State{managed: %{data: data}} = state)
       when is_map(envelope) do
     cond do
+      managed_binding_envelope?(envelope) -> handle_managed_binding_control(state, envelope)
       managed_review_envelope?(envelope) -> handle_managed_review_control(state, envelope)
       managed_transition_envelope?(envelope) -> handle_managed_transition_control(state, envelope)
       true -> apply_managed_control(state, envelope, managed_rules_context(data, envelope))
@@ -310,9 +321,11 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
+          |> Map.put(:running, Map.put(running, issue_id, updated_running_entry))
+          |> managed_record_usage(issue_id, token_delta)
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state}
     end
   end
 
@@ -337,7 +350,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp managed_maybe_dispatch(%State{managed: %{data: data}} = state) do
-    if data.paused == true or data.disabled == true or available_slots(state) <= 0 do
+    if data.paused == true or data.disabled == true or available_slots(state) <= 0 or
+         managed_usage_exhausted?(data) do
       state
     else
       case Tracker.fetch_issues_by_states(["READY"]) do
@@ -443,8 +457,23 @@ defmodule SymphonyElixir.Orchestrator do
       reconciliation[:issue_final_state] in [:closed, "closed"]
   end
 
-  defp managed_start_assignment(%State{} = state, %Issue{id: issue_id} = issue, assignment) do
-    generation = Map.get(assignment, :generation, 0) + 1
+  defp managed_start_assignment(%State{} = state, %Issue{} = issue, assignment) do
+    case managed_checkout_options() do
+      {:ok, _options} ->
+        managed_start_assignment_ready(state, issue, assignment)
+
+      {:error, reason} ->
+        Logger.error("Managed dispatch blocked: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp managed_start_assignment_ready(%State{} = state, %Issue{id: issue_id} = issue, assignment) do
+    generation =
+      if assignment[:recovery_generation_pending] == true,
+        do: Map.get(assignment, :generation, 0),
+        else: Map.get(assignment, :generation, 0) + 1
+
     attempt_id = "managed-#{issue_id}-#{generation}-#{System.unique_integer([:positive])}"
 
     attempt = %{
@@ -453,7 +482,8 @@ defmodule SymphonyElixir.Orchestrator do
       generation: generation,
       attempt_id: attempt_id,
       model: route_value(assignment.route, :model),
-      effort: route_value(assignment.route, :effort)
+      effort: route_value(assignment.route, :effort),
+      escalation_reason: assignment[:escalation_reason]
     }
 
     updated_assignment =
@@ -464,7 +494,9 @@ defmodule SymphonyElixir.Orchestrator do
         generation: generation,
         attempt_id: attempt_id,
         pending_effect: %{kind: :start, status: :pending, at: DateTime.utc_now()},
-        started_at: DateTime.utc_now()
+        started_at: DateTime.utc_now(),
+        resume_ready: false,
+        recovery_generation_pending: false
       })
 
     data =
@@ -510,48 +542,141 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp managed_apply_provider_transition(%State{managed: %{effects: module, data: data}} = state, assignment, target)
+  defp managed_apply_provider_transition(%State{managed: %{effects: module}} = state, assignment, target)
        when is_atom(module) and is_map(assignment) and is_atom(target) do
-    if function_exported?(module, :transition, 3) do
+    with {:ok, intent_state, intent_id} <- ensure_managed_transition_intent(state, assignment, target),
+         true <- function_exported?(module, :transition, 3) do
       context = %{
-        binding: data[:binding],
-        process_stopped: not Map.has_key?(state.running, assignment.assignment_id)
+        binding: intent_state.managed.data[:binding],
+        process_stopped: not Map.has_key?(intent_state.running, assignment.assignment_id)
       }
 
       case safe_managed_effect_call(module, :transition, [assignment, target, context]) do
         {:ok, facts} when is_map(facts) ->
-          effect = %{kind: :provider_transition, target: target, status: :reconciled, facts: facts, at: DateTime.utc_now()}
+          effect = %{
+            kind: :provider_transition,
+            target: target,
+            status: :reconciled,
+            facts: facts,
+            at: DateTime.utc_now()
+          }
 
           next_data =
-            data
-            |> update_in([:assignments, assignment.assignment_id], &Map.put(&1, :pending_effect, effect))
-            |> append_managed_event(%{operation: :provider_transition, assignment_id: assignment.assignment_id, target: target, status: :reconciled})
+            intent_state.managed.data
+            |> update_in([:assignments, assignment.assignment_id], fn current ->
+              current
+              |> Map.put(:pending_effect, effect)
+              |> maybe_put_managed(
+                :resume_ready,
+                target in [:ready, :review, :waiting] and is_binary(current[:thread_id])
+              )
+            end)
+            |> update_in([:effect_intents, intent_id], fn existing ->
+              (existing || %{})
+              |> Map.put(:status, :effect_reconciled)
+              |> Map.put(:facts, facts)
+              |> Map.put(:effect_reconciled_at, DateTime.utc_now())
+            end)
+            |> append_managed_event(%{
+              operation: :provider_transition,
+              assignment_id: assignment.assignment_id,
+              target: target,
+              status: :reconciled,
+              request_id: intent_id
+            })
 
-          case persist_managed_data(state, next_data) do
+          case persist_managed_data(intent_state, next_data) do
             {:ok, next_state} -> {:ok, next_state}
-            {:error, reason} -> {:error, state, {:managed_journal_write_failed, reason}}
+            {:error, reason} -> {:error, intent_state, {:managed_journal_write_failed, reason}}
           end
 
         {:error, code, details} ->
-          managed_provider_transition_failed(state, assignment, target, {code, details})
+          managed_provider_transition_failed(intent_state, assignment, target, {code, details}, intent_id)
 
         {:error, reason} ->
-          managed_provider_transition_failed(state, assignment, target, {:managed_provider_effect_failed, reason})
+          managed_provider_transition_failed(
+            intent_state,
+            assignment,
+            target,
+            {:managed_provider_effect_failed, reason},
+            intent_id
+          )
       end
     else
-      {:ok, state}
+      false ->
+        {:error, state, {:managed_provider_effects_unavailable, %{}}}
+
+      {:error, state, reason} ->
+        {:error, state, reason}
     end
   end
 
-  defp managed_apply_provider_transition(state, _assignment, _target), do: {:ok, state}
+  defp ensure_managed_transition_intent(%State{} = state, assignment, target) do
+    intents = state.managed.data[:effect_intents] || %{}
 
-  defp managed_provider_transition_failed(%State{} = state, assignment, target, reason) do
+    case Enum.find(intents, fn {_id, intent} ->
+           is_map(intent) and intent[:assignment_id] == assignment.assignment_id and
+             intent[:target] == target and intent[:status] in [:pending, :effect_reconciled]
+         end) do
+      {intent_id, _intent} ->
+        {:ok, state, intent_id}
+
+      nil ->
+        intent_id =
+          "managed-effect-#{assignment.assignment_id}-#{target}-#{state.managed.data[:event_cursor] + 1}"
+
+        intent = %{
+          request_id: intent_id,
+          request: nil,
+          assignment_id: assignment.assignment_id,
+          target: target,
+          auto: true,
+          status: :pending,
+          at: DateTime.utc_now()
+        }
+
+        data =
+          state.managed.data
+          |> put_in([:effect_intents, intent_id], intent)
+          |> append_managed_event(%{
+            operation: :provider_transition_intent,
+            request_id: intent_id,
+            assignment_id: assignment.assignment_id,
+            target: target
+          })
+
+        case persist_managed_data(state, data) do
+          {:ok, next_state} -> {:ok, next_state, intent_id}
+          {:error, reason} -> {:error, state, {:managed_journal_write_failed, reason}}
+        end
+    end
+  end
+
+  defp managed_provider_transition_failed(%State{} = state, assignment, target, reason, intent_id) do
     data =
       state.managed.data
       |> update_in([:assignments, assignment.assignment_id, :pending_effect], fn _ ->
-        %{kind: :provider_transition, target: target, status: :failed, error: managed_effect_error_code(reason), at: DateTime.utc_now()}
+        %{
+          kind: :provider_transition,
+          target: target,
+          status: :failed,
+          error: managed_effect_error_code(reason),
+          at: DateTime.utc_now()
+        }
       end)
-      |> append_managed_event(%{operation: :provider_transition_failed, assignment_id: assignment.assignment_id, target: target, error: managed_effect_error_code(reason)})
+      |> update_in([:effect_intents, intent_id], fn existing ->
+        (existing || %{})
+        |> Map.put(:status, :pending)
+        |> Map.put(:last_error, managed_effect_error_code(reason))
+        |> Map.put(:last_error_at, DateTime.utc_now())
+      end)
+      |> append_managed_event(%{
+        operation: :provider_transition_failed,
+        assignment_id: assignment.assignment_id,
+        target: target,
+        error: managed_effect_error_code(reason),
+        request_id: intent_id
+      })
 
     case persist_managed_data(state, data) do
       {:ok, next_state} -> {:error, next_state, reason}
@@ -671,6 +796,99 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp managed_finalize_usage(usage, running_entry, previous_usage_total, limit)
+       when is_map(usage) and is_map(running_entry) do
+    observed_total = nonnegative_integer(running_entry[:codex_total_tokens], 0)
+    previous_total = nonnegative_integer(previous_usage_total, 0)
+    additional = max(observed_total - previous_total, 0)
+    cumulative = nonnegative_integer(usage[:cumulative_tokens], 0) + additional
+    inflight = max(nonnegative_integer(usage[:inflight_tokens], 0) - observed_total, 0)
+
+    %{
+      baseline_tokens: nonnegative_integer(usage[:baseline_tokens], 0),
+      cumulative_tokens: cumulative,
+      inflight_tokens: inflight,
+      overshoot_tokens: max(nonnegative_integer(usage[:overshoot_tokens], 0), 0),
+      cap_reached: usage[:cap_reached] == true
+    }
+    |> then(fn next_usage ->
+      if is_integer(limit) and limit > 0 do
+        Map.merge(next_usage, %{
+          overshoot_tokens: max(cumulative - limit, 0),
+          cap_reached: cumulative >= limit
+        })
+      else
+        next_usage
+      end
+    end)
+  end
+
+  defp managed_finalize_usage(usage, _running_entry, _previous_usage_total, _limit) when is_map(usage), do: usage
+  defp managed_finalize_usage(_usage, _running_entry, _previous_usage_total, _limit), do: %{}
+
+  defp managed_usage_exhausted?(data) when is_map(data) do
+    limit = data[:usage_limit_tokens]
+    usage = data[:usage] || %{}
+    cumulative = usage[:cumulative_tokens] || 0
+    is_integer(limit) and limit > 0 and is_integer(cumulative) and cumulative >= limit
+  end
+
+  defp managed_usage_exhausted?(_data), do: false
+
+  defp managed_record_usage(%State{managed: %{data: data}} = state, issue_id, token_delta)
+       when is_binary(issue_id) and is_map(token_delta) do
+    total = token_delta[:total_tokens] || 0
+
+    if not (is_integer(total) and total > 0) do
+      state
+    else
+      assignment = get_in(data, [:assignments, issue_id])
+
+      if is_map(assignment) do
+        assignment_usage = assignment[:usage] || %{}
+        previous_total = nonnegative_integer(assignment_usage[:total_tokens], 0)
+        usage = data[:usage] || %{}
+        cumulative = nonnegative_integer(usage[:cumulative_tokens], 0) + total
+        limit = data[:usage_limit_tokens]
+        overshoot = if is_integer(limit) and limit > 0, do: max(cumulative - limit, 0), else: 0
+
+        next_usage = %{
+          input_tokens: nonnegative_integer(assignment_usage[:input_tokens], 0) + nonnegative_integer(token_delta[:input_tokens], 0),
+          output_tokens: nonnegative_integer(assignment_usage[:output_tokens], 0) + nonnegative_integer(token_delta[:output_tokens], 0),
+          total_tokens: previous_total + total,
+          seconds_running: nonnegative_integer(assignment_usage[:seconds_running], 0),
+          attempt_id: get_in(assignment, [:attempt_id])
+        }
+
+        next_aggregate = %{
+          baseline_tokens: nonnegative_integer(usage[:baseline_tokens], 0),
+          cumulative_tokens: cumulative,
+          inflight_tokens: nonnegative_integer(usage[:inflight_tokens], 0) + total,
+          overshoot_tokens: overshoot,
+          cap_reached: is_integer(limit) and limit > 0 and cumulative >= limit
+        }
+
+        next_data =
+          data
+          |> put_in([:assignments, issue_id, :usage], next_usage)
+          |> Map.put(:usage, next_aggregate)
+
+        case persist_managed_data(state, next_data) do
+          {:ok, next_state} ->
+            next_state
+
+          {:error, reason} ->
+            Logger.error("Managed usage could not be persisted for #{issue_id}: #{inspect(reason)}")
+            state
+        end
+      else
+        state
+      end
+    end
+  end
+
+  defp managed_record_usage(state, _issue_id, _token_delta), do: state
+
   defp managed_record_runtime(%State{managed: %{data: data}} = state, issue_id, runtime_info)
        when is_map(runtime_info) do
     case get_in(data, [:assignments, issue_id]) do
@@ -719,15 +937,26 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp managed_before_turn(%State{managed: %{data: data}} = state, turn_context) do
-    decision = managed_before_turn_decision(data, turn_context)
+  defp managed_before_turn(%State{managed: %{data: _data}} = state, turn_context) do
+    case managed_source_reconcile(state, turn_context) do
+      {:ok, reconciled_state, :unchanged} ->
+        decision =
+          if managed_usage_exhausted?(reconciled_state.managed.data) do
+            {:stop, :managed_usage_limit_exhausted}
+          else
+            managed_before_turn_decision(reconciled_state.managed.data, turn_context)
+          end
 
-    case decision do
-      :allow ->
-        managed_reserve_turn(state, turn_context)
+        case decision do
+          :allow -> managed_reserve_turn(reconciled_state, turn_context)
+          _ -> {decision, reconciled_state}
+        end
 
-      _ ->
-        {decision, state}
+      {:ok, reconciled_state, {:changed, target}} ->
+        {{:stop, {:managed_source_state_changed, target}}, reconciled_state}
+
+      {:error, reconciled_state, reason} ->
+        {{:stop, reason}, reconciled_state}
     end
   end
 
@@ -855,6 +1084,190 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp managed_attempt_matches?(_assignment, _attempt), do: {:error, :invalid_managed_attempt, %{}}
 
+  defp managed_source_reconcile(%State{} = state, context) when is_map(context) do
+    attempt = map_value(context, :attempt) || context
+    assignment_id = map_value(attempt, :assignment_id)
+    assignment = get_in(state.managed.data, [:assignments, assignment_id])
+
+    cond do
+      not is_map(assignment) ->
+        {:error, state, :managed_assignment_not_found}
+
+      not managed_source_fetch_enabled?() ->
+        {:ok, state, :unchanged}
+
+      true ->
+        fetcher = Map.get(state.managed, :source_fetcher, &Tracker.fetch_issues_by_ids/1)
+
+        case safe_managed_source_fetch(fetcher, [assignment_id]) do
+          {:ok, [%Issue{} = issue]} ->
+            managed_reconcile_source_issue(state, assignment, issue)
+
+          {:ok, []} ->
+            {:error, state, :managed_source_item_not_found}
+
+          {:ok, _items} ->
+            {:error, state, :managed_source_item_ambiguous}
+
+          {:error, reason} ->
+            {:error, state, {:managed_source_reconcile_failed, reason}}
+        end
+    end
+  end
+
+  defp managed_source_reconcile(state, _context), do: {:error, state, :managed_source_context_invalid}
+
+  defp managed_source_fetch_enabled? do
+    case Config.settings() do
+      {:ok, %{tracker: %{kind: "github_projects"}}} -> true
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp safe_managed_source_fetch(fetcher, ids) when is_function(fetcher, 1) do
+    fetcher.(ids)
+  rescue
+    error -> {:error, {:exception, Exception.message(error)}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp safe_managed_source_fetch(_fetcher, _ids), do: {:error, :managed_source_fetcher_unavailable}
+
+  defp managed_reconcile_source_issue(%State{} = state, assignment, %Issue{} = issue) do
+    with :ok <- managed_source_identity_matches?(assignment, issue),
+         :ok <- managed_source_material_matches?(assignment, issue),
+         {:ok, target} <- managed_source_target(issue) do
+      if target == assignment[:phase] and assignment[:stop_pending] != true do
+        {:ok, state, :unchanged}
+      else
+        assignment_id = assignment.assignment_id
+
+        updated =
+          assignment
+          |> Map.merge(%{
+            phase: target,
+            board_state: target,
+            source_authoritative: true,
+            source_state: issue.state,
+            source_observed_at: DateTime.utc_now(),
+            native_issue_id: source_native_value(issue, :issue_id) || assignment[:native_issue_id],
+            native_repository_id: source_native_repository_id(issue) || assignment[:native_repository_id],
+            project_item_id: source_native_value(issue, :project_item_id) || assignment[:project_item_id],
+            stop_pending: Map.has_key?(state.running, assignment_id),
+            pending_effect: %{kind: :source_reconcile, status: :reconciled, target: target}
+          })
+
+        data =
+          state.managed.data
+          |> put_in([:assignments, assignment_id], updated)
+          |> append_managed_event(%{
+            operation: :source_reconcile,
+            assignment_id: assignment_id,
+            source_state: issue.state,
+            target: target,
+            stop_pending: Map.has_key?(state.running, assignment_id)
+          })
+
+        case persist_managed_data(state, data) do
+          {:ok, reconciled_state} ->
+            {:ok, managed_stop_owned_process(reconciled_state, assignment_id), {:changed, target}}
+
+          {:error, reason} ->
+            {:error, state, {:managed_journal_write_failed, reason}}
+        end
+      end
+    else
+      {:error, reason, details} -> {:error, state, {reason, details}}
+      {:error, reason} -> {:error, state, reason}
+    end
+  end
+
+  defp managed_source_identity_matches?(assignment, %Issue{} = issue) do
+    repository = source_native_value(issue, :repository) |> source_nested_value(:name_with_owner)
+    issue_number = source_native_value(issue, :issue_number)
+    content_type = source_native_value(issue, :content_type)
+    expected_issue_id = assignment[:native_issue_id] || assignment[:issue_id]
+    expected_repository_id = assignment[:native_repository_id] || assignment[:repository_id]
+    observed_issue_id = source_native_value(issue, :issue_id)
+    observed_repository_id = source_native_value(issue, :repository) |> source_nested_value(:id)
+
+    if content_type == "Issue" and repository == assignment[:repository] and
+         issue_number == assignment[:issue_number] and
+         (is_nil(expected_issue_id) or expected_issue_id == observed_issue_id) and
+         (is_nil(expected_repository_id) or expected_repository_id == observed_repository_id) do
+      :ok
+    else
+      {:error, :managed_source_identity_mismatch}
+    end
+  end
+
+  defp managed_source_material_matches?(assignment, %Issue{} = issue) do
+    expected = assignment[:requirements_fingerprint]
+
+    cond do
+      is_nil(expected) ->
+        :ok
+
+      not is_binary(expected) or not String.starts_with?(expected, "sha256:") ->
+        {:error, :managed_source_material_invalid}
+
+      managed_material_fingerprint(issue.description) == expected ->
+        :ok
+
+      true ->
+        {:error, :managed_source_material_changed}
+    end
+  end
+
+  defp managed_material_fingerprint(body) when is_binary(body) do
+    "sha256:" <> Base.encode16(:crypto.hash(:sha256, body), case: :lower)
+  end
+
+  defp managed_material_fingerprint(_body), do: managed_material_fingerprint("")
+
+  defp managed_source_target(%Issue{} = issue) do
+    native_state = source_native_value(issue, :issue_state) |> to_string() |> String.downcase()
+    target = Rules.phase(issue.state)
+
+    cond do
+      native_state not in ["", "open"] -> {:ok, :cancelled}
+      target in [:ready, :active, :waiting, :review, :cancelled] -> {:ok, target}
+      true -> {:error, :managed_source_state_unknown}
+    end
+  end
+
+  defp source_native_value(%Issue{native_ref: native}, key) when is_map(native) do
+    Map.get(native, Atom.to_string(key), Map.get(native, key))
+  end
+
+  defp source_native_value(_issue, _key), do: nil
+
+  defp source_nested_value(value, key) when is_map(value) do
+    Map.get(value, Atom.to_string(key), Map.get(value, key))
+  end
+
+  defp source_nested_value(_value, _key), do: nil
+
+  defp source_native_repository_id(%Issue{} = issue) do
+    issue
+    |> source_native_value(:repository)
+    |> source_nested_value(:id)
+  end
+
+  defp managed_stop_owned_process(%State{} = state, assignment_id) do
+    case Map.get(state.running, assignment_id) do
+      %{pid: pid} when is_pid(pid) ->
+        Process.exit(pid, :shutdown)
+        state
+
+      _ ->
+        state
+    end
+  end
+
   defp managed_rules_context(data, envelope) do
     args = map_value(envelope, :args) || %{}
     assignment_id = map_value(args, :assignment_id)
@@ -894,6 +1307,66 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp recover_managed_reviews(state), do: state
 
+  defp recover_managed_active_assignments(%State{managed: %{data: data}} = state) do
+    data.assignments
+    |> Enum.filter(fn {assignment_id, assignment} ->
+      is_binary(assignment_id) and is_map(assignment) and assignment[:phase] == :active and
+        not Map.has_key?(state.running, assignment_id)
+    end)
+    |> Enum.reduce(state, fn {assignment_id, assignment}, acc ->
+      case managed_source_reconcile(acc, %{assignment_id: assignment_id}) do
+        {:ok, reconciled_state, :unchanged} ->
+          current = get_in(reconciled_state.managed.data, [:assignments, assignment_id]) || assignment
+
+          resumed =
+            current
+            |> Map.merge(%{
+              phase: :ready,
+              board_state: :ready,
+              # The old process is absent after a restart, so the stop is
+              # confirmed before any provider mutation or new dispatch.
+              stop_pending: false,
+              stop_reconciled: true,
+              pending_effect: %{kind: :startup_recovery, status: :pending},
+              generation: (current[:generation] || 0) + 1,
+              attempt_id: nil,
+              recovery_generation_pending: true,
+              resume_ready: is_binary(current[:thread_id])
+            })
+
+          recovery_data =
+            reconciled_state.managed.data
+            |> put_in([:assignments, assignment_id], resumed)
+            |> append_managed_event(%{
+              operation: :startup_recovery,
+              assignment_id: assignment_id,
+              generation: resumed[:generation],
+              stop_reconciled: true,
+              resume_ready: resumed[:resume_ready]
+            })
+
+          case persist_managed_data(reconciled_state, recovery_data) do
+            {:ok, next_state} ->
+              case managed_apply_provider_transition(next_state, resumed, :ready) do
+                {:ok, provider_state} -> provider_state
+                {:error, provider_state, _reason} -> provider_state
+              end
+
+            {:error, _reason} ->
+              reconciled_state
+          end
+
+        {:ok, reconciled_state, _changed} ->
+          reconciled_state
+
+        {:error, reconciled_state, _reason} ->
+          reconciled_state
+      end
+    end)
+  end
+
+  defp recover_managed_active_assignments(state), do: state
+
   defp recover_managed_transitions(%State{managed: %{data: data}} = state) do
     data[:effect_intents]
     |> Enum.filter(fn {_request_id, intent} -> is_map(intent) and intent[:status] == :pending and is_map(intent[:request]) end)
@@ -912,6 +1385,65 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp recover_managed_transitions(state), do: state
+
+  defp managed_binding_envelope?(envelope) when is_map(envelope) do
+    map_value(envelope, :operation) in [:bind_project, "bind_project"]
+  end
+
+  defp managed_binding_envelope?(_envelope), do: false
+
+  defp handle_managed_binding_control(%State{} = state, envelope) do
+    case managed_validate_binding(state, envelope) do
+      :ok -> apply_managed_control(state, envelope, %{})
+      {:error, code, details} -> {:reply, {:error, code, details}, state}
+    end
+  end
+
+  defp managed_validate_binding(%State{managed: %{effects: effects}} = _state, _envelope)
+       when effects != SymphonyElixir.Managed.GitHubEffects,
+       do: :ok
+
+  defp managed_validate_binding(%State{} = _state, envelope) do
+    args = map_value(envelope, :args) || %{}
+    requested = map_value(args, :project) || args
+
+    with {:ok, configured} <- SymphonyElixir.GitHubProjects.Client.fetch_configured_binding(),
+         :ok <- compare_managed_binding(requested, configured) do
+      :ok
+    else
+      {:error, code, details} -> {:error, code, details}
+      {:error, reason} -> {:error, :managed_binding_validation_failed, %{reason: inspect(reason)}}
+    end
+  end
+
+  defp compare_managed_binding(requested, configured) when is_map(requested) and is_map(configured) do
+    fields = [:project_id, :project_number, :status_field_id]
+
+    if Enum.all?(fields, fn key -> map_value(requested, key) == Map.get(configured, key) end) and
+         status_options_match?(map_value(requested, :status_options), configured[:status_options]) do
+      :ok
+    else
+      {:error, :managed_binding_mismatch, %{configured: Map.take(configured, fields)}}
+    end
+  end
+
+  defp compare_managed_binding(_requested, _configured), do: {:error, :managed_binding_mismatch, %{}}
+
+  defp status_options_match?(requested, configured) when is_map(requested) and is_map(configured) do
+    requested_pairs =
+      requested
+      |> Enum.map(fn {name, id} -> {String.upcase(to_string(name)), to_string(id)} end)
+      |> MapSet.new()
+
+    configured_pairs =
+      configured
+      |> Enum.map(fn {name, id} -> {String.upcase(to_string(name)), to_string(id)} end)
+      |> MapSet.new()
+
+    MapSet.equal?(requested_pairs, configured_pairs)
+  end
+
+  defp status_options_match?(_requested, _configured), do: false
 
   defp managed_review_envelope?(envelope) when is_map(envelope) do
     Map.get(envelope, :operation, Map.get(envelope, "operation")) in [:review, "review"]
@@ -936,32 +1468,81 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_managed_transition_control(%State{} = state, envelope) do
     target = transition_target(envelope)
-    context = %{stop_reconciled: managed_process_stopped_for_envelope?(state, envelope)}
+    assignment_id = map_value(map_value(envelope, :args) || %{}, :assignment_id)
+    request_id = map_value(envelope, :request_id)
+    current_assignment = get_in(state.managed.data, [:assignments, assignment_id])
+    running? = Map.has_key?(state.running, assignment_id)
 
-    case Rules.apply(state.managed.data, envelope, context) do
-      {:duplicate, response} ->
-        {:reply, {:ok, Map.put(response, :duplicate, true)}, state}
+    case get_in(state.managed.data, [:effect_intents, request_id]) do
+      existing when is_map(existing) ->
+        if existing[:status] in [:pending, :effect_reconciled] do
+          execute_managed_transition(state, current_assignment, existing, %{})
+        else
+          {:reply, {:error, :request_id_conflict, %{request_id: request_id}}, state}
+        end
 
-      {:error, code, details} ->
-        {:reply, {:error, code, details}, state}
+      _ ->
+        # The preview validates the request. Its phase mutation is kept out of
+        # the journal until the owned process has stopped and the provider effect
+        # has reconciled.
+        case Rules.apply(state.managed.data, envelope, %{stop_reconciled: true}) do
+          {:duplicate, response} ->
+            {:reply, {:ok, Map.put(response, :duplicate, true)}, state}
 
-      {:ok, preview, response} ->
-        assignment_id = map_value(map_value(envelope, :args) || %{}, :assignment_id)
-        assignment = get_in(preview, [:assignments, assignment_id]) || get_in(state.managed.data, [:assignments, assignment_id])
-        request_id = map_value(envelope, :request_id)
-        intent = %{request: envelope, request_id: request_id, assignment_id: assignment_id, target: target, context: context}
+          {:error, code, details} ->
+            {:reply, {:error, code, details}, state}
 
-        data =
-          state.managed.data
-          |> put_in([:effect_intents, request_id], Map.merge(intent, %{status: :pending, at: DateTime.utc_now()}))
-          |> append_managed_event(%{operation: :provider_transition_intent, request_id: request_id, assignment_id: assignment_id, target: target})
+          {:ok, _preview, response} ->
+            intent = %{
+              request: envelope,
+              request_id: request_id,
+              assignment_id: assignment_id,
+              target: target,
+              context: %{stop_reconciled: not running?}
+            }
 
-        case persist_managed_data(state, data) do
-          {:ok, intent_state} ->
-            execute_managed_transition(intent_state, assignment, intent, response)
+            data =
+              state.managed.data
+              |> update_in([:assignments, assignment_id], fn assignment ->
+                if running? and is_map(assignment) do
+                  Map.merge(assignment, %{
+                    stop_pending: true,
+                    pending_effect: %{kind: :stop, status: :pending, target: target, request_id: request_id}
+                  })
+                else
+                  assignment
+                end
+              end)
+              |> put_in([:effect_intents, request_id], Map.merge(intent, %{status: :pending, at: DateTime.utc_now()}))
+              |> append_managed_event(%{
+                operation: :provider_transition_intent,
+                request_id: request_id,
+                assignment_id: assignment_id,
+                target: target,
+                stop_pending: running?
+              })
 
-          {:error, reason} ->
-            {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
+            case persist_managed_data(state, data) do
+              {:ok, intent_state} ->
+                stopped_state =
+                  if running?,
+                    do: managed_stop_owned_process(intent_state, assignment_id),
+                    else: intent_state
+
+                if running? do
+                  {:reply,
+                   {:ok,
+                    response
+                    |> Map.put(:pending, true)
+                    |> Map.put(:stop_pending, true)
+                    |> Map.put(:request_id, request_id)}, stopped_state}
+                else
+                  execute_managed_transition(stopped_state, current_assignment, intent, response)
+                end
+
+              {:error, reason} ->
+                {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
+            end
         end
     end
   end
@@ -1246,30 +1827,46 @@ defmodule SymphonyElixir.Orchestrator do
 
     if is_map(assignment) and managed_attempt_matches?(assignment, attempt) == :ok do
       {phase, board_state, pending_effect, stop_pending, blocked_reason} =
-        case {reason, assignment[:phase]} do
-          {{:managed_agent_terminal, _report}, phase} when phase in [:review, :accepted] ->
+        case {reason, assignment[:phase], assignment[:stop_pending], assignment[:source_authoritative]} do
+          {_reason, phase, true, true} ->
+            {phase, phase, %{kind: :run, status: :source_stopped, attempt_id: attempt.attempt_id}, false, nil}
+
+          {{:managed_agent_guard_stop, _guard_reason}, phase, true, false} ->
+            {phase, phase, %{kind: :run, status: :stopped, attempt_id: attempt.attempt_id}, true, assignment[:blocked_reason]}
+
+          {{:managed_agent_terminal, _report}, phase, _, _} when phase in [:review, :accepted] ->
             {phase, phase, %{kind: :run, status: :completed, attempt_id: attempt.attempt_id}, false, nil}
 
-          {{:managed_agent_guard_stop, guard_reason}, phase} when phase in [:review, :waiting] ->
-            {phase, phase, %{kind: :run, status: :guard_stopped, reason: inspect(guard_reason), attempt_id: attempt.attempt_id}, phase == :waiting,
+          {{:managed_agent_guard_stop, guard_reason}, phase, _, _} when phase in [:review, :waiting] ->
+            {phase, phase, %{kind: :run, status: :guard_stopped, reason: inspect(guard_reason), attempt_id: attempt.attempt_id}, false,
              if(phase == :waiting, do: assignment[:blocked_reason], else: nil)}
 
-          {{:managed_agent_guard_stop, guard_reason}, _phase} ->
+          {{:managed_agent_guard_stop, guard_reason}, _phase, _, _} ->
             {:waiting, :waiting, %{kind: :run, status: :guard_stopped, reason: inspect(guard_reason), attempt_id: attempt.attempt_id}, true, inspect(guard_reason)}
 
-          {{:managed_agent_failed, failure}, _phase} ->
-            {:waiting, :waiting, %{kind: :run, status: :unknown, reason: inspect(failure), attempt_id: attempt.attempt_id}, true, inspect(failure)}
+          {{:managed_agent_failed, failure}, _phase, _, _} ->
+            if managed_retry_allowed?(assignment) and managed_transient_failure?(failure) do
+              {:ready, :ready, %{kind: :run, status: :retry_pending, reason: inspect(failure), attempt_id: attempt.attempt_id}, false, nil}
+            else
+              {:waiting, :waiting, %{kind: :run, status: :unknown, reason: inspect(failure), attempt_id: attempt.attempt_id}, true, inspect(failure)}
+            end
 
-          {:normal, phase} when phase in [:review, :waiting, :accepted] ->
+          {:normal, phase, _, _} when phase in [:review, :waiting, :accepted] ->
             {phase, phase, %{kind: :run, status: :completed, attempt_id: attempt.attempt_id}, false, nil}
 
-          {_other, _phase} ->
+          {_other, _phase, _, _} ->
             {:waiting, :waiting, %{kind: :run, status: :unknown, reason: inspect(reason), attempt_id: attempt.attempt_id}, true, inspect(reason)}
         end
+
+      previous_usage_total = get_in(assignment, [:usage, :total_tokens]) || 0
+
+      retrying? = phase == :ready and managed_retry_allowed?(assignment) and match?({:managed_agent_failed, _}, reason)
 
       updated =
         assignment
         |> Map.merge(%{phase: phase, board_state: board_state, pending_effect: pending_effect})
+        |> maybe_put_managed(:retry_count, if(retrying?, do: (assignment[:retry_count] || 0) + 1, else: assignment[:retry_count]))
+        |> maybe_put_managed(:resume_ready, if(retrying?, do: false, else: assignment[:resume_ready]))
         |> Map.put(:usage, %{
           input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
           output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
@@ -1282,6 +1879,7 @@ defmodule SymphonyElixir.Orchestrator do
       data =
         state.managed.data
         |> put_in([:assignments, issue_id], updated)
+        |> update_in([:usage], &managed_finalize_usage(&1, running_entry, previous_usage_total, state.managed.data[:usage_limit_tokens]))
         |> append_managed_event(%{
           operation: :agent_down,
           assignment_id: issue_id,
@@ -1291,7 +1889,7 @@ defmodule SymphonyElixir.Orchestrator do
         })
 
       case persist_managed_data(state, data) do
-        {:ok, next_state} when phase in [:review, :waiting] ->
+        {:ok, next_state} when phase in [:ready, :review, :waiting, :cancelled] ->
           case managed_apply_provider_transition(next_state, updated, phase) do
             {:ok, provider_state} -> provider_state
             {:error, provider_state, _reason} -> provider_state
@@ -1307,6 +1905,34 @@ defmodule SymphonyElixir.Orchestrator do
     else
       state
     end
+  end
+
+  defp managed_retry_allowed?(assignment) when is_map(assignment) do
+    retry_count = assignment[:retry_count] || 0
+    reserved = assignment[:turns_reserved] || 0
+    limit = assignment[:turn_limit] || 20
+
+    is_integer(retry_count) and retry_count < 2 and is_integer(reserved) and
+      is_integer(limit) and reserved < min(limit, 20)
+  end
+
+  defp managed_retry_allowed?(_assignment), do: false
+
+  defp managed_transient_failure?(failure) do
+    text = inspect(failure) |> String.downcase()
+
+    not Enum.any?(
+      [
+        "invalid",
+        "unauthorized",
+        "forbidden",
+        "configuration",
+        "malformed",
+        "turn_budget_exhausted",
+        "policy"
+      ],
+      &String.contains?(text, &1)
+    )
   end
 
   defp maybe_put_managed(map, key, nil), do: Map.delete(map, key)
@@ -2046,7 +2672,8 @@ defmodule SymphonyElixir.Orchestrator do
           generation: generation,
           attempt_id: attempt_id,
           model: route_value(assignment[:route], :model),
-          effort: route_value(assignment[:route], :effort)
+          effort: route_value(assignment[:route], :effort),
+          escalation_reason: assignment[:escalation_reason]
         }
 
       _ ->
@@ -2056,19 +2683,71 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp managed_attempt_for_issue(_state, _issue_id), do: nil
 
-  defp managed_run_options(%State{managed: %{data: data}} = _state, %Issue{id: issue_id}) do
+  defp managed_checkout_options do
+    case Config.settings() do
+      {:ok, %{managed: managed}} ->
+        values = %{
+          node_executable: managed.checkout_node,
+          helper_path: managed.checkout_helper_path,
+          policy_file: managed.checkout_policy_file
+        }
+
+        if Enum.all?(Map.values(values), &(is_binary(&1) and String.trim(&1) != "")) do
+          {:ok, values}
+        else
+          {:error, :managed_checkout_configuration_missing}
+        end
+
+      {:error, reason} ->
+        {:error, {:managed_checkout_configuration_invalid, reason}}
+    end
+  rescue
+    error -> {:error, {:managed_checkout_configuration_invalid, Exception.message(error)}}
+  end
+
+  defp managed_run_options(%State{managed: %{data: data}} = _state, %Issue{id: issue_id} = issue) do
     case managed_attempt_for_issue(%State{managed: %{data: data}}, issue_id) do
       %{assignment_id: ^issue_id} = attempt ->
         owner = self()
+        assignment = get_in(data, [:assignments, issue_id])
 
-        [
-          managed_attempt: attempt,
-          model: attempt[:model],
-          effort: attempt[:effort],
-          on_session: fn info -> managed_callback_call(owner, {:managed_session, attempt, info}) end,
-          before_turn: fn context -> managed_callback_call(owner, {:managed_before_turn, context}) end,
-          report_callback: fn payload -> managed_callback_call(owner, {:managed_report, payload}) end
-        ]
+        resume_options =
+          if is_map(assignment) and assignment[:resume_ready] == true and is_binary(assignment[:thread_id]),
+            do: [resume_thread_id: assignment[:thread_id]],
+            else: []
+
+        checkout_options =
+          case managed_checkout_options() do
+            {:ok, options} -> options
+            {:error, _reason} -> %{}
+          end
+
+        workspace_preparer =
+          if map_size(checkout_options) == 0 do
+            nil
+          else
+            fn workspace ->
+              apply(SymphonyElixir.Managed.Checkout, :prepare, [
+                workspace,
+                issue,
+                assignment,
+                attempt,
+                checkout_options
+              ])
+            end
+          end
+
+        resume_options ++
+          [
+            managed_attempt: attempt,
+            model: attempt[:model],
+            effort: attempt[:effort],
+            escalation_reason: attempt[:escalation_reason],
+            workspace_preparer: workspace_preparer,
+            on_session: fn info -> managed_callback_call(owner, {:managed_session, attempt, info}) end,
+            before_turn: fn context -> managed_callback_call(owner, {:managed_before_turn, context}) end,
+            report_callback: fn payload -> managed_callback_call(owner, {:managed_report, payload}) end
+          ]
 
       _ ->
         []
@@ -2317,26 +2996,69 @@ defmodule SymphonyElixir.Orchestrator do
 
     if enabled do
       with {:ok, journal, loaded} <- Journal.open(config.managed.journal_path),
-           {:ok, data} <- managed_data(loaded) do
-        effects = Keyword.get(opts, :managed_effects, Application.get_env(:symphony_elixir, :managed_effects, SymphonyElixir.Managed.GitHubEffects))
-        {:ok, %{state | managed: %{journal: journal, data: data, effects: effects}}}
+           {:ok, data} <- managed_data(loaded, config) do
+        effects =
+          Keyword.get(
+            opts,
+            :managed_effects,
+            Application.get_env(:symphony_elixir, :managed_effects, SymphonyElixir.Managed.GitHubEffects)
+          )
+
+        source_fetcher =
+          Keyword.get(
+            opts,
+            :managed_source_fetcher,
+            Application.get_env(:symphony_elixir, :managed_source_fetcher, &Tracker.fetch_issues_by_ids/1)
+          )
+
+        {:ok, %{state | managed: %{journal: journal, data: data, effects: effects, source_fetcher: source_fetcher}}}
       end
     else
       {:ok, state}
     end
   end
 
-  defp managed_data(%{} = data) when map_size(data) == 0, do: {:ok, Rules.new()}
+  defp managed_data(%{} = data, config) when map_size(data) == 0 do
+    {:ok, Rules.new(usage_limit_tokens: config.managed.usage_limit_tokens)}
+  end
 
-  defp managed_data(%{version: version} = data) do
+  defp managed_data(%{version: version} = data, config) do
     if version == Rules.version() do
-      {:ok, Map.merge(Rules.new(), data)}
+      defaults = Rules.new(usage_limit_tokens: config.managed.usage_limit_tokens)
+      merged = Map.merge(defaults, data)
+      usage_limit = config.managed.usage_limit_tokens || merged[:usage_limit_tokens]
+      {:ok, Map.put(merged, :usage_limit_tokens, usage_limit) |> normalize_managed_usage()}
     else
       {:error, :managed_journal_schema_mismatch}
     end
   end
 
-  defp managed_data(_data), do: {:error, :managed_journal_schema_mismatch}
+  defp managed_data(_data, _config), do: {:error, :managed_journal_schema_mismatch}
+
+  defp normalize_managed_usage(%{usage: usage} = data) when is_map(usage) do
+    normalized = %{
+      baseline_tokens: nonnegative_integer(usage[:baseline_tokens], 0),
+      cumulative_tokens: nonnegative_integer(usage[:cumulative_tokens], 0),
+      inflight_tokens: nonnegative_integer(usage[:inflight_tokens], 0),
+      overshoot_tokens: nonnegative_integer(usage[:overshoot_tokens], 0),
+      cap_reached: usage[:cap_reached] == true
+    }
+
+    Map.put(data, :usage, normalized)
+  end
+
+  defp normalize_managed_usage(data) when is_map(data) do
+    Map.put(data, :usage, %{
+      baseline_tokens: 0,
+      cumulative_tokens: 0,
+      inflight_tokens: 0,
+      overshoot_tokens: 0,
+      cap_reached: false
+    })
+  end
+
+  defp nonnegative_integer(value, _default) when is_integer(value) and value >= 0, do: value
+  defp nonnegative_integer(_value, default), do: default
 
   defp notify_dashboard do
     StatusDashboard.notify_update()

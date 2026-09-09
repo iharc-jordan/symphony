@@ -12,6 +12,17 @@ base commit, repository, workspace, revision and generation. Underlying issue
 ownership remains the orchestrator's responsibility. Issue requirements are not
 copied into the hook context or checkout input.
 
+Configure these values under `managed` in the service-owned `WORKFLOW.md`:
+
+```yaml
+managed:
+  checkout_node: /opt/node/bin/node
+  checkout_helper_path: /opt/symphony/plugin/mcp/cli.mjs
+  checkout_policy_file: /etc/symphony-managed/checkout-policy.json
+```
+
+`managed.enabled: true` requires all three values and a non-empty control token.
+
 Trusted options are absolute paths:
 
 - `node_executable`: the existing Linux Node executable.

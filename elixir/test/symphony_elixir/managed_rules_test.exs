@@ -157,7 +157,14 @@ defmodule SymphonyElixir.ManagedRulesTest do
       |> put_in([:assignments, "issue-1", :board_state], :active)
       |> put_in([:assignments, "issue-1", :revision], 2)
 
-    request = envelope("revise-active", :revise, %{assignment_id: "issue-1", expected_revision: 2, stop_reconciled: true, changes: %{route: %{model: "gpt-5.6-terra", effort: "max"}}})
+    request =
+      envelope("revise-active", :revise, %{
+        assignment_id: "issue-1",
+        expected_revision: 2,
+        stop_reconciled: true,
+        changes: %{route: %{model: "gpt-5.6-terra", effort: "max"}, escalation_reason: "fixture escalation"}
+      })
+
     assert {:error, :active_assignment_stop_required, %{}} = Rules.apply(state, request)
 
     assert {:ok, revised, _} =
@@ -178,7 +185,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
       envelope("revise-runtime-field", :revise, %{
         assignment_id: "issue-1",
         expected_revision: 2,
-        changes: %{route: %{model: "gpt-5.6-terra", effort: "max"}, stop_pending: false}
+        changes: %{route: %{model: "gpt-5.6-terra", effort: "max"}, escalation_reason: "fixture escalation", stop_pending: false}
       })
 
     assert {:error, :invalid_argument, %{argument: :changes, fields: [:stop_pending]}} =

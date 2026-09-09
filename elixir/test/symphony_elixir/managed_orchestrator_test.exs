@@ -2,6 +2,10 @@ defmodule SymphonyElixir.ManagedReviewEffectsStub do
   def review(_assignment, _args, _context) do
     {:ok, %{provider_state: :review, provider_final_state: :accepted, issue_final_state: :closed, reconciled: true, external_effects: %{status: :ok, issue_close: :ok}}}
   end
+
+  def transition(_assignment, target, _context) do
+    {:ok, %{provider_state: target, reconciled: true, external_effects: %{status: :ok}}}
+  end
 end
 
 defmodule SymphonyElixir.ManagedOrchestratorTest do

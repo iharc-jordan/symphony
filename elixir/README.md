@@ -215,6 +215,14 @@ codex:
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
 
+### Managed control plane
+
+Managed mode is an opt in control plane for GitHub Projects assignments. It journals
+control requests and provider effects, requires a service owned control token, and
+prepares each worker workspace through the configured trusted checkout helper. See
+[managed checkout preparation](docs/managed-checkout.md) for the private policy file,
+path boundaries, and per-attempt input contract.
+
 ### Linear adapter profile
 
 - Config: use `tracker.kind: linear` with `tracker.provider.endpoint` (default

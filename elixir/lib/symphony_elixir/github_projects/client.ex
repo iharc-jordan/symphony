@@ -169,6 +169,38 @@ defmodule SymphonyElixir.GitHubProjects.Client do
     fetch_issues_by_ids(ids, Config.settings!().tracker, &perform_request/2)
   end
 
+  @doc """
+  Fetch the project identity and status field configured for the tracker.
+
+  The result is the service-owned binding shape used by managed controls. It
+  is intentionally read from WORKFLOW.md and GitHub, never from a control
+  request.
+  """
+  @spec fetch_configured_binding(keyword()) :: {:ok, map()} | {:error, term()}
+  def fetch_configured_binding(opts \\ []) when is_list(opts) do
+    tracker = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
+    request_fun = Keyword.get(opts, :request_fun, &perform_request/2)
+
+    with {:ok, settings} <- settings(tracker),
+         {:ok, project} <- fetch_project(settings, request_fun),
+         {:ok, status_field} <- fetch_status_field(settings, project.id, request_fun) do
+      status_options =
+        Enum.reduce(status_field.options, %{}, fn {option_id, option_name}, acc ->
+          Map.put(acc, option_name, option_id)
+        end)
+
+      {:ok,
+       %{
+         project_id: project.id,
+         project_number: project.number,
+         status_field_id: status_field.id,
+         status_options: status_options
+       }}
+    end
+  rescue
+    error -> {:error, {:github_projects_binding_fetch_failed, Exception.message(error)}}
+  end
+
   @spec graphql(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def graphql(query, variables \\ %{}, opts \\ [])
       when is_binary(query) and is_map(variables) and is_list(opts) do

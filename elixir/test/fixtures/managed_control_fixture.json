@@ -205,6 +205,7 @@
               "model": "gpt-5.6-terra",
               "effort": "max"
             },
+            "escalation_reason": "fixture escalation",
             "resources": [
               "repo:OWNER/FIXTURE_A"
             ],

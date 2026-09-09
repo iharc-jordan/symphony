@@ -14,7 +14,8 @@ defmodule SymphonyElixir.Managed.Rules do
     "gpt-5.6-luna" => ~w(xhigh max),
     "gpt-5.6-terra" => ~w(xhigh max)
   }
-  @revision_change_keys ~w(base_commit route resources dependencies requirements requirements_fingerprint requirements_revision)a
+  @default_route %{model: "gpt-5.6-luna", effort: "xhigh"}
+  @revision_change_keys ~w(base_commit route resources dependencies requirements requirements_fingerprint requirements_revision escalation_reason)a
 
   @type state :: map()
   @type envelope :: map()
@@ -40,7 +41,16 @@ defmodule SymphonyElixir.Managed.Rules do
       events: Keyword.get(opts, :events, []),
       external_reconciliations: Keyword.get(opts, :external_reconciliations, %{}),
       review_intents: Keyword.get(opts, :review_intents, %{}),
-      effect_intents: Keyword.get(opts, :effect_intents, %{})
+      effect_intents: Keyword.get(opts, :effect_intents, %{}),
+      usage:
+        Keyword.get(opts, :usage, %{
+          baseline_tokens: Keyword.get(opts, :baseline_tokens, 0),
+          cumulative_tokens: Keyword.get(opts, :cumulative_tokens, 0),
+          inflight_tokens: 0,
+          overshoot_tokens: 0,
+          cap_reached: false
+        }),
+      usage_limit_tokens: Keyword.get(opts, :usage_limit_tokens)
     }
   end
 
@@ -62,6 +72,7 @@ defmodule SymphonyElixir.Managed.Rules do
   end
 
   @spec apply(state(), envelope()) :: result()
+  @spec apply(state(), envelope(), map()) :: result()
   def apply(state, envelope, context \\ %{}) when is_map(state) and is_map(envelope) do
     with {:ok, normalized} <- normalize_envelope(envelope),
          :ok <- validate_request_id(normalized.request_id),
@@ -166,18 +177,28 @@ defmodule SymphonyElixir.Managed.Rules do
   end
 
   @spec validate_route(map()) :: :ok | {:error, atom(), map()}
-  def validate_route(route) when is_map(route) do
+  def validate_route(route), do: validate_route(route, nil)
+
+  @spec validate_route(map(), String.t() | nil) :: :ok | {:error, atom(), map()}
+  def validate_route(route, escalation_reason) when is_map(route) do
     model = route |> Map.get(:model, Map.get(route, "model")) |> normalize_text()
     effort = route |> Map.get(:effort, Map.get(route, "effort")) |> normalize_text()
+    default? = model == @default_route.model and effort == @default_route.effort
+    reason = normalize_text(escalation_reason)
 
-    if model in Map.keys(@allowed_routes) and effort in Map.get(@allowed_routes, model, []) do
-      :ok
-    else
-      {:error, :invalid_route, %{model: model, effort: effort}}
+    cond do
+      model not in Map.keys(@allowed_routes) or effort not in Map.get(@allowed_routes, model, []) ->
+        {:error, :invalid_route, %{model: model, effort: effort}}
+
+      not default? and is_nil(reason) ->
+        {:error, :route_escalation_reason_required, %{model: model, effort: effort}}
+
+      true ->
+        :ok
     end
   end
 
-  def validate_route(_route), do: {:error, :invalid_route, %{}}
+  def validate_route(_route, _escalation_reason), do: {:error, :invalid_route, %{}}
 
   @spec validate_transition(atom() | String.t(), atom() | String.t()) ::
           :ok | {:error, atom(), map()}
@@ -268,9 +289,31 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp apply_binding(state, request, canonical, args) do
     with :ok <- expected_revision(state, args, :global),
-         {:ok, binding} <- binding_from_args(args) do
+         {:ok, binding} <- binding_from_args(args),
+         :ok <- binding_rebind_allowed?(state, binding) do
       response = %{operation: :bind_project, binding: binding, revision: state.control_revision + 1}
       commit(state, request, canonical, response, %{binding: binding})
+    end
+  end
+
+  # A project binding is an authority boundary. Replacing it while any
+  # assignment is still owned by the service could make the old worker mutate
+  # a different project after restart.
+  defp binding_rebind_allowed?(%{binding: nil}, _binding), do: :ok
+
+  defp binding_rebind_allowed?(state, binding) do
+    if state.binding == binding do
+      :ok
+    else
+      case Enum.find(state.assignments, fn {_id, assignment} ->
+             is_map(assignment) and phase(assignment[:phase]) not in @terminal_phases
+           end) do
+        nil ->
+          :ok
+
+        {assignment_id, assignment} ->
+          {:error, :binding_in_use, %{assignment_id: assignment_id, phase: phase(assignment[:phase])}}
+      end
     end
   end
 
@@ -428,13 +471,21 @@ defmodule SymphonyElixir.Managed.Rules do
     route = Map.get(args, :route, Map.get(args, "route", %{model: "gpt-5.6-luna", effort: "xhigh"}))
     resources = Map.get(args, :resources, Map.get(args, "resources", []))
     dependencies = Map.get(args, :dependencies, Map.get(args, "dependencies", []))
+    project_item_id = text_value(args, :project_item_id) || text_value(args, :native_project_item_id) || assignment_id
+    native_issue_id = text_value(args, :native_issue_id) || text_value(args, :issue_id) || text_value(args, :issue_node_id)
+
+    native_repository_id =
+      text_value(args, :native_repository_id) ||
+        text_value(args, :repository_id) ||
+        text_value(args, :repository_node_id)
 
     with :ok <- present(assignment_id, :assignment_id),
          :ok <- present(repository, :repository),
          :ok <- positive(issue_number, :issue_number),
          :ok <- present(base_commit, :base_commit),
          :ok <- phase_is(board_state, :ready),
-         :ok <- validate_route(route),
+         escalation_reason <- text_value(args, :escalation_reason),
+         :ok <- validate_route(route, escalation_reason),
          :ok <- list_of_binaries(resources, :resources),
          :ok <- list_of_binaries(dependencies, :dependencies),
          {:ok, requirements} <- requirement_metadata(args) do
@@ -450,6 +501,14 @@ defmodule SymphonyElixir.Managed.Rules do
          resources: Enum.uniq(resources),
          dependencies: Enum.uniq(dependencies),
          route: route,
+         escalation_reason: escalation_reason,
+         project_item_id: project_item_id,
+         native_issue_id: native_issue_id,
+         native_repository_id: native_repository_id,
+         underlying_issue_id: native_issue_id || repository <> "#" <> Integer.to_string(issue_number),
+         turn_limit: min(number_value(args, :turn_limit) || 20, 20),
+         turns_reserved: 0,
+         retry_count: 0,
          enrolled_at: DateTime.utc_now()
        }
        |> Map.merge(requirements)}
@@ -486,6 +545,7 @@ defmodule SymphonyElixir.Managed.Rules do
         requirement_body = Map.get(changes, :requirements)
         fingerprint = text_value(changes, :requirements_fingerprint)
         requirement_revision = Map.get(changes, :requirements_revision)
+        escalation_reason = text_value(changes, :escalation_reason)
         base_commit = text_value(changes, :base_commit)
         resources = Map.get(changes, :resources)
         dependencies = Map.get(changes, :dependencies)
@@ -503,6 +563,7 @@ defmodule SymphonyElixir.Managed.Rules do
             |> maybe_put(:base_commit, base_commit)
             |> maybe_put(:requirements_fingerprint, fingerprint)
             |> maybe_put(:requirements_revision, requirement_revision)
+            |> maybe_put(:escalation_reason, escalation_reason)
 
           {:ok, sanitized}
         end
@@ -521,8 +582,12 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp optional_route(changes) do
     case Map.get(changes, :route) do
-      nil -> :ok
-      route -> if validate_route(route) == :ok, do: :ok, else: validate_route(route)
+      nil ->
+        :ok
+
+      route ->
+        reason = text_value(changes, :escalation_reason) || text_value(route, :escalation_reason)
+        if validate_route(route, reason) == :ok, do: :ok, else: validate_route(route, reason)
     end
   end
 
@@ -561,8 +626,12 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp maybe_route(changes) do
     case Map.get(changes, :route, Map.get(changes, "route")) do
-      nil -> {:ok, nil}
-      route -> if validate_route(route) == :ok, do: {:ok, route}, else: validate_route(route)
+      nil ->
+        {:ok, nil}
+
+      route ->
+        reason = text_value(changes, :escalation_reason) || text_value(route, :escalation_reason)
+        if validate_route(route, reason) == :ok, do: {:ok, route}, else: validate_route(route, reason)
     end
   end
 
@@ -582,13 +651,29 @@ defmodule SymphonyElixir.Managed.Rules do
     do: duplicate_identity_free_after_revision?(state, nil, assignment)
 
   defp duplicate_identity_free_after_revision?(state, own_id, assignment) do
+    identity = assignment_identity(assignment)
+
     duplicate =
       Enum.find(state.assignments, fn {id, existing} ->
-        id != own_id and existing.repository == assignment.repository and existing.issue_number == assignment.issue_number and existing.phase not in @terminal_phases
+        id != own_id and assignment_identity(existing) == identity and phase(existing[:phase]) not in @terminal_phases
       end)
 
     if is_nil(duplicate), do: :ok, else: {:error, :duplicate_underlying_identity, %{assignment_id: elem(duplicate, 0)}}
   end
+
+  defp assignment_identity(assignment) when is_map(assignment) do
+    native_issue_id = text_value(assignment, :native_issue_id) || text_value(assignment, :issue_id)
+
+    if native_issue_id do
+      "github:issue:" <> native_issue_id
+    else
+      repository = text_value(assignment, :repository) || ""
+      issue_number = number_value(assignment, :issue_number) || 0
+      repository <> "#" <> Integer.to_string(issue_number)
+    end
+  end
+
+  defp assignment_identity(_assignment), do: ""
 
   defp resources_free?(state, resources, own_id \\ nil) do
     conflicting =
@@ -687,6 +772,14 @@ defmodule SymphonyElixir.Managed.Rules do
   defp normalize_key("request_id"), do: :request_id
   defp normalize_key("assignment_id"), do: :assignment_id
   defp normalize_key("project_id"), do: :project_id
+  defp normalize_key("project_item_id"), do: :project_item_id
+  defp normalize_key("native_project_item_id"), do: :native_project_item_id
+  defp normalize_key("native_issue_id"), do: :native_issue_id
+  defp normalize_key("issue_id"), do: :issue_id
+  defp normalize_key("issue_node_id"), do: :issue_node_id
+  defp normalize_key("native_repository_id"), do: :native_repository_id
+  defp normalize_key("repository_id"), do: :repository_id
+  defp normalize_key("repository_node_id"), do: :repository_node_id
   defp normalize_key("status_field_id"), do: :status_field_id
   defp normalize_key("project_number"), do: :project_number
   defp normalize_key("status_options"), do: :status_options
@@ -713,6 +806,8 @@ defmodule SymphonyElixir.Managed.Rules do
   defp normalize_key("requirements"), do: :requirements
   defp normalize_key("requirements_fingerprint"), do: :requirements_fingerprint
   defp normalize_key("requirements_revision"), do: :requirements_revision
+  defp normalize_key("escalation_reason"), do: :escalation_reason
+  defp normalize_key("turn_limit"), do: :turn_limit
   defp normalize_key("issue_body"), do: :issue_body
   defp normalize_key(key), do: key
 

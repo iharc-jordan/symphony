@@ -86,7 +86,6 @@ defmodule SymphonyElixir.Config do
   end
 
   @doc false
-  @spec local_workspace_root() :: Path.t()
   @spec managed_enabled?() :: {:ok, boolean()} | {:error, term()}
   def managed_enabled? do
     with {:ok, settings} <- settings() do
@@ -102,6 +101,7 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec local_workspace_root() :: Path.t()
   def local_workspace_root do
     workflow_dir = Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
     Path.expand(settings!().workspace.root, workflow_dir)
