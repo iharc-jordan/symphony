@@ -1,11 +1,17 @@
 {
   "workflow_managed": {
     "enabled": true,
-    "journal_path": "/var/lib/symphony-managed/journal.log",
-    "control_token_file": "/run/symphony-managed/control.token",
+    "journal_path": "/home/example/.local/state/codex-orchestration/journal.log",
+    "control_token_file": "/home/example/.config/codex-orchestration/control.token",
     "event_limit": 100,
     "event_wait_ms": 5000
   },
+  "route_cases": [
+    {"route":{"model":"gpt-5.6-luna","effort":"xhigh"},"accepted":true},
+    {"route":{"model":"gpt-5.6-terra","effort":"max"},"escalation_reason":"Fixture requires additional reasoning depth","accepted":true},
+    {"route":{"model":"gpt-5.6-terra","effort":"max"},"accepted":false},
+    {"route":{"model":"gpt-6-astra","effort":"xhigh"},"escalation_reason":"Not an allowed worker route","accepted":false}
+  ],
   "http": {
     "state": {
       "method": "GET",
@@ -20,6 +26,12 @@
         "assignments": {}
       }
     },
+    "events": {
+      "method": "GET",
+      "path": "/api/v1/managed/events?after=0&wait_ms=1000&limit=100",
+      "authorization": "Bearer <token-file-value>",
+      "response": {"after": 0, "events": [], "cursor": 0}
+    },
     "bind_project": {
       "method": "POST",
       "path": "/api/v1/managed/control",
@@ -29,9 +41,9 @@
         "args": {
           "expected_revision": 0,
           "project": {
-            "project_id": "PVT_kwDOexample",
-            "project_number": 7,
-            "status_field_id": "PVTSSFexample",
+            "project_id": "project-example",
+            "project_number": 4,
+            "status_field_id": "status-field-example",
             "status_options": {
               "READY": "option-ready",
               "ACTIVE": "option-active",
@@ -40,18 +52,16 @@
               "WAITING": "option-waiting",
               "CANCELLED": "option-cancelled"
             },
-            "repositories": [
-              "OWNER/FIXTURE_A"
-            ]
+            "repositories": ["fixture-owner/fixture-repository"]
           }
         }
       },
       "response": {
         "operation": "bind_project",
         "binding": {
-          "project_id": "PVT_kwDOexample",
-          "project_number": 7,
-          "status_field_id": "PVTSSFexample",
+          "project_id": "project-example",
+          "project_number": 4,
+          "status_field_id": "status-field-example",
           "status_options": {
             "READY": "option-ready",
             "ACTIVE": "option-active",
@@ -60,9 +70,7 @@
             "WAITING": "option-waiting",
             "CANCELLED": "option-cancelled"
           },
-          "repositories": [
-            "OWNER/FIXTURE_A"
-          ]
+          "repositories": ["fixture-owner/fixture-repository"]
         },
         "revision": 1
       }
@@ -71,334 +79,125 @@
       "method": "POST",
       "path": "/api/v1/managed/control",
       "body": {
-        "request_id": "enroll-issue-42",
+        "request_id": "enroll-fixture-1",
         "operation": "enroll",
         "args": {
           "expected_revision": 1,
-          "assignment_id": "fixture-item-42",
-          "repository": "OWNER/FIXTURE_A",
+          "assignment_id": "project-item-example",
+          "repository": "fixture-owner/fixture-repository",
           "issue_number": 42,
           "base_commit": "0123456789abcdef0123456789abcdef01234567",
           "board_state": "READY",
           "owner": "fixture-owner",
-          "resources": [
-            "repo:OWNER/FIXTURE_A"
-          ],
+          "resources": ["repo:fixture-owner/fixture-repository"],
           "dependencies": [],
-          "route": {
-            "model": "gpt-5.6-luna",
-            "effort": "xhigh"
-          },
-          "requirements_fingerprint": "sha256:issue-body-revision-1",
+          "route": {"model": "gpt-5.6-luna", "effort": "xhigh"},
+          "requirements_fingerprint": "sha256:fixture-requirements",
           "requirements_revision": 1
         }
       },
       "response": {
         "operation": "enroll",
-        "assignment_id": "fixture-item-42",
+        "assignment_id": "project-item-example",
         "revision": 1,
         "phase": "ready",
         "control_revision": 2
-      }
-    },
-    "review": {
-      "body": {
-        "request_id": "review-issue-42",
-        "operation": "review",
-        "args": {
-          "assignment_id": "fixture-item-42",
-          "expected_revision": 2,
-          "disposition": "accepted",
-          "evidence": [
-            "https://example.invalid/evidence/fixture-issue-42"
-          ]
-        }
-      },
-      "response": {
-        "operation": "review",
-        "assignment_id": "fixture-item-42",
-        "revision": 3,
-        "phase": "accepted",
-        "disposition": "accepted",
-        "issue_close": "ok",
-        "control_revision": 8
-      },
-      "service_prerequisite": {
-        "internal_call": "Managed.GitHubEffects.review",
-        "ordering": [
-          {
-            "step": "authorize_review",
-            "result": "accepted_only_after_revision_and_phase_checks"
-          },
-          {
-            "step": "journal_review_intent",
-            "result": "durable",
-            "request_id": "review-issue-42"
-          },
-          {
-            "step": "verify_current_material_and_native_identity",
-            "result": "ok"
-          },
-          {
-            "step": "write_project_status",
-            "value": "ACCEPTED",
-            "result": "ok"
-          },
-          {
-            "step": "close_native_issue",
-            "state_reason": "COMPLETED",
-            "result": "ok"
-          },
-          {
-            "step": "refetch_and_reconcile",
-            "result": "ok"
-          }
-        ],
-        "facts": {
-          "revision": 2,
-          "provider_state": "REVIEW",
-          "provider_final_state": "ACCEPTED",
-          "issue_final_state": "CLOSED",
-          "issue_state_reason": "COMPLETED",
-          "reconciled": true,
-          "external_effects": {
-            "status": "ok",
-            "issue_close": "ok"
-          }
-        },
-        "caller_supplied_facts": false,
-        "note": "The issue close is performed only after durable review authorization; it is not a prerequisite supplied by the caller."
-      }
-    },
-    "errors": {
-      "stale_revision": {
-        "status": 409,
-        "body": {
-          "error": {
-            "code": "stale_revision",
-            "message": "Managed request failed"
-          }
-        }
-      },
-      "unauthorized": {
-        "status": 401,
-        "body": {
-          "error": {
-            "code": "unauthorized",
-            "message": "Unauthorized"
-          }
-        }
       }
     },
     "revise": {
       "method": "POST",
       "path": "/api/v1/managed/control",
       "body": {
-        "request_id": "revise-issue-42",
+        "request_id": "revise-fixture-1",
         "operation": "revise",
         "args": {
-          "assignment_id": "fixture-item-42",
+          "assignment_id": "project-item-example",
           "expected_revision": 1,
           "changes": {
             "base_commit": "fedcba9876543210fedcba9876543210fedcba98",
-            "route": {
-              "model": "gpt-5.6-terra",
-              "effort": "max"
-            },
-            "escalation_reason": "fixture escalation",
-            "resources": [
-              "repo:OWNER/FIXTURE_A"
-            ],
-            "dependencies": [],
-            "requirements": {
-              "source": "fixture-only-requirements"
-            },
-            "requirements_fingerprint": "sha256:fixture-revision-2",
+            "requirements_fingerprint": "sha256:fixture-requirements-2",
             "requirements_revision": 2
           }
         }
       },
       "response": {
         "operation": "revise",
-        "assignment_id": "fixture-item-42",
+        "assignment_id": "project-item-example",
         "revision": 2,
-        "phase": "ready",
-        "control_revision": 3
-      },
-      "precondition": "The assignment is ready and no provider effect is required before the revision."
+        "phase": "ready"
+      }
     },
     "pause": {
       "method": "POST",
       "path": "/api/v1/managed/control",
       "body": {
-        "request_id": "pause-managed-1",
+        "request_id": "pause-fixture-1",
         "operation": "pause",
-        "args": {
-          "expected_revision": 3
-        }
+        "args": {"expected_revision": 2, "disable": false, "reason": "fixture pause"}
       },
-      "response": {
-        "operation": "pause",
-        "revision": 4,
-        "paused": true,
-        "disabled": false
-      }
+      "response": {"operation": "pause", "revision": 3, "paused": true, "disabled": false}
     },
     "resume": {
       "method": "POST",
       "path": "/api/v1/managed/control",
       "body": {
-        "request_id": "resume-managed-1",
+        "request_id": "resume-fixture-1",
         "operation": "resume",
-        "args": {
-          "expected_revision": 4
-        }
+        "args": {"expected_revision": 3, "reason": "fixture resume"}
       },
-      "response": {
-        "operation": "resume",
-        "revision": 5,
-        "paused": false,
-        "disabled": false
-      }
+      "response": {"operation": "resume", "revision": 4, "paused": false, "disabled": false}
     },
     "interrupt": {
       "method": "POST",
       "path": "/api/v1/managed/control",
       "body": {
-        "request_id": "interrupt-issue-42",
+        "request_id": "interrupt-fixture-1",
         "operation": "interrupt",
-        "args": {
-          "assignment_id": "fixture-item-42",
-          "expected_revision": 2,
-          "reason": "operator stop"
-        }
+        "args": {"assignment_id": "project-item-example", "expected_revision": 1, "reason": "fixture interruption"}
       },
-      "response": {
-        "operation": "interrupt",
-        "assignment_id": "fixture-item-42",
-        "revision": 3,
-        "phase": "waiting",
-        "control_revision": 6
-      },
-      "precondition": "A managed attempt is active and the service confirms the process has stopped before writing WAITING."
+      "response": {"operation": "interrupt", "assignment_id": "project-item-example", "revision": 2, "phase": "waiting", "reason": "fixture interruption"}
     },
     "cancel": {
       "method": "POST",
       "path": "/api/v1/managed/control",
       "body": {
-        "request_id": "cancel-issue-42",
+        "request_id": "cancel-fixture-1",
         "operation": "cancel",
+        "args": {"assignment_id": "project-item-example", "expected_revision": 1, "reason": "fixture cancellation"}
+      },
+      "response": {"operation": "cancel", "assignment_id": "project-item-example", "revision": 2, "phase": "cancelled", "reason": "fixture cancellation"}
+    },
+    "review": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "review-fixture-1",
+        "operation": "review",
         "args": {
-          "assignment_id": "fixture-item-42",
-          "expected_revision": 3,
-          "reason": "fixture cancellation"
+          "assignment_id": "project-item-example",
+          "expected_revision": 1,
+          "disposition": "accepted",
+          "evidence": ["https://example.invalid/evidence/fixture-1"]
         }
       },
       "response": {
-        "operation": "cancel",
-        "assignment_id": "fixture-item-42",
-        "revision": 4,
-        "phase": "cancelled",
-        "control_revision": 7
+        "operation": "review",
+        "assignment_id": "project-item-example",
+        "revision": 2,
+        "phase": "accepted",
+        "disposition": "accepted",
+        "issue_close": "ok"
+      }
+    },
+    "errors": {
+      "stale_revision": {
+        "status": 409,
+        "body": {"error": {"code": "stale_revision", "message": "Managed request failed"}}
       },
-      "precondition": "The service confirms the process has stopped before writing CANCELLED."
+      "unauthorized": {
+        "status": 401,
+        "body": {"error": {"code": "unauthorized", "message": "Unauthorized"}}
+      }
     }
-  },
-  "events": [
-    {
-      "cursor": 1,
-      "operation": "bind_project",
-      "request_id": "bind-project-1",
-      "control_revision": 1
-    },
-    {
-      "cursor": 2,
-      "operation": "enroll",
-      "request_id": "enroll-issue-42",
-      "assignment_id": "fixture-item-42",
-      "phase": "ready",
-      "control_revision": 2
-    },
-    {
-      "cursor": 3,
-      "operation": "revise",
-      "request_id": "revise-issue-42",
-      "assignment_id": "fixture-item-42",
-      "phase": "ready",
-      "control_revision": 3
-    },
-    {
-      "cursor": 4,
-      "operation": "pause",
-      "request_id": "pause-managed-1",
-      "control_revision": 4
-    },
-    {
-      "cursor": 5,
-      "operation": "resume",
-      "request_id": "resume-managed-1",
-      "control_revision": 5
-    },
-    {
-      "cursor": 6,
-      "operation": "dispatch_started",
-      "assignment_id": "fixture-item-42",
-      "phase": "active"
-    },
-    {
-      "cursor": 7,
-      "operation": "interrupt",
-      "request_id": "interrupt-issue-42",
-      "assignment_id": "fixture-item-42",
-      "phase": "waiting",
-      "control_revision": 6
-    },
-    {
-      "cursor": 8,
-      "operation": "review_intent",
-      "request_id": "review-issue-42",
-      "assignment_id": "fixture-item-42",
-      "phase": "review_pending"
-    },
-    {
-      "cursor": 9,
-      "operation": "provider_status",
-      "assignment_id": "fixture-item-42",
-      "value": "ACCEPTED",
-      "result": "ok"
-    },
-    {
-      "cursor": 10,
-      "operation": "issue_close",
-      "assignment_id": "fixture-item-42",
-      "value": "CLOSED",
-      "state_reason": "COMPLETED",
-      "result": "ok"
-    },
-    {
-      "cursor": 11,
-      "operation": "reconcile",
-      "assignment_id": "fixture-item-42",
-      "provider_state": "REVIEW",
-      "provider_final_state": "ACCEPTED",
-      "issue_final_state": "CLOSED",
-      "control_revision": 7
-    },
-    {
-      "cursor": 12,
-      "operation": "review",
-      "request_id": "review-issue-42",
-      "assignment_id": "fixture-item-42",
-      "phase": "accepted",
-      "control_revision": 8
-    },
-    {
-      "cursor": 13,
-      "operation": "cancel",
-      "request_id": "cancel-issue-42",
-      "assignment_id": "fixture-item-42",
-      "phase": "cancelled",
-      "control_revision": 7
-    }
-  ]
+  }
 }
