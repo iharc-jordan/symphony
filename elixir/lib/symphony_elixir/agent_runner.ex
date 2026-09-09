@@ -140,25 +140,28 @@ defmodule SymphonyElixir.AgentRunner do
       {:ok, turn_limit} ->
         case AppServer.start_session(workspace, app_server_opts) do
           {:ok, session} ->
-            try do
-              case invoke_on_session(on_session, AppServer.session_info(session), issue) do
-                :ok ->
-                  do_run_codex_turns(
-                    session,
-                    workspace,
-                    issue,
-                    opts,
-                    runner_context,
-                    1,
-                    turn_limit
-                  )
+            result =
+              try do
+                case invoke_on_session(on_session, AppServer.session_info(session), issue) do
+                  :ok ->
+                    do_run_codex_turns(
+                      session,
+                      workspace,
+                      issue,
+                      opts,
+                      runner_context,
+                      1,
+                      turn_limit
+                    )
 
-                {:error, reason} ->
-                  {:error, reason}
+                  {:error, reason} ->
+                    {:error, reason}
+                end
+              catch
+                kind, reason -> {:error, {:session_exception, kind, reason}}
               end
-            after
-              AppServer.stop_session(session)
-            end
+
+            combine_session_stop(result, AppServer.stop_session(session))
 
           {:error, reason} ->
             {:error, reason}
@@ -255,6 +258,16 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp managed_exit_reason(:turn_budget_exhausted), do: {:managed_agent_guard_stop, :turn_budget_exhausted}
   defp managed_exit_reason(reason), do: {:managed_agent_failed, reason}
+
+  defp combine_session_stop(result, :ok), do: result
+
+  defp combine_session_stop({:error, operation_reason}, {:error, stop_reason}) do
+    {:error, {:session_stop_failed, stop_reason, operation_reason}}
+  end
+
+  defp combine_session_stop(_result, {:error, stop_reason}) do
+    {:error, {:session_stop_failed, stop_reason}}
+  end
 
   defp app_server_opts(opts, worker_host) do
     opts

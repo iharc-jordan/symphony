@@ -344,6 +344,173 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "managed stale stop cannot terminate a newer attempt in the same workspace" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-managed-stale-stop-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-STALE-STOP")
+    codex_binary = Path.join(test_root, "fake-codex")
+    File.mkdir_p!(workspace)
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    while IFS= read -r line; do
+      case "$line" in
+        *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+        *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-stale"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server"
+    )
+
+    attempt_a = %{
+      assignment_id: "issue-stale-stop",
+      revision: "rev-1",
+      generation: 1,
+      attempt_id: "attempt-a"
+    }
+
+    attempt_b = %{attempt_a | generation: 2, attempt_id: "attempt-b"}
+
+    session_a = nil
+    session_b = nil
+
+    try do
+      assert {:ok, session_a} =
+               AppServer.start_session(workspace,
+                 managed_attempt: attempt_a,
+                 model: "gpt-5.6-luna",
+                 effort: "xhigh"
+               )
+
+      assert {:ok, session_b} =
+               AppServer.start_session(workspace,
+                 managed_attempt: attempt_b,
+                 model: "gpt-5.6-luna",
+                 effort: "xhigh"
+               )
+
+      unit_a = session_a.metadata.systemd_unit
+      unit_b = session_b.metadata.systemd_unit
+      pid_b = session_b.metadata.codex_process_identity.pid
+      assert unit_a != unit_b
+
+      assert {_, 0} =
+               System.cmd(
+                 "systemctl",
+                 [
+                   "--user",
+                   "kill",
+                   "--kill-who=all",
+                   "--signal=KILL",
+                   unit_a
+                 ],
+                 stderr_to_stdout: true
+               )
+
+      Process.sleep(150)
+      assert :ok = AppServer.stop_session(session_a)
+      assert File.exists?("/proc/#{pid_b}")
+      assert {state, 0} = System.cmd("systemctl", ["--user", "show", unit_b, "--property=ActiveState", "--value"])
+      assert String.trim(state) == "active"
+    after
+      stop_optional_session(session_a)
+      stop_optional_session(session_b)
+
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "recorded process metadata stops an owned scope after the port is gone" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-managed-recorded-stop-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-RECORDED-STOP")
+    codex_binary = Path.join(test_root, "fake-codex")
+    File.mkdir_p!(workspace)
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    while IFS= read -r line; do
+      case "$line" in
+        *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+        *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-recorded"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server"
+    )
+
+    metadata = nil
+
+    try do
+      assert {:ok, session} =
+               AppServer.start_session(workspace,
+                 managed_attempt: %{
+                   assignment_id: "issue-recorded-stop",
+                   revision: "rev-1",
+                   generation: 1,
+                   attempt_id: "attempt-recorded"
+                 },
+                 model: "gpt-5.6-luna",
+                 effort: "xhigh"
+               )
+
+      metadata = session.metadata
+      assert Port.close(session.port)
+      Process.sleep(250)
+      assert :ok = AppServer.stop_recorded_process(metadata)
+
+      assert {state, 0} =
+               System.cmd("systemctl", [
+                 "--user",
+                 "show",
+                 metadata.systemd_unit,
+                 "--property=ActiveState",
+                 "--value"
+               ])
+
+      assert String.trim(state) in ["inactive", "failed"]
+    after
+      stop_optional_recorded_metadata(metadata)
+
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp stop_optional_session(session) do
+    case session do
+      %{port: _} = session -> AppServer.stop_session(session)
+      _ -> :ok
+    end
+  end
+
+  defp stop_optional_recorded_metadata(metadata) do
+    case metadata do
+      metadata when is_map(metadata) -> AppServer.stop_recorded_process(metadata)
+      _ -> :ok
+    end
+  end
+
   test "managed sessions reject a missing or wrong server model on start and resume" do
     test_root =
       Path.join(
