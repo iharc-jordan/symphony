@@ -368,22 +368,9 @@ defmodule SymphonyElixir.Workspace do
               ]
               |> Enum.join("\n")
 
-            run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms)
-            |> case do
-              {:ok, {output, status}} ->
-                handle_hook_command_result(
-                  {output, status},
-                  workspace,
-                  nil,
-                  "before_remove"
-                )
-
-              {:error, {:workspace_hook_timeout, "before_remove", _timeout_ms} = reason} ->
-                {:error, reason}
-
-              {:error, reason} ->
-                {:error, reason}
-            end
+            worker_host
+            |> run_remote_command(script, Config.settings!().hooks.timeout_ms)
+            |> handle_before_remove_remote_result(workspace)
             |> ignore_hook_failure()
 
           {:error, reason} ->
@@ -394,6 +381,11 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  defp handle_before_remove_remote_result({:ok, {output, status}}, workspace) do
+    handle_hook_command_result({output, status}, workspace, nil, "before_remove")
+  end
+
+  defp handle_before_remove_remote_result({:error, reason}, _workspace), do: {:error, reason}
   defp ignore_hook_failure(:ok), do: :ok
   defp ignore_hook_failure({:error, _reason}), do: :ok
 
