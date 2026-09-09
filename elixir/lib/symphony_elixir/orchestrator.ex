@@ -841,6 +841,7 @@ defmodule SymphonyElixir.Orchestrator do
     retry_allowed? = is_map(assignment) and managed_retry_allowed?(Map.put(assignment, :retry_count, retry_count))
     next_retry_count = retry_count + 1
     phase = if retry_allowed?, do: :ready, else: :waiting
+    blocked_reason = if phase == :waiting, do: inspect(reason), else: nil
 
     data =
       state.managed.data
@@ -850,7 +851,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> Map.put(:phase, phase)
           |> Map.put(:board_state, phase)
           |> Map.put(:retry_count, next_retry_count)
-          |> maybe_put_managed(:blocked_reason, if(phase == :waiting, do: inspect(reason), else: nil))
+          |> maybe_put_managed(:blocked_reason, blocked_reason)
           |> managed_dispatch_failure_effect(attempt, reason, retry_allowed?)
         else
           assignment
