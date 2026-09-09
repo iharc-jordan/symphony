@@ -1,6 +1,16 @@
 defmodule SymphonyElixir.AgentRunner do
   @moduledoc """
   Executes a single tracker work item in its workspace with Codex.
+
+  Managed callers receive structured process exits so the orchestrator can
+  distinguish an intentional terminal or guard stop from an execution failure.
+  The managed exit shapes are:
+
+    * {:managed_agent_terminal, report} for an accepted terminal report;
+    * {:managed_agent_guard_stop, reason} for a callback or exhausted-budget stop;
+    * {:managed_agent_failed, reason} for an execution failure.
+
+  Generic callers retain the historical RuntimeError behavior.
   """
 
   require Logger
@@ -31,7 +41,12 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+
+        if managed_attempt?(opts) do
+          exit(managed_exit_reason(reason))
+        else
+          raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        end
     end
   end
 
@@ -40,7 +55,13 @@ defmodule SymphonyElixir.AgentRunner do
 
     case Workspace.create_for_issue(issue, worker_host) do
       {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+        send_worker_runtime_info(
+          codex_update_recipient,
+          issue,
+          worker_host,
+          workspace,
+          Keyword.get(opts, :managed_attempt)
+        )
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
@@ -55,21 +76,28 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp codex_message_handler(recipient, issue) do
+  defp codex_message_handler(recipient, issue, managed_attempt) do
     fn message ->
-      send_codex_update(recipient, issue, message)
+      send_codex_update(recipient, issue, message, managed_attempt)
     end
   end
 
-  defp send_codex_update(recipient, %Issue{id: issue_id}, message)
+  defp send_codex_update(recipient, %Issue{id: issue_id}, message, managed_attempt)
        when is_binary(issue_id) and is_pid(recipient) do
-    send(recipient, {:codex_worker_update, issue_id, message})
+    update = maybe_scope_update(message, managed_attempt)
+    send(recipient, {:codex_worker_update, issue_id, update})
     :ok
   end
 
-  defp send_codex_update(_recipient, _issue, _message), do: :ok
+  defp send_codex_update(_recipient, _issue, _message, _managed_attempt), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
+  defp maybe_scope_update(message, managed_attempt) when is_map(managed_attempt) do
+    Map.put(message, :attempt, managed_attempt)
+  end
+
+  defp maybe_scope_update(message, _managed_attempt), do: message
+
+  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace, managed_attempt)
        when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
     send(
       recipient,
@@ -77,36 +105,95 @@ defmodule SymphonyElixir.AgentRunner do
        %{
          worker_host: worker_host,
          workspace_path: workspace
-       }}
+       }
+       |> maybe_scope_runtime_info(managed_attempt)}
     )
 
     :ok
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _managed_attempt), do: :ok
+
+  defp maybe_scope_runtime_info(runtime_info, managed_attempt) when is_map(managed_attempt),
+    do: Map.put(runtime_info, :attempt, managed_attempt)
+
+  defp maybe_scope_runtime_info(runtime_info, _managed_attempt), do: runtime_info
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
+    remaining_turns = Keyword.get(opts, :remaining_turns, max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
+    on_session = Keyword.get(opts, :on_session, &default_callback/1)
+    before_turn = Keyword.get(opts, :before_turn, &default_callback/1)
+    app_server_opts = app_server_opts(opts, worker_host)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
-      try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
-      after
-        AppServer.stop_session(session)
-      end
+    runner_context = %{
+      codex_update_recipient: codex_update_recipient,
+      issue_state_fetcher: issue_state_fetcher,
+      before_turn: before_turn
+    }
+
+    case validate_turn_allowance(max_turns, remaining_turns) do
+      {:ok, 0} ->
+        {:error, :turn_budget_exhausted}
+
+      {:ok, turn_limit} ->
+        case AppServer.start_session(workspace, app_server_opts) do
+          {:ok, session} ->
+            try do
+              case invoke_on_session(on_session, AppServer.session_info(session), issue) do
+                :ok ->
+                  do_run_codex_turns(
+                    session,
+                    workspace,
+                    issue,
+                    opts,
+                    runner_context,
+                    1,
+                    turn_limit
+                  )
+
+                {:error, reason} ->
+                  {:error, reason}
+              end
+            after
+              AppServer.stop_session(session)
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_turns(app_session, workspace, issue, opts, runner_context, turn_number, max_turns) do
+    %{
+      codex_update_recipient: codex_update_recipient,
+      issue_state_fetcher: issue_state_fetcher,
+      before_turn: before_turn
+    } = runner_context
+
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
-    with {:ok, turn_session} <-
+    with :ok <-
+           invoke_before_turn(
+             before_turn,
+             before_turn_context(app_session, workspace, issue, turn_number, max_turns)
+           ),
+         {:ok, turn_session} <-
            AppServer.run_turn(
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message:
+               codex_message_handler(
+                 codex_update_recipient,
+                 issue,
+                 app_session.managed_attempt
+               )
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
@@ -118,9 +205,8 @@ defmodule SymphonyElixir.AgentRunner do
             app_session,
             workspace,
             refreshed_issue,
-            codex_update_recipient,
             opts,
-            issue_state_fetcher,
+            runner_context,
             turn_number + 1,
             max_turns
           )
@@ -138,6 +224,89 @@ defmodule SymphonyElixir.AgentRunner do
       end
     end
   end
+
+  defp validate_turn_allowance(max_turns, remaining_turns)
+       when is_integer(max_turns) and max_turns >= 0 and
+              is_integer(remaining_turns) and remaining_turns >= 0 do
+    {:ok, min(max_turns, remaining_turns)}
+  end
+
+  defp validate_turn_allowance(max_turns, _remaining_turns)
+       when not is_integer(max_turns) or max_turns < 0,
+       do: {:error, {:invalid_turn_allowance, :max_turns, max_turns}}
+
+  defp validate_turn_allowance(_max_turns, remaining_turns),
+    do: {:error, {:invalid_turn_allowance, :remaining_turns, remaining_turns}}
+
+  defp managed_attempt?(opts), do: Keyword.has_key?(opts, :managed_attempt)
+
+  defp managed_exit_reason({:orchestration_report_terminal, report}),
+    do: {:managed_agent_terminal, report}
+
+  defp managed_exit_reason({callback, :stopped, reason}) when callback in [:on_session, :before_turn],
+    do: {:managed_agent_guard_stop, {callback, reason}}
+
+  defp managed_exit_reason({callback, reason}) when callback in [:on_session, :before_turn],
+    do: {:managed_agent_guard_stop, {callback, reason}}
+
+  defp managed_exit_reason(:turn_budget_exhausted), do: {:managed_agent_guard_stop, :turn_budget_exhausted}
+  defp managed_exit_reason(reason), do: {:managed_agent_failed, reason}
+
+  defp app_server_opts(opts, worker_host) do
+    opts
+    |> Keyword.take([
+      :managed_attempt,
+      :model,
+      :effort,
+      :reasoning_effort,
+      :escalation_reason,
+      :resume_thread_id,
+      :report_callback,
+      :report
+    ])
+    |> Keyword.put(:worker_host, worker_host)
+  end
+
+  defp before_turn_context(session, workspace, issue, turn_number, max_turns) do
+    %{
+      attempt: session.managed_attempt,
+      turn: turn_number,
+      remaining_turns: max(max_turns - turn_number + 1, 0),
+      thread_id: session.thread_id,
+      model: session.model,
+      effort: session.effort,
+      thread_reasoning_effort: session.thread_reasoning_effort,
+      issue: issue,
+      workspace: workspace
+    }
+  end
+
+  defp invoke_on_session(callback, session_info, _issue) when is_function(callback, 1) do
+    normalize_callback_result(callback.(session_info), :on_session)
+  rescue
+    error -> {:error, {:on_session, {:callback_exception, Exception.message(error)}}}
+  end
+
+  defp invoke_on_session(_callback, _session_info, _issue), do: {:error, :invalid_on_session_callback}
+
+  defp invoke_before_turn(callback, context) when is_function(callback, 1) do
+    normalize_callback_result(callback.(context), :before_turn)
+  rescue
+    error -> {:error, {:before_turn, {:callback_exception, Exception.message(error)}}}
+  end
+
+  defp invoke_before_turn(_callback, _context), do: {:error, :invalid_before_turn_callback}
+
+  defp normalize_callback_result(:ok, _callback_name), do: :ok
+  defp normalize_callback_result(:allow, _callback_name), do: :ok
+  defp normalize_callback_result({:ok, _value}, _callback_name), do: :ok
+  defp normalize_callback_result({:stop, reason}, callback_name), do: {:error, {callback_name, :stopped, reason}}
+  defp normalize_callback_result({:error, reason}, callback_name), do: {:error, {callback_name, reason}}
+
+  defp normalize_callback_result(other, callback_name),
+    do: {:error, {callback_name, :invalid_callback_result, other}}
+
+  defp default_callback(_value), do: :ok
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 

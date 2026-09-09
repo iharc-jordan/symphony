@@ -1,6 +1,470 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "managed app server sends the approved route and accepts orchestration reports" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-managed-route-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-MANAGED")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="$SYMP_TEST_CODEx_TRACE"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-managed"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
+          3) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-managed"}}}' ;;
+          4)
+            printf '%s\\n' '{"id":99,"method":"item/tool/call","params":{"tool":"orchestration_report","arguments":{"kind":"checkpoint","report_id":"report-1","summary":"validated","evidence":[{"test":"green"}]}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-managed","turn":{"id":"turn-managed","status":"completed","items":[]}}}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-managed",
+        identifier: "MT-MANAGED",
+        title: "Managed route",
+        description: "Exercise the managed app-server route",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-MANAGED",
+        labels: ["backend"]
+      }
+
+      attempt = %{
+        assignment_id: "issue-managed",
+        revision: "rev-1",
+        generation: 0,
+        attempt_id: "attempt-1"
+      }
+
+      parent = self()
+
+      assert {:ok, _result} =
+               AppServer.run(
+                 workspace,
+                 "Run managed turn",
+                 issue,
+                 managed_attempt: attempt,
+                 model: "gpt-5.6-luna",
+                 effort: "xhigh",
+                 report_callback: fn report ->
+                   send(parent, {:managed_report, report})
+                   :ok
+                 end
+               )
+
+      assert_receive {:managed_report,
+                      %{
+                        attempt: ^attempt,
+                        kind: "checkpoint",
+                        report_id: "report-1",
+                        summary: "validated",
+                        evidence: [%{"test" => "green"}],
+                        thread_id: "thread-managed",
+                        turn_id: "turn-managed"
+                      }}
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("JSON:", trim: true)
+        |> Enum.map(&String.trim_trailing(&1, "\\n"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      thread_start = Enum.find(payloads, &(&1["method"] == "thread/start"))
+      assert get_in(thread_start, ["params", "model"]) == "gpt-5.6-luna"
+
+      assert Enum.any?(get_in(thread_start, ["params", "dynamicTools"]), fn tool ->
+               tool["name"] == "orchestration_report" and
+                 get_in(tool, ["inputSchema", "required"]) ==
+                   ["kind", "report_id", "summary", "evidence"]
+             end)
+
+      turn_start = Enum.find(payloads, &(&1["method"] == "turn/start"))
+      assert get_in(turn_start, ["params", "model"]) == "gpt-5.6-luna"
+      assert get_in(turn_start, ["params", "effort"]) == "xhigh"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "terminal orchestration reports interrupt the active turn before unwinding" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-managed-terminal-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-TERMINAL")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-terminal.trace")
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="$SYMP_TEST_CODEx_TRACE"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-terminal"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-terminal"}}}'
+            printf '%s\\n' '{"id":99,"method":"item/tool/call","params":{"tool":"orchestration_report","arguments":{"kind":"result","report_id":"report-terminal","summary":"done","evidence":[]}}}'
+            ;;
+          5) ;;
+          6) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-terminal",
+        identifier: "MT-TERMINAL",
+        title: "Terminal report",
+        description: "Stop the active turn after a terminal report",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-TERMINAL",
+        labels: ["backend"]
+      }
+
+      attempt = %{
+        assignment_id: "issue-terminal",
+        revision: "rev-1",
+        generation: 0,
+        attempt_id: "attempt-terminal"
+      }
+
+      assert {:error, {:orchestration_report_terminal, report}} =
+               AppServer.run(
+                 workspace,
+                 "Report result",
+                 issue,
+                 managed_attempt: attempt,
+                 model: "gpt-5.6-luna",
+                 effort: "xhigh",
+                 report_callback: fn _report -> :ok end
+               )
+
+      assert report.kind == "result"
+      assert report.report_id == "report-terminal"
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("JSON:", trim: true)
+        |> Enum.map(&String.trim_trailing(&1, "
+"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      assert Enum.any?(payloads, fn payload ->
+               payload["method"] == "turn/interrupt" and
+                 get_in(payload, ["params", "threadId"]) == "thread-terminal" and
+                 get_in(payload, ["params", "turnId"]) == "turn-terminal"
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "managed route rejects unsupported models, unreasoned escalation, and stale route metadata" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-managed-route-reject-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-MANAGED-REJECT")
+      File.mkdir_p!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      attempt = %{
+        assignment_id: "issue-managed-reject",
+        revision: "rev-1",
+        generation: 1,
+        attempt_id: "attempt-1"
+      }
+
+      assert {:error, {:managed_model_not_allowed, "gpt-6-astra", _}} =
+               AppServer.start_session(workspace,
+                 managed_attempt: attempt,
+                 model: "gpt-6-astra"
+               )
+
+      assert {:error, :managed_escalation_reason_required} =
+               AppServer.start_session(workspace,
+                 managed_attempt: attempt,
+                 model: "gpt-5.6-terra",
+                 effort: "xhigh"
+               )
+
+      stale_attempt = Map.put(attempt, :model, "gpt-5.6-terra")
+
+      assert {:error, {:managed_route_mismatch, :model, "gpt-5.6-terra", "gpt-5.6-luna"}} =
+               AppServer.start_session(workspace,
+                 managed_attempt: stale_attempt,
+                 model: "gpt-5.6-luna"
+               )
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "managed app server resumes the exact thread and preserves route fields" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-managed-resume-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-RESUME")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-resume.trace")
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="$SYMP_TEST_CODEx_TRACE"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"thread-resume"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
+          3) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-resume"}}}' ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-resume","turn":{"id":"turn-resume","status":"completed","items":[]}}}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-resume",
+        identifier: "MT-RESUME",
+        title: "Resume route",
+        description: "Resume the existing thread",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-RESUME",
+        labels: ["backend"]
+      }
+
+      attempt = %{
+        assignment_id: "issue-resume",
+        revision: "rev-2",
+        generation: 2,
+        attempt_id: "attempt-2"
+      }
+
+      assert {:ok, _result} =
+               AppServer.run(
+                 workspace,
+                 "Continue managed turn",
+                 issue,
+                 managed_attempt: attempt,
+                 model: "gpt-5.6-luna",
+                 effort: "xhigh",
+                 resume_thread_id: "thread-resume"
+               )
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("JSON:", trim: true)
+        |> Enum.map(&String.trim_trailing(&1, "\\n"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      refute Enum.any?(payloads, &(&1["method"] == "thread/start"))
+      resume = Enum.find(payloads, &(&1["method"] == "thread/resume"))
+      assert get_in(resume, ["params", "threadId"]) == "thread-resume"
+      assert get_in(resume, ["params", "model"]) == "gpt-5.6-luna"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "managed sessions reject a missing or wrong server model on start and resume" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-managed-model-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-MODEL")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      attempt = %{
+        assignment_id: "issue-model",
+        revision: "rev-1",
+        generation: 0,
+        attempt_id: "attempt-model"
+      }
+
+      for {response_id, extra_response, opts} <- [
+            {2, ~s(,"model":"gpt-5.6-terra","reasoningEffort":null), []},
+            {4, ~s(,"model":"gpt-5.6-terra","reasoningEffort":null), [resume_thread_id: "thread-model"]},
+            {2, "", []}
+          ] do
+        File.write!(codex_binary, """
+        #!/bin/sh
+        count=0
+        while IFS= read -r _line; do
+          count=$((count + 1))
+          case "$count" in
+            1) printf '%s
+        ' '{"id":1,"result":{}}' ;;
+            2) printf '%s
+        ' '{"id":#{response_id},"result":{"thread":{"id":"thread-model"}#{extra_response}}}' ;;
+            *) exit 0 ;;
+          esac
+        done
+        """)
+
+        File.chmod!(codex_binary, 0o755)
+
+        assert {:error, reason} =
+                 AppServer.start_session(
+                   workspace,
+                   Keyword.merge(
+                     [managed_attempt: attempt, model: "gpt-5.6-luna", effort: "xhigh"],
+                     opts
+                   )
+                 )
+
+        assert reason in [
+                 {:managed_model_mismatch, "gpt-5.6-luna", "gpt-5.6-terra"},
+                 {:managed_model_missing, "gpt-5.6-luna"}
+               ]
+      end
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "modern completed notifications preserve failed and interrupted turn status" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-turn-status-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-STATUS")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-status",
+        identifier: "MT-STATUS",
+        title: "Modern status",
+        description: "Preserve structured completion status",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-STATUS",
+        labels: ["backend"]
+      }
+
+      for {status, expected_tag} <- [{"failed", :turn_failed}, {"interrupted", :turn_interrupted}] do
+        File.write!(codex_binary, """
+        #!/bin/sh
+        count=0
+        while IFS= read -r _line; do
+          count=$((count + 1))
+          case "$count" in
+            1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+            2) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-status"}}}' ;;
+            3) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-status"}}}' ;;
+            4) printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-status","turn":{"id":"turn-status","status":"#{status}","items":[]}}}' ;;
+          esac
+        done
+        """)
+
+        File.chmod!(codex_binary, 0o755)
+
+        assert {:error, {^expected_tag, details}} =
+                 AppServer.run(workspace, "Status turn", issue)
+
+        assert get_in(details, ["turn", "status"]) == status
+      end
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
@@ -95,17 +559,17 @@ defmodule SymphonyElixir.AppServerTest do
       while IFS= read -r _line; do
         count=$((count + 1))
         case "$count" in
-          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
           2) ;;
-          3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-timeout"}}}' ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-timeout"}}}' ;;
           4)
-            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-timeout"}}}'
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-timeout"}}}'
             sleep 0.15
-            printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"one"}}}'
+            printf '%s\\n' '{"method":"item/updated","params":{"item":{"id":"one"}}}'
             sleep 0.15
-            printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"two"}}}'
+            printf '%s\\n' '{"method":"item/updated","params":{"item":{"id":"two"}}}'
             sleep 0.15
-            printf '%s\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
           *) exit 0 ;;
@@ -139,13 +603,13 @@ defmodule SymphonyElixir.AppServerTest do
       while IFS= read -r _line; do
         count=$((count + 1))
         case "$count" in
-          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
           2) ;;
-          3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-silent"}}}' ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-silent"}}}' ;;
           4)
-            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-silent"}}}'
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-silent"}}}'
             sleep 0.4
-            printf '%s\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
           *) exit 0 ;;
@@ -1439,9 +1903,9 @@ defmodule SymphonyElixir.AppServerTest do
       File.write!(codex_binary, """
       #!/bin/sh
       trace_file="$SYMP_TEST_CODEx_TRACE"
-      printf 'PROFILE_LOADED:%s\n' "$#{profile_marker_env}" >> "$trace_file"
-      printf 'CANONICAL_SECRET:%s\n' "$LINEAR_API_KEY" >> "$trace_file"
-      printf 'CUSTOM_SECRET:%s\n' "$#{custom_secret_env}" >> "$trace_file"
+      printf 'PROFILE_LOADED:%s\\n' "$#{profile_marker_env}" >> "$trace_file"
+      printf 'CANONICAL_SECRET:%s\\n' "$LINEAR_API_KEY" >> "$trace_file"
+      printf 'CUSTOM_SECRET:%s\\n' "$#{custom_secret_env}" >> "$trace_file"
       count=0
 
       while IFS= read -r line; do
@@ -1449,16 +1913,16 @@ defmodule SymphonyElixir.AppServerTest do
 
         case "$count" in
           1)
-            printf '%s\n' '{"id":1,"result":{}}'
+            printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-secret"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-secret"}}}'
             ;;
           3)
-            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-secret"}}}'
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-secret"}}}'
             ;;
           4)
-            printf '%s\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
           *)
