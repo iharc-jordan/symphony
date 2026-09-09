@@ -189,7 +189,7 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":99,"method":"item/tool/call","params":{"tool":"orchestration_report","arguments":{"kind":"result","report_id":"report-terminal","summary":"done","evidence":[]}}}'
             ;;
           6) ;;
-          7) exit 0 ;;
+          7) : ;;
         esac
       done
       """)
