@@ -812,10 +812,30 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     {pid, path} = managed_server()
 
     :sys.replace_state(pid, fn state ->
-      %{state | managed: %{state.managed | effects: SymphonyElixir.ManagedRequirementsTransitionStub}}
+      data = %{state.managed.data | disabled: true}
+      managed = %{state.managed | data: data, effects: SymphonyElixir.ManagedRequirementsTransitionStub}
+      %{state | managed: managed}
     end)
 
     {pid, path}
+  end
+
+  defp stop_revision_polling(pid) do
+    assert Enum.any?(1..20, fn _attempt ->
+             case :sys.get_state(pid).poll_check_in_progress do
+               false ->
+                 true
+
+               true ->
+                 Process.sleep(5)
+                 false
+             end
+           end)
+
+    :sys.replace_state(pid, fn state ->
+      if is_reference(state.tick_timer_ref), do: Process.cancel_timer(state.tick_timer_ref)
+      %{state | tick_timer_ref: nil, tick_token: nil, poll_interval_ms: :timer.hours(1)}
+    end)
   end
 
   defp prepare_revision_assignment(pid, old_fingerprint, new_fingerprint) do
@@ -840,6 +860,8 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
 
       %{state | managed: %{state.managed | data: data}}
     end)
+
+    stop_revision_polling(pid)
   end
 
   defp revise_request(request_id, expected_revision, fingerprint) do
