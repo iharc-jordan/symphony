@@ -624,7 +624,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp managed_apply_provider_transition(%State{managed: %{effects: module}} = state, assignment, target)
        when is_atom(module) and is_map(assignment) and is_atom(target) do
     with {:ok, intent_state, intent_id} <- ensure_managed_transition_intent(state, assignment, target),
-         true <- function_exported?(module, :transition, 3) do
+         true <- Code.ensure_loaded?(module) and function_exported?(module, :transition, 3) do
       context = %{
         binding: intent_state.managed.data[:binding],
         process_stopped: not Map.has_key?(intent_state.running, assignment.assignment_id)
@@ -2008,7 +2008,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp managed_review_effects(_state, _intent), do: {:error, :managed_review_effects_unavailable, %{}}
 
   defp managed_review_available?(module) do
-    function_exported?(module, :review, 3) or function_exported?(module, :review, 2)
+    Code.ensure_loaded?(module) and
+      (function_exported?(module, :review, 3) or function_exported?(module, :review, 2))
   end
 
   defp call_managed_review_effect(state, module, data, intent) do
