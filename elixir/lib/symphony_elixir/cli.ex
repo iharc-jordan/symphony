@@ -65,18 +65,26 @@ defmodule SymphonyElixir.CLI do
     if deps.file_regular?.(expanded_path) do
       :ok = deps.set_workflow_file_path.(expanded_path)
 
-      with :ok <- maybe_require_managed_workflow(deps, managed),
-           :ok <- maybe_set_managed_mode(managed) do
-        case deps.ensure_all_started.() do
-          {:ok, _started_apps} ->
-            :ok
-
-          {:error, reason} ->
-            {:error, "Failed to start Symphony with workflow #{expanded_path}: #{inspect(reason)}"}
-        end
-      end
+      start_application(expanded_path, deps, managed)
     else
       {:error, "Workflow file not found: #{expanded_path}"}
+    end
+  end
+
+  defp start_application(workflow_path, deps, managed) do
+    with :ok <- maybe_require_managed_workflow(deps, managed),
+         :ok <- maybe_set_managed_mode(managed) do
+      ensure_started(workflow_path, deps)
+    end
+  end
+
+  defp ensure_started(workflow_path, deps) do
+    case deps.ensure_all_started.() do
+      {:ok, _started_apps} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, "Failed to start Symphony with workflow #{workflow_path}: #{inspect(reason)}"}
     end
   end
 

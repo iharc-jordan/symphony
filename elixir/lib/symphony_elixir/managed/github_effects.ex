@@ -91,9 +91,8 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
     if provider_status(issue) == target do
       :ok
     else
-      with {:ok, option} <- status_option(context, target),
-           :ok <- set_project_status(issue, context, option) do
-        :ok
+      with {:ok, option} <- status_option(context, target) do
+        set_project_status(issue, context, option)
       end
     end
   end
@@ -101,9 +100,8 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
   defp ensure_project_accepted(issue, context) do
     case provider_status(issue) do
       :review ->
-        with {:ok, accepted_option} <- status_option(context, :accepted),
-             :ok <- set_project_status(issue, context, accepted_option) do
-          :ok
+        with {:ok, accepted_option} <- status_option(context, :accepted) do
+          set_project_status(issue, context, accepted_option)
         end
 
       :accepted ->
@@ -190,7 +188,12 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
 
   defp provider_status_is(issue, expected) do
     actual = provider_status(issue)
-    if actual == expected, do: :ok, else: {:error, :managed_provider_state_mismatch, %{expected: expected, actual: actual}}
+
+    if actual == expected do
+      :ok
+    else
+      {:error, :managed_provider_state_mismatch, %{expected: expected, actual: actual}}
+    end
   end
 
   defp native_state_is_closed(issue) do
@@ -214,21 +217,25 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
       type != "Issue" ->
         {:error, :managed_native_issue_required, %{}}
 
-      current_state == "closed" and current_reason == "completed" ->
-        :ok
-
       current_state == "closed" ->
-        {:error, :managed_issue_closed_with_wrong_reason, %{reason: current_reason}}
+        close_closed_issue(current_reason)
 
       not is_binary(id) ->
         {:error, :managed_native_issue_id_missing, %{}}
 
       true ->
-        case graphql(@close_issue_mutation, %{"issueId" => id}) do
-          {:ok, body} -> close_response_ok(body, type, id)
-          {:error, reason} -> {:error, :managed_issue_close_failed, %{reason: inspect(reason)}}
-          _ -> {:error, :managed_issue_close_failed, %{}}
-        end
+        close_open_issue(id)
+    end
+  end
+
+  defp close_closed_issue("completed"), do: :ok
+  defp close_closed_issue(reason), do: {:error, :managed_issue_closed_with_wrong_reason, %{reason: reason}}
+
+  defp close_open_issue(id) do
+    case graphql(@close_issue_mutation, %{"issueId" => id}) do
+      {:ok, body} -> close_response_ok(body, "Issue", id)
+      {:error, reason} -> {:error, :managed_issue_close_failed, %{reason: inspect(reason)}}
+      _ -> {:error, :managed_issue_close_failed, %{}}
     end
   end
 
@@ -262,15 +269,17 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
     name = target |> Atom.to_string() |> String.upcase()
     options = get_in(context, [:binding, :status_options]) || %{}
 
-    case options do
-      options when is_map(options) ->
-        case Enum.find(options, fn {key, _id} -> String.upcase(to_string(key)) == name end) do
-          {_, id} when is_binary(id) -> {:ok, id}
-          _ -> {:error, :managed_status_option_missing, %{status: target}}
-        end
+    if is_map(options) do
+      find_status_option(options, name, target)
+    else
+      {:error, :managed_status_option_missing, %{status: target}}
+    end
+  end
 
-      _ ->
-        {:error, :managed_status_option_missing, %{status: target}}
+  defp find_status_option(options, name, target) do
+    case Enum.find(options, fn {key, _id} -> String.upcase(to_string(key)) == name end) do
+      {_, id} when is_binary(id) -> {:ok, id}
+      _ -> {:error, :managed_status_option_missing, %{status: target}}
     end
   end
 

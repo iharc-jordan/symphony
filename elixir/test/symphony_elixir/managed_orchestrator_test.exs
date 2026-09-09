@@ -1,6 +1,13 @@
 defmodule SymphonyElixir.ManagedReviewEffectsStub do
   def review(_assignment, _args, _context) do
-    {:ok, %{provider_state: :review, provider_final_state: :accepted, issue_final_state: :closed, reconciled: true, external_effects: %{status: :ok, issue_close: :ok}}}
+    {:ok,
+     %{
+       provider_state: :review,
+       provider_final_state: :accepted,
+       issue_final_state: :closed,
+       reconciled: true,
+       external_effects: %{status: :ok, issue_close: :ok}
+     }}
   end
 
   def transition(_assignment, target, _context) do
@@ -195,7 +202,14 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
              Control.submit(pid, %{
                request_id: "review",
                operation: :review,
-               args: %{assignment_id: "item-1", expected_revision: 1, disposition: "accepted", evidence: ["test"], provider_state: "ACTIVE", reconciled: false}
+               args: %{
+                 assignment_id: "item-1",
+                 expected_revision: 1,
+                 disposition: "accepted",
+                 evidence: ["test"],
+                 provider_state: "ACTIVE",
+                 reconciled: false
+               }
              })
 
     assert response.phase == :accepted
@@ -599,7 +613,12 @@ defmodule SymphonyElixir.ManagedOrchestratorSourceReconciliationTest do
 
       %{
         state
-        | managed: %{journal: journal, data: data, effects: SymphonyElixir.ManagedReviewEffectsStub, source_fetcher: fn _ids -> {:ok, [issue]} end},
+        | managed: %{
+            journal: journal,
+            data: data,
+            effects: SymphonyElixir.ManagedReviewEffectsStub,
+            source_fetcher: fn _ids -> {:ok, [issue]} end
+          },
           running: %{"item-1" => running},
           poll_check_in_progress: true
       }
@@ -659,7 +678,12 @@ defmodule SymphonyElixir.ManagedOrchestratorUsageRecoveryTest do
 
     :sys.replace_state(pid, fn state ->
       data = put_in(Rules.new(), [:usage, :inflight_tokens], 42)
-      %{state | managed: %{journal: journal, data: data, effects: SymphonyElixir.ManagedReviewEffectsStub}, poll_check_in_progress: true}
+
+      %{
+        state
+        | managed: %{journal: journal, data: data, effects: SymphonyElixir.ManagedReviewEffectsStub},
+          poll_check_in_progress: true
+      }
     end)
 
     on_exit(fn ->

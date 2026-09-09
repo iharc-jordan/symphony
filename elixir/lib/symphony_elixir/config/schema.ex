@@ -467,45 +467,8 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp finalize_settings(settings) do
     provider = normalize_optional_map(settings.tracker.provider) || %{}
-
-    {api_key, assignee, provider, secret_environment_names} =
-      case settings.tracker.kind do
-        "linear" ->
-          linear_provider =
-            provider
-            |> Map.put_new("endpoint", settings.tracker.endpoint || @linear_endpoint)
-            |> Map.put_new("api_key", settings.tracker.api_key)
-            |> Map.put_new("project_slug", settings.tracker.project_slug)
-            |> Map.put_new("assignee", settings.tracker.assignee)
-
-          resolved_api_key =
-            resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
-
-          resolved_assignee =
-            resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
-
-          {
-            resolved_api_key,
-            resolved_assignee,
-            linear_provider,
-            ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
-          }
-
-        _ ->
-          {settings.tracker.api_key, settings.tracker.assignee, provider, []}
-      end
-
-    {active_states, terminal_states} =
-      case settings.tracker.kind do
-        kind when kind in ["linear", "memory"] ->
-          {
-            settings.tracker.active_states || @linear_active_states,
-            settings.tracker.terminal_states || @linear_terminal_states
-          }
-
-        _ ->
-          {settings.tracker.active_states, settings.tracker.terminal_states}
-      end
+    {api_key, assignee, provider, secret_environment_names} = finalize_tracker(settings.tracker, provider)
+    {active_states, terminal_states} = finalize_tracker_states(settings.tracker)
 
     tracker = %{
       settings.tracker
@@ -544,25 +507,64 @@ defmodule SymphonyElixir.Config.Schema do
     %{settings | tracker: tracker, workspace: workspace, codex: codex, managed: managed}
   end
 
+  defp finalize_tracker(tracker, provider) do
+    case tracker.kind do
+      "linear" ->
+        linear_provider =
+          provider
+          |> Map.put_new("endpoint", tracker.endpoint || @linear_endpoint)
+          |> Map.put_new("api_key", tracker.api_key)
+          |> Map.put_new("project_slug", tracker.project_slug)
+          |> Map.put_new("assignee", tracker.assignee)
+
+        resolved_api_key = resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
+        resolved_assignee = resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
+
+        {
+          resolved_api_key,
+          resolved_assignee,
+          linear_provider,
+          ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
+        }
+
+      _ ->
+        {tracker.api_key, tracker.assignee, provider, []}
+    end
+  end
+
+  defp finalize_tracker_states(tracker) do
+    case tracker.kind do
+      kind when kind in ["linear", "memory"] ->
+        {
+          tracker.active_states || @linear_active_states,
+          tracker.terminal_states || @linear_terminal_states
+        }
+
+      _ ->
+        {tracker.active_states, tracker.terminal_states}
+    end
+  end
+
   defp validate_managed_settings(%Managed{enabled: false}), do: :ok
 
   defp validate_managed_settings(%Managed{} = managed) do
-    token =
-      case managed.control_token_file do
-        file when is_binary(file) ->
-          case File.read(file) do
-            {:ok, value} -> String.trim(value)
-            {:error, _reason} -> nil
-          end
+    case managed_validation_token(managed) do
+      token when is_binary(token) and token != "" -> validate_managed_paths(managed)
+      _ -> {:error, "managed.enabled=true requires a readable non-empty control_token_file or control_token"}
+    end
+  end
 
-        _ ->
-          managed.control_token
-      end
+  defp managed_validation_token(%Managed{control_token_file: file}) when is_binary(file) do
+    case File.read(file) do
+      {:ok, value} -> String.trim(value)
+      {:error, _reason} -> nil
+    end
+  end
 
+  defp managed_validation_token(%Managed{control_token: token}), do: token
+
+  defp validate_managed_paths(%Managed{} = managed) do
     cond do
-      not (is_binary(token) and token != "") ->
-        {:error, "managed.enabled=true requires a readable non-empty control_token_file or control_token"}
-
       not present_string?(managed.checkout_node) ->
         {:error, "managed.enabled=true requires managed.checkout_node"}
 

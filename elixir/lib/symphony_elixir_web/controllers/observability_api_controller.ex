@@ -6,6 +6,8 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   use Phoenix.Controller, formats: [:json]
 
   alias Plug.Conn
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.Managed.Control
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
@@ -40,7 +42,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   @spec managed_state(Conn.t(), map()) :: Conn.t()
   def managed_state(conn, _params) do
     with :ok <- authorize_managed(conn),
-         {:ok, payload} <- SymphonyElixir.Managed.Control.state(orchestrator(), snapshot_timeout_ms()) do
+         {:ok, payload} <- Control.state(orchestrator(), snapshot_timeout_ms()) do
       json(conn, payload)
     else
       {:error, :unauthorized} -> managed_error(conn, 401, "unauthorized", "Unauthorized")
@@ -70,14 +72,23 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   @spec managed_control(Conn.t(), map()) :: Conn.t()
   def managed_control(conn, params) do
     with :ok <- authorize_managed(conn),
-         {:ok, response} <- SymphonyElixir.Managed.Control.submit(orchestrator(), params, snapshot_timeout_ms()) do
+         {:ok, response} <- Control.submit(orchestrator(), params, snapshot_timeout_ms()) do
       conn |> put_status(200) |> json(response)
     else
-      {:error, :unauthorized} -> managed_error(conn, 401, "unauthorized", "Unauthorized")
-      {:error, :forbidden} -> managed_error(conn, 403, "loopback_required", "Loopback access required")
-      {:error, :managed_mode_disabled} -> managed_error(conn, 503, "managed_mode_disabled", "Managed mode is disabled")
-      {:error, code, details} when is_atom(code) -> managed_error(conn, 409, Atom.to_string(code), safe_managed_message(details))
-      {:error, reason} -> managed_error(conn, 400, "invalid_request", safe_managed_message(reason))
+      {:error, :unauthorized} ->
+        managed_error(conn, 401, "unauthorized", "Unauthorized")
+
+      {:error, :forbidden} ->
+        managed_error(conn, 403, "loopback_required", "Loopback access required")
+
+      {:error, :managed_mode_disabled} ->
+        managed_error(conn, 503, "managed_mode_disabled", "Managed mode is disabled")
+
+      {:error, code, details} when is_atom(code) ->
+        managed_error(conn, 409, Atom.to_string(code), safe_managed_message(details))
+
+      {:error, reason} ->
+        managed_error(conn, 400, "invalid_request", safe_managed_message(reason))
     end
   end
 
@@ -104,10 +115,12 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   defp loopback?(_), do: false
 
   defp valid_bearer?(conn) do
-    expected = SymphonyElixir.Config.managed_control_token()
+    expected = Config.managed_control_token()
     [header | _] = get_req_header(conn, "authorization") ++ [""]
     token = String.replace_prefix(header, "Bearer ", "")
-    is_binary(expected) and expected != "" and byte_size(token) == byte_size(expected) and Plug.Crypto.secure_compare(token, expected)
+
+    is_binary(expected) and expected != "" and byte_size(token) == byte_size(expected) and
+      Plug.Crypto.secure_compare(token, expected)
   end
 
   defp bounded_integer(nil, default, _minimum, _maximum), do: {:ok, default}
@@ -137,7 +150,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   end
 
   defp wait_for_managed_events(after_cursor, limit, deadline, _wait_ms) do
-    case SymphonyElixir.Managed.Control.events(orchestrator(), after_cursor, limit, 1_000) do
+    case Control.events(orchestrator(), after_cursor, limit, 1_000) do
       {:ok, events} when events != [] ->
         {:ok, events}
 
