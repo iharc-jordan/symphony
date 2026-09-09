@@ -720,6 +720,7 @@ defmodule SymphonyElixir.Orchestrator do
           request: nil,
           assignment_id: assignment.assignment_id,
           target: target,
+          revision: assignment[:revision],
           auto: true,
           status: :pending,
           at: DateTime.utc_now()
@@ -1651,18 +1652,30 @@ defmodule SymphonyElixir.Orchestrator do
     |> Enum.filter(fn {_request_id, intent} ->
       managed_transition_intent_reusable?(intent)
     end)
+    # Complete pending explicit controls before automatic transitions. A
+    # revision can supersede an automatic intent from its prior assignment
+    # revision, so recovery must commit that fence before replaying autos.
+    |> Enum.sort_by(fn {_request_id, intent} -> if is_map(intent[:request]), do: 0, else: 1 end)
     |> Enum.reduce(state, &recover_managed_transition/2)
   end
 
   defp recover_managed_transitions(state), do: state
 
-  defp recover_managed_transition({_request_id, intent}, state) do
-    assignment = get_in(state.managed.data, [:assignments, intent.assignment_id])
+  defp recover_managed_transition({request_id, _captured_intent}, state) do
+    # Re-read the intent after each prior recovery step. A successful revision
+    # may retire an automatic intent that was present when this pass began.
+    case get_in(state.managed.data, [:effect_intents, request_id]) do
+      intent when is_map(intent) ->
+        assignment = get_in(state.managed.data, [:assignments, intent.assignment_id])
 
-    if is_map(assignment) do
-      replay_managed_transition(state, assignment, intent)
-    else
-      state
+        if managed_transition_intent_reusable?(intent) and is_map(assignment) do
+          replay_managed_transition(state, assignment, intent)
+        else
+          state
+        end
+
+      _ ->
+        state
     end
   end
 
@@ -1880,14 +1893,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp managed_transition_provider_assignment(state, assignment, %{request: request, assignment_id: assignment_id}) do
-    if map_value(request, :operation) in [:revise, "revise"] do
-      case Rules.apply(state.managed.data, request, %{stop_reconciled: true}) do
-        {:ok, preview, _response} -> {:ok, Map.fetch!(preview.assignments, assignment_id)}
-        {:duplicate, _response} -> {:ok, assignment}
-        {:error, code, details} -> {:error, {code, details}}
-      end
-    else
-      {:ok, assignment}
+    case Rules.apply(state.managed.data, request, %{stop_reconciled: true}) do
+      {:ok, preview, _response} ->
+        if map_value(request, :operation) in [:revise, "revise"],
+          do: {:ok, Map.fetch!(preview.assignments, assignment_id)},
+          else: {:ok, assignment}
+
+      {:duplicate, _response} ->
+        {:ok, assignment}
+
+      {:error, code, details} ->
+        {:error, {code, details}}
     end
   end
 
@@ -1912,6 +1928,7 @@ defmodule SymphonyElixir.Orchestrator do
       committed_data
       |> put_in([:effect_intents, intent.request_id, :status], :committed)
       |> put_in([:effect_intents, intent.request_id, :committed_at], DateTime.utc_now())
+      |> retire_obsolete_managed_auto_intents(intent)
       |> append_managed_event(%{
         operation: :provider_transition_committed,
         request_id: intent.request_id,
@@ -1927,6 +1944,65 @@ defmodule SymphonyElixir.Orchestrator do
         {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
     end
   end
+
+  defp retire_obsolete_managed_auto_intents(data, %{request: request, assignment_id: assignment_id})
+       when is_map(request) do
+    if map_value(request, :operation) in [:revise, "revise"] do
+      revision = get_in(data, [:assignments, assignment_id, :revision])
+
+      {intents, retired_ids} =
+        retire_managed_auto_intents(data[:effect_intents] || %{}, assignment_id, revision)
+
+      data = Map.put(data, :effect_intents, intents)
+
+      if retired_ids == [] do
+        data
+      else
+        append_managed_event(data, %{
+          operation: :provider_transition_intents_retired,
+          assignment_id: assignment_id,
+          request_id: request.request_id,
+          intent_ids: Enum.reverse(retired_ids),
+          revision: revision
+        })
+      end
+    else
+      data
+    end
+  end
+
+  defp retire_obsolete_managed_auto_intents(data, _intent), do: data
+
+  defp retire_managed_auto_intents(intents, assignment_id, revision) do
+    Enum.reduce(intents, {%{}, []}, fn {intent_id, intent}, {acc, retired} ->
+      case retire_managed_auto_intent(intent, assignment_id, revision) do
+        {:retired, retired_intent} ->
+          {Map.put(acc, intent_id, retired_intent), [intent_id | retired]}
+
+        :keep ->
+          {Map.put(acc, intent_id, intent), retired}
+      end
+    end)
+  end
+
+  defp retire_managed_auto_intent(intent, assignment_id, revision) do
+    if obsolete_managed_auto_intent?(intent, assignment_id, revision) do
+      {:retired,
+       intent
+       |> Map.put(:status, :retired)
+       |> Map.put(:retired_reason, :assignment_revised)
+       |> Map.put(:retired_at, DateTime.utc_now())}
+    else
+      :keep
+    end
+  end
+
+  defp obsolete_managed_auto_intent?(intent, assignment_id, revision) when is_map(intent) do
+    intent[:auto] == true and intent[:assignment_id] == assignment_id and
+      intent[:status] in [:pending, :effect_reconciled] and intent[:revision] != revision
+  end
+
+  defp obsolete_managed_auto_intent?(_intent, _assignment_id, _revision), do: false
 
   defp fail_managed_transition(state, intent, reason) do
     failed_data =

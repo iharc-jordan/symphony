@@ -41,10 +41,18 @@ defmodule SymphonyElixir.ManagedRequirementsTransitionStub do
     expected = assignment[:expected_requirements_fingerprint]
 
     if assignment[:requirements_fingerprint] == expected do
-      if is_pid(observer), do: send(observer, {:requirements_transition, assignment})
+      if is_pid(observer) do
+        send(observer, {:requirements_transition, assignment})
+        send(observer, {:requirements_transition_target, target, assignment})
+      end
+
       {:ok, %{provider_state: target, reconciled: true, external_effects: %{status: :ok}}}
     else
-      if is_pid(observer), do: send(observer, {:requirements_transition_rejected, assignment})
+      if is_pid(observer) do
+        send(observer, {:requirements_transition_rejected, assignment})
+        send(observer, {:requirements_transition_target, target, assignment})
+      end
+
       {:error, :requirements_changed, %{expected: expected, actual: assignment[:requirements_fingerprint]}}
     end
   end
@@ -1015,6 +1023,259 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     refute Map.has_key?(state.managed.data.effect_intents, "revise-stale-r2")
     assert state.managed.data.assignments["item-1"].requirements_fingerprint == old_fingerprint
     assert state.managed.data.assignments["item-1"].revision == 1
+  end
+
+  test "successful revision resets exhausted retry state and retires obsolete automatic transitions" do
+    old_fingerprint = body_fingerprint("requirements-v1")
+    new_fingerprint = body_fingerprint("requirements-v2")
+    {pid, _path} = revision_server()
+    prepare_revision_assignment(pid, old_fingerprint, new_fingerprint)
+
+    :sys.replace_state(pid, fn current ->
+      data = put_in(current.managed.data, [:assignments, "item-1", :turns_reserved], 7)
+      %{current | managed: %{current.managed | data: data}}
+    end)
+
+    state = :sys.get_state(pid)
+
+    exhausted =
+      Enum.reduce(1..3, state, fn generation, current ->
+        Orchestrator.mark_managed_dispatch_failed_for_test(
+          current,
+          "item-1",
+          %{assignment_id: "item-1", revision: 1, generation: generation, attempt_id: "failed-#{generation}"},
+          :spawn_failed
+        )
+      end)
+
+    auto_active = %{
+      request_id: "auto-active-before-revise",
+      request: nil,
+      assignment_id: "item-1",
+      target: :active,
+      revision: 1,
+      auto: true,
+      status: :pending
+    }
+
+    data = put_in(exhausted.managed.data, [:effect_intents, auto_active.request_id], auto_active)
+    :sys.replace_state(pid, fn current -> %{current | managed: %{current.managed | data: data}} end)
+
+    assert {:ok, response} = Control.submit(pid, revise_request("revise-after-retries", 1, new_fingerprint))
+    assert response.revision == 2
+    assert_receive {:requirements_transition, provider_assignment}
+    assert provider_assignment.requirements_fingerprint == new_fingerprint
+    assert_receive {:requirements_transition_target, :ready, ^provider_assignment}
+    refute_receive {:requirements_transition_target, :active, _assignment}, 100
+
+    state = :sys.get_state(pid)
+    assignment = state.managed.data.assignments["item-1"]
+    assert assignment.phase == :ready
+    assert assignment.board_state == :ready
+    assert assignment.retry_count == 0
+    refute Map.has_key?(assignment, :blocked_reason)
+    assert assignment.turns_reserved == 7
+    assert assignment.turn_limit == 20
+    assert state.managed.data.effect_intents[auto_active.request_id].status == :retired
+    assert state.managed.data.effect_intents[auto_active.request_id].retired_reason == :assignment_revised
+
+    recovered = Orchestrator.recover_managed_transitions_for_test(state)
+    refute_receive {:requirements_transition, _assignment}, 100
+    refute_receive {:requirements_transition_rejected, _assignment}, 100
+    refute_receive {:managed_transition_effect, "item-1", :active}, 100
+    assert recovered.managed.data.assignments["item-1"].phase == :ready
+  end
+
+  test "failed revision preserves retry state and uncertain automatic intents" do
+    old_fingerprint = body_fingerprint("requirements-v1")
+    new_fingerprint = body_fingerprint("requirements-v2")
+    wrong_fingerprint = body_fingerprint("requirements-wrong")
+    {pid, _path} = revision_server()
+    prepare_revision_assignment(pid, old_fingerprint, new_fingerprint)
+
+    state = :sys.get_state(pid)
+
+    exhausted =
+      Enum.reduce(1..3, state, fn generation, current ->
+        Orchestrator.mark_managed_dispatch_failed_for_test(
+          current,
+          "item-1",
+          %{assignment_id: "item-1", revision: 1, generation: generation, attempt_id: "failed-#{generation}"},
+          :spawn_failed
+        )
+      end)
+
+    auto_active = %{
+      request_id: "auto-active-uncertain",
+      request: nil,
+      assignment_id: "item-1",
+      target: :active,
+      revision: 1,
+      auto: true,
+      status: :pending
+    }
+
+    data = put_in(exhausted.managed.data, [:effect_intents, auto_active.request_id], auto_active)
+    :sys.replace_state(pid, fn current -> %{current | managed: %{current.managed | data: data}} end)
+
+    assert {:error, {:requirements_changed, _details}} =
+             Control.submit(pid, revise_request("revise-failed-after-retries", 1, wrong_fingerprint))
+
+    assert_receive {:requirements_transition_rejected, provider_assignment}
+    assert provider_assignment.requirements_fingerprint == wrong_fingerprint
+
+    state = :sys.get_state(pid)
+    assignment = state.managed.data.assignments["item-1"]
+    assert assignment.phase == :waiting
+    assert assignment.retry_count == 3
+    assert assignment.blocked_reason == ":spawn_failed"
+    assert assignment.requirements_fingerprint == old_fingerprint
+    assert assignment.requirements_revision == 1
+    assert state.managed.data.effect_intents[auto_active.request_id] == auto_active
+  end
+
+  test "pending revision replay rejects a stale request before provider effects" do
+    old_fingerprint = body_fingerprint("requirements-v1")
+    new_fingerprint = body_fingerprint("requirements-v2")
+    {pid, _path} = revision_server()
+    prepare_revision_assignment(pid, old_fingerprint, new_fingerprint)
+    request = revise_request("revise-pending-stale", 1, new_fingerprint)
+    state = :sys.get_state(pid)
+
+    data =
+      state.managed.data
+      |> put_in([:assignments, "item-1", :revision], 2)
+      |> put_in([:effect_intents, request.request_id], %{
+        request_id: request.request_id,
+        request: request,
+        assignment_id: "item-1",
+        target: :ready,
+        context: %{stop_reconciled: true},
+        status: :pending
+      })
+
+    :sys.replace_state(pid, fn current -> %{current | managed: %{current.managed | data: data}} end)
+    assert {:error, {:stale_revision, _details}} = Control.submit(pid, request)
+    refute_receive {:requirements_transition, _assignment}, 100
+    refute_receive {:requirements_transition_rejected, _assignment}, 100
+
+    state = :sys.get_state(pid)
+    assert state.managed.data.effect_intents[request.request_id].status == :pending
+    assert state.managed.data.assignments["item-1"].revision == 2
+  end
+
+  test "cold recovery commits a pending revision before replaying obsolete automatic transitions" do
+    old_fingerprint = body_fingerprint("requirements-v1")
+    new_fingerprint = body_fingerprint("requirements-v2")
+    {pid, path} = revision_server()
+    prepare_revision_assignment(pid, old_fingerprint, new_fingerprint)
+    request = revise_request("revise-cold-recovery", 1, new_fingerprint)
+    state = :sys.get_state(pid)
+
+    exhausted =
+      Enum.reduce(1..3, state, fn generation, current ->
+        Orchestrator.mark_managed_dispatch_failed_for_test(
+          current,
+          "item-1",
+          %{assignment_id: "item-1", revision: 1, generation: generation, attempt_id: "cold-failed-#{generation}"},
+          :spawn_failed
+        )
+      end)
+
+    auto_active = %{
+      request_id: "auto-active-cold-recovery",
+      request: nil,
+      assignment_id: "item-1",
+      target: :active,
+      revision: 1,
+      auto: true,
+      status: :pending
+    }
+
+    data =
+      exhausted.managed.data
+      |> put_in([:effect_intents, auto_active.request_id], auto_active)
+      |> put_in([:effect_intents, request.request_id], %{
+        request_id: request.request_id,
+        request: request,
+        assignment_id: "item-1",
+        target: :ready,
+        context: %{stop_reconciled: true},
+        status: :pending
+      })
+
+    :ok = Journal.append(exhausted.managed.journal, data)
+    :ok = GenServer.stop(pid)
+
+    name = Module.concat(__MODULE__, :cold_recovery_restart)
+
+    {:ok, restarted_pid} =
+      Orchestrator.start_link(
+        name: name,
+        managed_effects: SymphonyElixir.ManagedRequirementsTransitionStub
+      )
+
+    journal_name = String.to_atom("managed_cold_restart_#{System.unique_integer([:positive])}")
+    {:ok, journal, loaded} = Journal.open(path, name: journal_name)
+
+    :sys.replace_state(restarted_pid, fn current ->
+      managed = %{journal: journal, data: loaded, effects: SymphonyElixir.ManagedRequirementsTransitionStub}
+      %{current | managed: managed, poll_check_in_progress: true}
+    end)
+
+    on_exit(fn ->
+      if Process.alive?(restarted_pid), do: GenServer.stop(restarted_pid)
+    end)
+
+    recovered = Orchestrator.recover_managed_transitions_for_test(:sys.get_state(restarted_pid))
+    assert_receive {:requirements_transition, provider_assignment}
+    assert provider_assignment.requirements_fingerprint == new_fingerprint
+    assert_receive {:requirements_transition_target, :ready, ^provider_assignment}
+    refute_receive {:requirements_transition_target, :active, _assignment}, 100
+
+    :sys.replace_state(restarted_pid, fn _ -> recovered end)
+    state = :sys.get_state(restarted_pid)
+    assignment = state.managed.data.assignments["item-1"]
+    assert assignment.phase == :ready
+    assert assignment.retry_count == 0
+    refute Map.has_key?(assignment, :blocked_reason)
+    assert state.managed.data.effect_intents[auto_active.request_id].status == :retired
+  end
+
+  test "stale pending interrupt replay validates before provider effects" do
+    old_fingerprint = body_fingerprint("requirements-v1")
+    new_fingerprint = body_fingerprint("requirements-v2")
+    {pid, _path} = revision_server()
+    prepare_revision_assignment(pid, old_fingerprint, new_fingerprint)
+
+    request = %{
+      request_id: "interrupt-pending-stale",
+      operation: :interrupt,
+      args: %{assignment_id: "item-1", expected_revision: 1, reason: "operator stop"}
+    }
+
+    state = :sys.get_state(pid)
+
+    data =
+      state.managed.data
+      |> put_in([:assignments, "item-1", :phase], :active)
+      |> put_in([:assignments, "item-1", :board_state], :active)
+      |> put_in([:assignments, "item-1", :revision], 2)
+      |> put_in([:effect_intents, request.request_id], %{
+        request_id: request.request_id,
+        request: request,
+        assignment_id: "item-1",
+        target: :waiting,
+        context: %{stop_reconciled: true},
+        status: :pending
+      })
+
+    :sys.replace_state(pid, fn current -> %{current | managed: %{current.managed | data: data}} end)
+    assert {:error, {:stale_revision, _details}} = Control.submit(pid, request)
+    refute_receive {:requirements_transition, _assignment}, 100
+    refute_receive {:requirements_transition_rejected, _assignment}, 100
+    state = :sys.get_state(pid)
+    assert state.managed.data.effect_intents[request.request_id].status == :pending
   end
 
   test "managed dispatch failures retry twice then block" do

@@ -552,6 +552,10 @@ defmodule SymphonyElixir.Managed.Rules do
       |> Map.put(:revision, assignment.revision + 1)
       |> Map.put(:phase, :ready)
       |> Map.put(:board_state, :ready)
+      # A successful operator revision starts a fresh automatic retry window.
+      # Lifetime turn accounting and the existing workspace/session are retained.
+      |> Map.put(:retry_count, 0)
+      |> Map.delete(:blocked_reason)
       |> Map.put(:route, route || assignment.route)
       |> reset_changed_route_session(assignment.route)
 

@@ -542,7 +542,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
       refute Map.has_key?(assignment, :metadata)
       assert assignment.workspace == "/assigned/checkout"
       assert assignment.turns_reserved == 7
-      assert assignment.retry_count == 1
+      assert assignment.retry_count == 0
     end
 
     same_route = %{assignment_id: "issue-1", expected_revision: 1, changes: %{route: %{model: "gpt-5.6-luna", effort: "xhigh"}}}
