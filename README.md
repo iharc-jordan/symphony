@@ -9,6 +9,8 @@ _In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), S
 
 Workspace lifecycle hooks can read bounded JSON issue identity in `SYMPHONY_ISSUE_CONTEXT`; removal hooks receive explicit null identity values when no issue is available.
 
+The Elixir reference implementation also supports GitHub Projects as an additive tracker, using project item identity, configured status fields, and native cross-repository issue dependencies. See [the tracker configuration](elixir/README.md) for setup.
+
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 
