@@ -229,36 +229,57 @@ defmodule SymphonyElixir.AgentRunner do
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
-
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            opts,
-            runner_context,
-            turn_number + 1,
-            max_turns
-          )
-
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
-
-          if managed_attempt?(opts) do
-            {:error, :turn_budget_exhausted}
-          else
-            :ok
-          end
-
-        {:done, _refreshed_issue} ->
-          :ok
-
-        {:error, reason} ->
-          {:error, reason}
-      end
+      continue_after_turn(
+        app_session,
+        workspace,
+        issue,
+        opts,
+        runner_context,
+        turn_number,
+        max_turns,
+        issue_state_fetcher
+      )
     end
+  end
+
+  defp continue_after_turn(
+         app_session,
+         workspace,
+         issue,
+         opts,
+         runner_context,
+         turn_number,
+         max_turns,
+         issue_state_fetcher
+       ) do
+    case continue_with_issue?(issue, issue_state_fetcher) do
+      {:continue, refreshed_issue} when turn_number < max_turns ->
+        Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+
+        do_run_codex_turns(
+          app_session,
+          workspace,
+          refreshed_issue,
+          opts,
+          runner_context,
+          turn_number + 1,
+          max_turns
+        )
+
+      {:continue, refreshed_issue} ->
+        Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+        exhausted_turn_result(opts)
+
+      {:done, _refreshed_issue} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp exhausted_turn_result(opts) do
+    if managed_attempt?(opts), do: {:error, :turn_budget_exhausted}, else: :ok
   end
 
   defp validate_turn_allowance(max_turns, remaining_turns)
