@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, HookContext, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -338,13 +338,7 @@ defmodule SymphonyElixir.Workspace do
             :ok
 
           command ->
-            run_hook(
-              command,
-              workspace,
-              %{issue_id: nil, issue_identifier: Path.basename(workspace)},
-              "before_remove",
-              nil
-            )
+            run_hook(command, workspace, nil, "before_remove", nil)
             |> ignore_hook_failure()
         end
 
@@ -361,47 +355,76 @@ defmodule SymphonyElixir.Workspace do
         :ok
 
       command ->
-        script =
-          [
-            remote_shell_assign("workspace", workspace),
-            "if [ -d \"$workspace\" ]; then",
-            "  cd \"$workspace\"",
-            "  #{command}",
-            "fi"
-          ]
-          |> Enum.join("\n")
+        case HookContext.encode(nil) do
+          {:ok, context_json} ->
+            script =
+              [
+                hook_env_assignment(context_json),
+                remote_shell_assign("workspace", workspace),
+                "if [ -d \"$workspace\" ]; then",
+                "  cd \"$workspace\"",
+                "  #{command}",
+                "fi"
+              ]
+              |> Enum.join("\n")
 
-        run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms)
-        |> case do
-          {:ok, {output, status}} ->
-            handle_hook_command_result(
-              {output, status},
-              workspace,
-              %{issue_id: nil, issue_identifier: Path.basename(workspace)},
-              "before_remove"
-            )
+            run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms)
+            |> case do
+              {:ok, {output, status}} ->
+                handle_hook_command_result(
+                  {output, status},
+                  workspace,
+                  nil,
+                  "before_remove"
+                )
 
-          {:error, {:workspace_hook_timeout, "before_remove", _timeout_ms} = reason} ->
-            {:error, reason}
+              {:error, {:workspace_hook_timeout, "before_remove", _timeout_ms} = reason} ->
+                {:error, reason}
+
+              {:error, reason} ->
+                {:error, reason}
+            end
+            |> ignore_hook_failure()
 
           {:error, reason} ->
-            {:error, reason}
+            Logger.warning("Workspace hook context rejected hook=before_remove workspace=#{workspace} worker_host=#{worker_host_for_log(worker_host)} reason=#{inspect(reason)}")
+
+            :ok
         end
-        |> ignore_hook_failure()
     end
   end
 
   defp ignore_hook_failure(:ok), do: :ok
   defp ignore_hook_failure({:error, _reason}), do: :ok
 
-  defp run_hook(command, workspace, issue_context, hook_name, nil) do
+  defp run_hook(command, workspace, issue_context, hook_name, worker_host) do
+    case HookContext.encode(issue_context) do
+      {:ok, context_json} ->
+        run_hook_with_context(command, workspace, context_json, issue_context, hook_name, worker_host)
+
+      {:error, reason} ->
+        Logger.warning(
+          "Workspace hook context rejected hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host_for_log(worker_host)} reason=#{inspect(reason)}"
+        )
+
+        {:error, {:workspace_hook_context_rejected, hook_name, reason}}
+    end
+  end
+
+  defp run_hook_with_context(command, workspace, context_json, issue_context, hook_name, nil) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd(
+          "sh",
+          ["-lc", command],
+          cd: workspace,
+          env: [{HookContext.env_name(), context_json}],
+          stderr_to_stdout: true
+        )
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -417,12 +440,13 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp run_hook(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
+  defp run_hook_with_context(command, workspace, context_json, issue_context, hook_name, worker_host)
+       when is_binary(worker_host) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    case run_remote_command(worker_host, remote_hook_command(workspace, command, context_json), timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -432,6 +456,16 @@ defmodule SymphonyElixir.Workspace do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp remote_hook_command(workspace, command, context_json)
+       when is_binary(workspace) and is_binary(command) and is_binary(context_json) do
+    [hook_env_assignment(context_json), "cd #{shell_escape(workspace)} && #{command}"]
+    |> Enum.join("\n")
+  end
+
+  defp hook_env_assignment(context_json) when is_binary(context_json) do
+    "export #{HookContext.env_name()}=#{shell_escape(context_json)}"
   end
 
   defp handle_hook_command_result({_output, 0}, _workspace, _issue_id, _hook_name) do
@@ -568,28 +602,33 @@ defmodule SymphonyElixir.Workspace do
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
-  defp issue_context(%{id: issue_id, identifier: identifier}) do
+  defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
     %{
-      issue_id: issue_id,
-      issue_identifier: identifier || "issue"
+      id: issue_id,
+      identifier: identifier,
+      native_ref: Map.get(issue, :native_ref)
+    }
+  end
+
+  defp issue_context(%{"id" => issue_id, "identifier" => identifier} = issue) do
+    %{
+      id: issue_id,
+      identifier: identifier,
+      native_ref: Map.get(issue, "native_ref")
     }
   end
 
   defp issue_context(identifier) when is_binary(identifier) do
-    %{
-      issue_id: nil,
-      issue_identifier: identifier
-    }
+    %{id: nil, identifier: identifier, native_ref: nil}
   end
 
   defp issue_context(_identifier) do
-    %{
-      issue_id: nil,
-      issue_identifier: "issue"
-    }
+    %{id: nil, identifier: nil, native_ref: nil}
   end
 
-  defp issue_log_context(%{issue_id: issue_id, issue_identifier: issue_identifier}) do
-    "issue_id=#{issue_id || "n/a"} issue_identifier=#{issue_identifier || "issue"}"
+  defp issue_log_context(%{id: issue_id, identifier: issue_identifier}) do
+    "issue_id=#{issue_id || "n/a"} issue_identifier=#{issue_identifier || "n/a"}"
   end
+
+  defp issue_log_context(_issue_context), do: "issue_id=n/a issue_identifier=n/a"
 end

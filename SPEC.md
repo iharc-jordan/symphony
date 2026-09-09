@@ -441,6 +441,21 @@ Fields:
   - Invalid values fail configuration validation.
   - Changes SHOULD be re-applied at runtime for future hook executions.
 
+Hook environment contract:
+
+- Each configured workspace hook receives `SYMPHONY_ISSUE_CONTEXT` as UTF-8 JSON with exactly
+  `id`, `identifier`, and `native_ref` keys.
+- `id` and `identifier` carry the normalized issue identity. `native_ref` is an optional provider
+  reference containing only non-secret identity/location metadata. Provider adapters MUST NOT put
+  titles, bodies, payloads, commands, executable strings, credentials, authentication material, or
+  user details in this reference. Symphony rejects a native reference containing those reserved
+  fields (including nested fields) instead of passing it to the hook.
+- Native references use JSON-compatible values only. The serialized context is limited to 16 KiB;
+  an oversized value is rejected rather than truncated.
+- `before_remove` runs without an issue context and receives `{"id":null,"identifier":null,"native_ref":null}`.
+- Context rejection follows the existing hook failure policy: `after_create` and `before_run`
+  fail their operation, while `after_run` and `before_remove` log and ignore hook failures.
+
 #### 5.3.5 `agent` (object)
 
 Fields:

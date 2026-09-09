@@ -1649,10 +1649,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert Config.settings!().worker.ssh_hosts == ["worker-01:2200"]
       assert Config.settings!().workspace.root == workspace_root
-      assert {:ok, ^workspace_path} = Workspace.create_for_issue("MT-SSH-WS", "worker-01:2200")
-      assert :ok = Workspace.run_before_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
-      assert :ok = Workspace.run_after_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
-      assert :ok = Workspace.remove_issue_workspaces("MT-SSH-WS", "worker-01:2200")
+
+      remote_issue = %{
+        id: "project-item-42",
+        identifier: "MT-SSH-WS",
+        native_ref: %{"repository" => %{"name" => "owner's/repository;safe"}}
+      }
+
+      assert {:ok, ^workspace_path} = Workspace.create_for_issue(remote_issue, "worker-01:2200")
+      assert :ok = Workspace.run_before_run_hook(workspace_path, remote_issue, "worker-01:2200")
+      assert :ok = Workspace.run_after_run_hook(workspace_path, remote_issue, "worker-01:2200")
+      assert :ok = Workspace.remove_issue_workspaces(remote_issue, "worker-01:2200")
 
       trace = File.read!(trace_file)
       assert trace =~ "-p 2200 worker-01 bash -lc"
@@ -1660,6 +1667,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ "~/.symphony-remote-workspaces/MT-SSH-WS"
       assert trace =~ "${workspace#\\~/}"
       assert trace =~ "echo before-run"
+      assert trace =~ "export SYMPHONY_ISSUE_CONTEXT="
+      assert trace =~ "owner"
       assert trace =~ "echo after-run"
       assert trace =~ "echo before-remove"
       assert trace =~ "rm -rf"
