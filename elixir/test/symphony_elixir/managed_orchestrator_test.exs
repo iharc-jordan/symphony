@@ -601,6 +601,24 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     }
   end
 
+  defp managed_server do
+    name = Module.concat(__MODULE__, :"server_#{System.unique_integer([:positive])}")
+    path = Path.join(System.tmp_dir!(), "managed-orchestrator-#{System.unique_integer([:positive])}.log")
+    {:ok, pid} = Orchestrator.start_link(name: name, managed_effects: SymphonyElixir.ManagedReviewEffectsStub)
+    {:ok, journal, %{}} = Journal.open(path, name: String.to_atom("managed_test_#{System.unique_integer([:positive])}"))
+
+    :sys.replace_state(pid, fn state ->
+      %{state | managed: %{journal: journal, data: Rules.new(), effects: SymphonyElixir.ManagedReviewEffectsStub}, poll_check_in_progress: true}
+    end)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      File.rm(path)
+    end)
+
+    {pid, path}
+  end
+
   test "startup recovery replays automatic provider intents with no control request" do
     name = Module.concat(__MODULE__, :"server_#{System.unique_integer([:positive])}")
     path = Path.join(System.tmp_dir!(), "managed-recovery-#{System.unique_integer([:positive])}.log")
@@ -641,6 +659,116 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
 
     state = :sys.get_state(pid)
     assert state.managed.data.effect_intents["auto-ready"].status == :effect_reconciled
+  end
+
+  test "managed dispatch failures retry twice then block" do
+    {pid, _path} = managed_server()
+
+    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+
+    attempt = fn generation ->
+      %{assignment_id: "item-1", revision: 1, generation: generation, attempt_id: "attempt-#{generation}"}
+    end
+
+    failed_once =
+      Orchestrator.mark_managed_dispatch_failed_for_test(
+        :sys.get_state(pid),
+        "item-1",
+        attempt.(1),
+        :spawn_failed
+      )
+
+    assignment = failed_once.managed.data.assignments["item-1"]
+    assert assignment.phase == :ready
+    assert assignment.board_state == :ready
+    assert assignment.retry_count == 1
+    assert assignment.pending_effect.status == :retry_pending
+    assert assignment.pending_effect.reason == ":spawn_failed"
+
+    failed_twice =
+      Orchestrator.mark_managed_dispatch_failed_for_test(
+        failed_once,
+        "item-1",
+        attempt.(2),
+        :spawn_failed
+      )
+
+    assignment = failed_twice.managed.data.assignments["item-1"]
+    assert assignment.phase == :ready
+    assert assignment.board_state == :ready
+    assert assignment.retry_count == 2
+    assert assignment.pending_effect.status == :retry_pending
+
+    failed_three_times =
+      Orchestrator.mark_managed_dispatch_failed_for_test(
+        failed_twice,
+        "item-1",
+        attempt.(3),
+        :spawn_failed
+      )
+
+    assignment = failed_three_times.managed.data.assignments["item-1"]
+    assert assignment.phase == :waiting
+    assert assignment.board_state == :waiting
+    assert assignment.retry_count == 3
+    assert assignment.pending_effect.status == :failed
+    assert assignment.blocked_reason == ":spawn_failed"
+
+    dispatch_failures =
+      failed_three_times.managed.data.events
+      |> Enum.filter(&(&1.operation == :dispatch_failed))
+      |> Enum.reverse()
+
+    assert Enum.map(dispatch_failures, & &1.retry_count) == [1, 2, 3]
+    assert Enum.map(dispatch_failures, & &1.phase) == [:ready, :ready, :waiting]
+  end
+
+  test "dispatch failure preserves an uncertain provider transition" do
+    {pid, _path} = managed_server()
+
+    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+
+    provider_effect = %{
+      kind: :provider_transition,
+      target: :active,
+      status: :failed,
+      error: :managed_provider_effect_failed
+    }
+
+    intent = %{
+      request_id: "auto-active",
+      request: nil,
+      assignment_id: "item-1",
+      target: :active,
+      auto: true,
+      status: :pending,
+      last_error: :managed_provider_effect_failed
+    }
+
+    state = :sys.get_state(pid)
+
+    data =
+      state.managed.data
+      |> put_in([:assignments, "item-1", :pending_effect], provider_effect)
+      |> put_in([:effect_intents, "auto-active"], intent)
+
+    state = %{state | managed: %{state.managed | data: data}}
+
+    failed =
+      Orchestrator.mark_managed_dispatch_failed_for_test(
+        state,
+        "item-1",
+        %{assignment_id: "item-1", revision: 1, generation: 1, attempt_id: "attempt-provider"},
+        {:managed_provider_effect_failed, :transport_unknown}
+      )
+
+    assignment = failed.managed.data.assignments["item-1"]
+    assert assignment.phase == :ready
+    assert assignment.retry_count == 1
+    assert assignment.pending_effect == provider_effect
+    assert failed.managed.data.effect_intents["auto-active"] == intent
   end
 end
 

@@ -836,23 +836,64 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp managed_mark_dispatch_failed(%State{} = state, issue_id, attempt, reason) do
+    assignment = get_in(state.managed.data, [:assignments, issue_id])
+    retry_count = managed_dispatch_retry_count(assignment)
+    retry_allowed? = is_map(assignment) and managed_retry_allowed?(Map.put(assignment, :retry_count, retry_count))
+    next_retry_count = retry_count + 1
+    phase = if retry_allowed?, do: :ready, else: :waiting
+
     data =
       state.managed.data
       |> update_in([:assignments, issue_id], fn assignment ->
         if is_map(assignment) do
           assignment
-          |> Map.put(:phase, :ready)
-          |> Map.put(:board_state, :ready)
-          |> Map.put(:pending_effect, %{kind: :start, status: :failed, reason: inspect(reason), attempt_id: attempt.attempt_id})
+          |> Map.put(:phase, phase)
+          |> Map.put(:board_state, phase)
+          |> Map.put(:retry_count, next_retry_count)
+          |> maybe_put_managed(:blocked_reason, if(phase == :waiting, do: inspect(reason), else: nil))
+          |> managed_dispatch_failure_effect(attempt, reason, retry_allowed?)
         else
           assignment
         end
       end)
-      |> append_managed_event(%{operation: :dispatch_failed, assignment_id: issue_id, attempt_id: attempt.attempt_id})
+      |> append_managed_event(%{
+        operation: :dispatch_failed,
+        assignment_id: issue_id,
+        attempt_id: attempt.attempt_id,
+        phase: phase,
+        retry_count: next_retry_count,
+        reason: inspect(reason)
+      })
 
     case persist_managed_data(state, data) do
       {:ok, next_state} -> next_state
       {:error, _reason} -> state
+    end
+  end
+
+  defp managed_dispatch_retry_count(assignment) when is_map(assignment) do
+    case assignment[:retry_count] do
+      retry_count when is_integer(retry_count) and retry_count >= 0 -> retry_count
+      _ -> 0
+    end
+  end
+
+  defp managed_dispatch_retry_count(_assignment), do: 0
+
+  defp managed_dispatch_failure_effect(assignment, attempt, reason, retry_allowed?) do
+    case assignment[:pending_effect] do
+      %{kind: :provider_transition} ->
+        assignment
+
+      _ ->
+        status = if retry_allowed?, do: :retry_pending, else: :failed
+
+        Map.put(assignment, :pending_effect, %{
+          kind: :start,
+          status: status,
+          reason: inspect(reason),
+          attempt_id: attempt.attempt_id
+        })
     end
   end
 
@@ -2555,6 +2596,13 @@ defmodule SymphonyElixir.Orchestrator do
   @spec recover_managed_transitions_for_test(term()) :: term()
   def recover_managed_transitions_for_test(%State{} = state) do
     recover_managed_transitions(state)
+  end
+
+  @doc false
+  @spec mark_managed_dispatch_failed_for_test(term(), String.t(), map(), term()) :: term()
+  def mark_managed_dispatch_failed_for_test(%State{} = state, issue_id, attempt, reason)
+      when is_binary(issue_id) and is_map(attempt) do
+    managed_mark_dispatch_failed(state, issue_id, attempt, reason)
   end
 
   @doc false
