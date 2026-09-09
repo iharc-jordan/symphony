@@ -7,6 +7,8 @@ work instead of supervising coding agents.
 
 _In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._
 
+Workspace lifecycle hooks can read bounded JSON issue identity in `SYMPHONY_ISSUE_CONTEXT`; removal hooks receive explicit null identity values when no issue is available.
+
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 

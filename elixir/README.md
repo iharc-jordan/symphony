@@ -167,6 +167,14 @@ Notes:
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
+- Every configured workspace hook receives `SYMPHONY_ISSUE_CONTEXT`, a UTF-8 JSON object with exactly
+  `id`, `identifier`, and `native_ref`. The context excludes issue title/body and executable or
+  credential settings. `native_ref` is reserved for non-secret provider identity/location metadata;
+  invalid content, authentication, credential, payload, and executable keys are rejected. The
+  serialized value is limited to 16 KiB; an oversized context rejects the hook instead of being
+  truncated. Hooks run for workspace removal without an issue context receive `null` for all three
+  values. `after_create` and `before_run` keep their existing failure behavior, while
+  `after_run` and `before_remove` continue to ignore hook failures.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
