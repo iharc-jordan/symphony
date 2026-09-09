@@ -13,7 +13,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, Jira
+1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, GitHub Projects, Jira
    Cloud, Asana, and GitLab)
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
@@ -263,6 +263,14 @@ codex:
   `body`; Symphony executes it host-side with the session-bound token, removes configured tracker
   credentials and provider authentication aliases from the Codex child, and leaves raw tool access
   limited by that token's GitHub permissions.
+
+### GitHub Projects adapter
+
+- Config: use `tracker.kind: github_projects` with `tracker.provider.owner_type` (`org` or `user`), `owner`, `project_number`, optional `status_field_name` (default `Status`), optional `graphql_url` (default `https://api.github.com/graphql`), and `token` (defaults to `GITHUB_TOKEN` and accepts `$VAR`). Keep `active_states`, `terminal_states`, and `required_labels` under `tracker`.
+- Scope and identity: reads are scoped to the configured Projects V2 board. Items use the ProjectV2Item node ID as `issue.id`; `issue.identifier` is `owner/repository#number`. `native_ref` retains `project_id`, `project_item_id`, the underlying global `issue_id`, repository metadata, issue number, and content type.
+- Reads: project fields, options, and items use GraphQL connections with page cursors. The Status field is resolved by name. Archived items, draft issues, and items with missing content or status are omitted from candidate reads and fail an ID refresh as malformed. Pull requests remain visible with `dispatchable: false`; closed underlying issues are never dispatchable.
+- Blockers: Issue `blockedBy` connections are read and fully paginated, including cross-repository blockers. A blocker is terminal only when its GitHub issue state is `CLOSED`; unknown blocker state keeps the item non-dispatchable. GraphQL errors, transport/status failures, malformed payloads, rate limits, and missing cursors fail the read safely.
+- The adapter is read-only. It does not mutate Project status or enroll repositories, and it does not advertise a provider-native tool. Workspace checkout for a multi-repository project belongs in workflow hooks or a separate generic hook-context integration.
 
 ### Jira Cloud adapter
 

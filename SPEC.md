@@ -2134,6 +2134,19 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Error mapping covers config, request, non-success response, malformed payload, pagination, and
   rate limiting, including documented category/message mappings for language-native errors
 
+### GitHub Projects V2 profile
+
+The Elixir implementation's `github_projects` adapter scopes reads to one user or organization
+Project V2 board selected by `tracker.provider.owner_type`, `owner`, and `project_number`.
+The selected Status field defaults to `Status`; `active_states`, `terminal_states`, and
+`required_labels` remain tracker-level settings. The ProjectV2Item node ID is the opaque
+dispatch ID, while `identifier` is `owner/repository#number` and `native_ref` retains
+non-secret project, item, underlying issue, repository, number, and content-type fields. GraphQL
+item, field, label, and blocker connections are fully paginated. Archived, draft, missing-status,
+and malformed records are omitted from candidate reads and fail ID refreshes; pull requests are
+never dispatchable. GitHub issue blockers are terminal only when their underlying state is
+`CLOSED`. The adapter is read-only and does not choose a workspace repository.
+
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
 - Dispatch sort order is priority then oldest creation time
