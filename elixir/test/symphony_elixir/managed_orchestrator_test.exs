@@ -35,6 +35,21 @@ defmodule SymphonyElixir.ManagedCountingTransitionStub do
   end
 end
 
+defmodule SymphonyElixir.ManagedRequirementsTransitionStub do
+  def transition(assignment, target, _context) do
+    observer = assignment[:transition_observer]
+    expected = assignment[:expected_requirements_fingerprint]
+
+    if assignment[:requirements_fingerprint] == expected do
+      if is_pid(observer), do: send(observer, {:requirements_transition, assignment})
+      {:ok, %{provider_state: target, reconciled: true, external_effects: %{status: :ok}}}
+    else
+      if is_pid(observer), do: send(observer, {:requirements_transition_rejected, assignment})
+      {:error, :requirements_changed, %{expected: expected, actual: assignment[:requirements_fingerprint]}}
+    end
+  end
+end
+
 defmodule SymphonyElixir.ManagedOrchestratorTest do
   use SymphonyElixir.TestSupport
 
@@ -787,6 +802,197 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     assert length(ready_intents) == 2
     assert Enum.any?(ready_intents, fn {id, _intent} -> id != "auto-ready" end)
     Process.exit(fake_pid, :kill)
+  end
+
+  defp body_fingerprint(body) do
+    "sha256:" <> Base.encode16(:crypto.hash(:sha256, body), case: :lower)
+  end
+
+  defp revision_server do
+    {pid, path} = managed_server()
+
+    :sys.replace_state(pid, fn state ->
+      %{state | managed: %{state.managed | effects: SymphonyElixir.ManagedRequirementsTransitionStub}}
+    end)
+
+    {pid, path}
+  end
+
+  defp prepare_revision_assignment(pid, old_fingerprint, new_fingerprint) do
+    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+
+    enrollment =
+      enrollment_args()
+      |> Map.put(:requirements_fingerprint, old_fingerprint)
+      |> Map.put(:requirements_revision, 1)
+
+    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment})
+    observer = self()
+
+    :sys.replace_state(pid, fn state ->
+      data =
+        update_in(state.managed.data, [:assignments, "item-1"], fn assignment ->
+          Map.merge(assignment, %{
+            transition_observer: observer,
+            expected_requirements_fingerprint: new_fingerprint
+          })
+        end)
+
+      %{state | managed: %{state.managed | data: data}}
+    end)
+  end
+
+  defp revise_request(request_id, expected_revision, fingerprint) do
+    %{
+      request_id: request_id,
+      operation: :revise,
+      args: %{
+        assignment_id: "item-1",
+        expected_revision: expected_revision,
+        changes: %{requirements_fingerprint: fingerprint, requirements_revision: 2}
+      }
+    }
+  end
+
+  test "fresh revise control verifies new requirements before committing locally" do
+    old_fingerprint = body_fingerprint("requirements-v1")
+    new_fingerprint = body_fingerprint("requirements-v2")
+    {pid, _path} = revision_server()
+    prepare_revision_assignment(pid, old_fingerprint, new_fingerprint)
+
+    request = revise_request("revise-r2", 1, new_fingerprint)
+    assert {:ok, response} = Control.submit(pid, request)
+    assert response.revision == 2
+    assert_receive {:requirements_transition, provider_assignment}
+    assert provider_assignment.requirements_fingerprint == new_fingerprint
+    assert provider_assignment.requirements_revision == 2
+
+    state = :sys.get_state(pid)
+    assignment = state.managed.data.assignments["item-1"]
+    assert assignment.requirements_fingerprint == new_fingerprint
+    assert assignment.requirements_revision == 2
+    assert assignment.revision == 2
+    assert state.managed.data.effect_intents["revise-r2"].status == :committed
+
+    event_cursor = state.managed.data.event_cursor
+    assert {:ok, duplicate} = Control.submit(pid, request)
+    assert duplicate.duplicate == true
+    refute_receive {:requirements_transition, _assignment}, 100
+    assert :sys.get_state(pid).managed.data.event_cursor == event_cursor
+  end
+
+  test "pending revise recovery supplies new requirements and commits after the provider effect" do
+    old_fingerprint = body_fingerprint("requirements-v1")
+    new_fingerprint = body_fingerprint("requirements-v2")
+    {pid, _path} = revision_server()
+    prepare_revision_assignment(pid, old_fingerprint, new_fingerprint)
+    assert {:ok, _snapshot} = Control.state(pid)
+
+    request = revise_request("revise-recovered-r2", 1, new_fingerprint)
+    state = :sys.get_state(pid)
+
+    data =
+      put_in(state.managed.data, [:effect_intents, "revise-recovered-r2"], %{
+        request_id: "revise-recovered-r2",
+        request: request,
+        assignment_id: "item-1",
+        target: :ready,
+        context: %{stop_reconciled: true},
+        status: :pending
+      })
+
+    :sys.replace_state(pid, fn current -> %{current | managed: %{current.managed | data: data}} end)
+    assert {:ok, snapshot} = Control.state(pid)
+    assert snapshot.assignments["item-1"].requirements_fingerprint == old_fingerprint
+    assert snapshot.assignments["item-1"].requirements_revision == 1
+    assert snapshot.assignments["item-1"].revision == 1
+
+    recovered = Orchestrator.recover_managed_transitions_for_test(:sys.get_state(pid))
+    assert_receive {:requirements_transition, provider_assignment}
+    assert provider_assignment.requirements_fingerprint == new_fingerprint
+    assert provider_assignment.requirements_revision == 2
+    :sys.replace_state(pid, fn _ -> recovered end)
+
+    assert {:ok, snapshot} = Control.state(pid)
+    assert snapshot.assignments["item-1"].requirements_fingerprint == new_fingerprint
+    assert snapshot.assignments["item-1"].requirements_revision == 2
+    assert snapshot.assignments["item-1"].revision == 2
+    assert :sys.get_state(pid).managed.data.effect_intents["revise-recovered-r2"].status == :committed
+  end
+
+  test "pending revise with changed input rejects the request without provider effects" do
+    old_fingerprint = body_fingerprint("requirements-v1")
+    new_fingerprint = body_fingerprint("requirements-v2")
+    wrong_fingerprint = body_fingerprint("requirements-wrong")
+    {pid, _path} = revision_server()
+    prepare_revision_assignment(pid, old_fingerprint, new_fingerprint)
+    assert {:ok, _snapshot} = Control.state(pid)
+
+    pending_request = revise_request("revise-pending-r2", 1, new_fingerprint)
+    state = :sys.get_state(pid)
+
+    data =
+      put_in(state.managed.data, [:effect_intents, "revise-pending-r2"], %{
+        request_id: "revise-pending-r2",
+        request: pending_request,
+        assignment_id: "item-1",
+        target: :ready,
+        context: %{stop_reconciled: true},
+        status: :pending
+      })
+
+    :sys.replace_state(pid, fn current -> %{current | managed: %{current.managed | data: data}} end)
+    event_cursor = state.managed.data.event_cursor
+    changed_request = revise_request("revise-pending-r2", 1, wrong_fingerprint)
+
+    assert {:error, :request_id_conflict, _details} = Control.submit(pid, changed_request)
+    refute_receive {:requirements_transition, _assignment}, 100
+    refute_receive {:requirements_transition_rejected, _assignment}, 100
+
+    state = :sys.get_state(pid)
+    assert state.managed.data.event_cursor == event_cursor
+    assert state.managed.data.effect_intents["revise-pending-r2"].request == pending_request
+    assert state.managed.data.effect_intents["revise-pending-r2"].status == :pending
+    assert state.managed.data.assignments["item-1"].requirements_fingerprint == old_fingerprint
+    assert state.managed.data.assignments["item-1"].revision == 1
+  end
+
+  test "wrong requirements keep the old assignment after provider rejection" do
+    old_fingerprint = body_fingerprint("requirements-v1")
+    new_fingerprint = body_fingerprint("requirements-v2")
+    wrong_fingerprint = body_fingerprint("requirements-wrong")
+    {pid, _path} = revision_server()
+    prepare_revision_assignment(pid, old_fingerprint, new_fingerprint)
+
+    assert {:error, _reason} = Control.submit(pid, revise_request("revise-wrong-r2", 1, wrong_fingerprint))
+    assert_receive {:requirements_transition_rejected, provider_assignment}
+    assert provider_assignment.requirements_fingerprint == wrong_fingerprint
+
+    state = :sys.get_state(pid)
+    assignment = state.managed.data.assignments["item-1"]
+    assert assignment.requirements_fingerprint == old_fingerprint
+    assert assignment.requirements_revision == 1
+    assert assignment.revision == 1
+    assert state.managed.data.effect_intents["revise-wrong-r2"].status == :pending
+  end
+
+  test "stale revisions are rejected before provider effects" do
+    old_fingerprint = body_fingerprint("requirements-v1")
+    new_fingerprint = body_fingerprint("requirements-v2")
+    {pid, _path} = revision_server()
+    prepare_revision_assignment(pid, old_fingerprint, new_fingerprint)
+    state = :sys.get_state(pid)
+    event_cursor = state.managed.data.event_cursor
+
+    assert {:error, :stale_revision, _details} = Control.submit(pid, revise_request("revise-stale-r2", 0, new_fingerprint))
+    refute_receive {:requirements_transition, _assignment}, 100
+    refute_receive {:requirements_transition_rejected, _assignment}, 100
+
+    state = :sys.get_state(pid)
+    assert state.managed.data.event_cursor == event_cursor
+    refute Map.has_key?(state.managed.data.effect_intents, "revise-stale-r2")
+    assert state.managed.data.assignments["item-1"].requirements_fingerprint == old_fingerprint
+    assert state.managed.data.assignments["item-1"].revision == 1
   end
 
   test "managed dispatch failures retry twice then block" do
