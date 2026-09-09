@@ -553,8 +553,19 @@ defmodule SymphonyElixir.Managed.Rules do
       |> Map.put(:phase, :ready)
       |> Map.put(:board_state, :ready)
       |> Map.put(:route, route || assignment.route)
+      |> reset_changed_route_session(assignment.route)
 
     {:ok, revised}
+  end
+
+  defp reset_changed_route_session(revised, previous_route) do
+    if Enum.any?([:model, :effort], &(text_value(revised.route, &1) != text_value(previous_route, &1))) do
+      revised
+      |> Map.drop([:thread_id, :session_id, :turn_id, :model, :effort, :thread_reasoning_effort, :metadata])
+      |> Map.put(:resume_ready, false)
+    else
+      revised
+    end
   end
 
   defp revision_changes(args) do

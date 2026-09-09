@@ -512,6 +512,45 @@ defmodule SymphonyElixir.ManagedRulesTest do
     assert {:ok, _string_operation_state, _} = Rules.apply(Rules.new(), envelope("string-operation", "pause", %{"expected_revision" => 0}))
   end
 
+  test "route revisions start a new session while preserving workspace and allowance" do
+    state = enrolled_state("issue-1")
+
+    state =
+      update_in(state, [:assignments, "issue-1"], fn assignment ->
+        Map.merge(assignment, %{
+          thread_id: "old-thread",
+          session_id: "old-thread",
+          turn_id: "old-turn",
+          model: "gpt-5.6-luna",
+          effort: "xhigh",
+          metadata: %{process: "stopped"},
+          resume_ready: true,
+          workspace: "/assigned/checkout",
+          turns_reserved: 7,
+          retry_count: 1
+        })
+      end)
+
+    for route <- [%{model: "gpt-5.6-luna", effort: "max"}, %{model: "gpt-5.6-terra", effort: "xhigh"}] do
+      args = %{assignment_id: "issue-1", expected_revision: 1, changes: %{route: route, escalation_reason: "Diagnosis requires additional reasoning"}}
+      assert {:ok, revised, _} = Rules.apply(state, envelope("change-route", :revise, args), %{stop_reconciled: true})
+      assignment = revised.assignments["issue-1"]
+      assert assignment.route == route
+      assert assignment.revision == 2
+      refute assignment.resume_ready
+      refute Map.has_key?(assignment, :thread_id)
+      refute Map.has_key?(assignment, :metadata)
+      assert assignment.workspace == "/assigned/checkout"
+      assert assignment.turns_reserved == 7
+      assert assignment.retry_count == 1
+    end
+
+    same_route = %{assignment_id: "issue-1", expected_revision: 1, changes: %{route: %{model: "gpt-5.6-luna", effort: "xhigh"}}}
+    assert {:ok, same, _} = Rules.apply(state, envelope("same-route", :revise, same_route), %{stop_reconciled: true})
+    assert same.assignments["issue-1"].thread_id == "old-thread"
+    assert same.assignments["issue-1"].resume_ready
+  end
+
   test "request history remains bounded after many valid operations" do
     state =
       Enum.reduce(1..101, Rules.new(), fn index, state ->

@@ -75,6 +75,159 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     {pid, path}
   end
 
+  for scenario <- [:fresh, :resume, :escalate] do
+    @dispatch_scenario scenario
+    test "managed dispatch prepares the checkout with the required session mode: #{scenario}" do
+      root = Path.join(System.tmp_dir!(), "managed-dispatch-checkout-#{System.unique_integer([:positive])}")
+      workspaces = Path.join(root, "workspaces")
+      control = Path.join(root, "control")
+      policy = Path.join(control, "policy.json")
+      helper = Path.join(control, "helper.py")
+      codex = Path.join(control, "fake_codex.py")
+      File.mkdir_p!(control)
+      File.write!(policy, Jason.encode!(%{control_root: control, workspace_root: workspaces}))
+
+      File.write!(helper, """
+      import json, os, pathlib, sys
+      assert sys.argv[1] == 'checkout'
+      payload = json.loads(pathlib.Path(sys.argv[3]).read_text())
+      payload['context'] = json.loads(os.environ['SYMPHONY_ISSUE_CONTEXT'])
+      pathlib.Path('dispatch-helper-proof.json').write_text(json.dumps(payload))
+      sys.exit(#{if @dispatch_scenario != :fresh, do: 0, else: 7})
+      """)
+
+      File.write!(codex, """
+      import json, pathlib, sys
+      for line in sys.stdin:
+          message = json.loads(line)
+          method = message.get('method')
+          if method == 'initialize':
+              print(json.dumps({'id': message['id'], 'result': {}}), flush=True)
+          elif method == 'config/read':
+              print(json.dumps({'id': message['id'], 'result': {'config': {'mcp_servers': {}}}}), flush=True)
+          elif method in ['thread/start', 'thread/resume']:
+              pathlib.Path('thread-request-proof.json').write_text(json.dumps(message))
+              print(json.dumps({'id': message['id'], 'error': {'code': -32000, 'message': 'Fixture captured request'}}), flush=True)
+              sys.exit(7)
+      """)
+
+      File.write!(Workflow.workflow_file_path(), """
+      ---
+      tracker:
+        kind: memory
+        active_states: [READY, ACTIVE]
+        terminal_states: [ACCEPTED, CANCELLED]
+      polling:
+        interval_ms: 60000
+      workspace:
+        root: #{workspaces}
+      codex:
+        command: #{System.find_executable("python3")} #{codex}
+      managed:
+        checkout_node: #{System.find_executable("python3")}
+        checkout_helper_path: #{helper}
+        checkout_policy_file: #{policy}
+      ---
+      Disposable helper dispatch test.
+      """)
+
+      :ok = WorkflowStore.force_reload()
+
+      issue = %Issue{
+        id: "item-1",
+        identifier: "acme/example#5",
+        title: "Checkout fixture",
+        state: "READY",
+        dispatchable: true,
+        native_ref: %{"project_item_id" => "item-1", "issue_id" => "I_fixture", "issue_number" => 5, "repository" => %{"name_with_owner" => "acme/example"}}
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+      {pid, _path} = managed_server()
+
+      on_exit(fn ->
+        if Process.alive?(pid), do: GenServer.stop(pid)
+        File.rm_rf!(root)
+      end)
+
+      assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+      args = %{enrollment_args() | base_commit: String.duplicate("a", 40)}
+      assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: args})
+
+      if @dispatch_scenario != :fresh do
+        :sys.replace_state(pid, fn state ->
+          data =
+            update_in(state.managed.data, [:assignments, "item-1"], fn assignment ->
+              Map.merge(assignment, %{resume_ready: true, thread_id: "stored-thread", generation: 2, recovery_generation_pending: true})
+            end)
+
+          %{state | managed: %{state.managed | data: data}}
+        end)
+      end
+
+      if @dispatch_scenario == :escalate do
+        changes = %{route: %{model: "gpt-5.6-terra", effort: "xhigh"}, escalation_reason: "Complex diagnosis"}
+        args = %{assignment_id: "item-1", expected_revision: 1, changes: changes}
+        assert {:ok, _} = Control.submit(pid, %{request_id: "escalate", operation: :revise, args: args})
+      end
+
+      send(pid, :run_poll_cycle)
+
+      proof =
+        Enum.find_value(1..100, fn _ ->
+          case Path.wildcard(Path.join(workspaces, "*/dispatch-helper-proof.json")) do
+            [path] ->
+              path
+
+            [] ->
+              Process.sleep(20)
+              nil
+          end
+        end)
+
+      assert is_binary(proof), "managed dispatch must invoke the real preparer before starting Codex"
+      payload = proof |> File.read!() |> Jason.decode!()
+      assert payload["assignment_id"] == "item-1"
+      assert payload["base_commit"] == args.base_commit
+      assert payload["revision"] == if(@dispatch_scenario == :escalate, do: 2, else: 1)
+      assert payload["generation"] == if(@dispatch_scenario != :fresh, do: 2, else: 1)
+      assert payload["context"]["native_ref"]["issue_id"] == "I_fixture"
+      assert {:ok, snapshot} = Control.state(pid)
+      assert payload["attempt_id"] == snapshot.assignments["item-1"].attempt_id
+
+      if @dispatch_scenario != :fresh do
+        request_path = Path.join(Path.dirname(proof), "thread-request-proof.json")
+
+        assert Enum.any?(1..250, fn _ ->
+                 if File.exists?(request_path),
+                   do: true,
+                   else:
+                     (
+                       Process.sleep(20)
+                       false
+                     )
+               end),
+               "managed recovery must reach the AppServer thread request"
+
+        request = request_path |> File.read!() |> Jason.decode!()
+
+        if @dispatch_scenario == :resume do
+          assert request["method"] == "thread/resume"
+          assert request["params"]["threadId"] == "stored-thread"
+          assert request["params"]["model"] == "gpt-5.6-luna"
+        else
+          assert request["method"] == "thread/start"
+          refute Map.has_key?(request["params"], "threadId")
+          assert request["params"]["model"] == "gpt-5.6-terra"
+        end
+
+        assert request["params"]["permissions"] == "symphony_worker"
+      end
+
+      GenServer.stop(pid)
+    end
+  end
+
   test "managed control is serialized, durable, and exposes revision and cursor" do
     {pid, _path} = managed_server()
 

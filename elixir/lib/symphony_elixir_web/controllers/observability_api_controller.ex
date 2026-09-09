@@ -49,7 +49,6 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
       {:error, :forbidden} -> managed_error(conn, 403, "loopback_required", "Loopback access required")
       {:error, :managed_mode_disabled} -> managed_error(conn, 503, "managed_mode_disabled", "Managed mode is disabled")
       {:error, reason} -> managed_error(conn, 503, "managed_unavailable", safe_managed_message(reason))
-      {:error, code, details} -> managed_error(conn, 409, Atom.to_string(code), safe_managed_message(details))
     end
   end
 

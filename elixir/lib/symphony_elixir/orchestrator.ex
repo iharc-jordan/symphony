@@ -233,7 +233,6 @@ defmodule SymphonyElixir.Orchestrator do
     case managed_report_provider_effect(state, payload) do
       {:ok, provider_state} -> {:reply, :ok, provider_state}
       {:error, provider_state, {code, details}} -> {:reply, {:error, {code, details}}, provider_state}
-      {:error, provider_state, reason} -> {:reply, {:error, reason}, provider_state}
     end
   end
 
@@ -389,7 +388,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp managed_dispatch_candidate(%State{} = state, %Issue{id: issue_id} = issue)
        when is_binary(issue_id) do
-    case get_in(state, [:managed, :data, :assignments, issue_id]) do
+    case get_in(state.managed, [:data, :assignments, issue_id]) do
       %{phase: :ready, board_state: :ready} = assignment ->
         if available_slots(state) > 0 and
              managed_issue_matches_assignment?(issue, assignment) and
@@ -462,8 +461,6 @@ defmodule SymphonyElixir.Orchestrator do
       dependency.repository <> "#" <> Integer.to_string(dependency.issue_number) == identifier
     end)
   end
-
-  defp find_assignment_by_identity(_data, _identifier), do: nil
 
   defp accepted_dependency_receipt?(data, id) do
     assignment = get_in(data, [:assignments, id])
@@ -539,7 +536,6 @@ defmodule SymphonyElixir.Orchestrator do
         attempt_id: attempt_id,
         pending_effect: %{kind: :start, status: :pending, at: DateTime.utc_now()},
         started_at: DateTime.utc_now(),
-        resume_ready: false,
         recovery_generation_pending: false
       })
 
@@ -679,7 +675,10 @@ defmodule SymphonyElixir.Orchestrator do
         |> Map.put(:pending_effect, effect)
         |> maybe_put_managed(
           :resume_ready,
-          target in [:ready, :review, :waiting] and is_binary(current[:thread_id])
+          if(target == :active,
+            do: current[:resume_ready],
+            else: target in [:ready, :review, :waiting] and is_binary(current[:thread_id])
+          )
         )
       end)
       |> update_in([:effect_intents, intent_id], fn existing ->
@@ -776,7 +775,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp managed_effect_error_code({code, _details}) when is_atom(code), do: code
-  defp managed_effect_error_code(code) when is_atom(code), do: code
   defp managed_effect_error_code(_reason), do: :managed_provider_effect_failed
 
   defp safe_managed_effect_call(module, function, args) do
@@ -818,7 +816,9 @@ defmodule SymphonyElixir.Orchestrator do
     data
     |> update_in([:assignments, issue_id], fn assignment ->
       if is_map(assignment) do
-        Map.put(assignment, :pending_effect, %{
+        assignment
+        |> Map.put(:resume_ready, false)
+        |> Map.put(:pending_effect, %{
           kind: :start,
           status: :started,
           process_id: inspect(pid),
@@ -1275,7 +1275,6 @@ defmodule SymphonyElixir.Orchestrator do
          {:ok, target} <- managed_source_target(issue) do
       reconcile_source_observation(state, assignment, issue, target)
     else
-      {:error, reason, details} -> {:error, state, {reason, details}}
       {:error, reason} -> {:error, state, reason}
     end
   end
@@ -1491,10 +1490,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp recover_prepared_managed_review(state, prepared) do
-    case execute_managed_review(state, prepared) do
-      {:reply, _reply, next_state} -> next_state
-      _ -> state
-    end
+    {:reply, _reply, next_state} = execute_managed_review(state, prepared)
+    next_state
   end
 
   defp recover_duplicate_managed_review(state, intent) do
@@ -1621,10 +1618,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp replay_managed_transition(state, assignment, %{request: request} = intent) when is_map(request) do
-    case execute_managed_transition(state, assignment, intent, %{}) do
-      {:reply, _reply, next_state} -> next_state
-      _ -> state
-    end
+    {:reply, _reply, next_state} = execute_managed_transition(state, assignment, intent, %{})
+    next_state
   end
 
   defp replay_managed_transition(state, assignment, intent) do
@@ -1640,8 +1635,6 @@ defmodule SymphonyElixir.Orchestrator do
   defp managed_binding_envelope?(envelope) when is_map(envelope) do
     map_value(envelope, :operation) in [:bind_project, "bind_project"]
   end
-
-  defp managed_binding_envelope?(_envelope), do: false
 
   defp handle_managed_binding_control(%State{} = state, envelope) do
     case managed_validate_binding(state, envelope) do
@@ -1700,13 +1693,9 @@ defmodule SymphonyElixir.Orchestrator do
     Map.get(envelope, :operation, Map.get(envelope, "operation")) in [:review, "review"]
   end
 
-  defp managed_review_envelope?(_envelope), do: false
-
   defp managed_transition_envelope?(envelope) when is_map(envelope) do
     Map.get(envelope, :operation, Map.get(envelope, "operation")) in [:revise, "revise", :interrupt, "interrupt", :cancel, "cancel"]
   end
-
-  defp managed_transition_envelope?(_envelope), do: false
 
   defp transition_target(envelope) do
     case Map.get(envelope, :operation, Map.get(envelope, "operation")) do
@@ -2221,10 +2210,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp finalize_managed_agent_down(state, updated, stop_intent, phase, issue_id) when is_map(stop_intent) do
     if is_map(Map.get(stop_intent, :request)) do
-      case execute_managed_transition(state, updated, stop_intent, %{}) do
-        {:reply, _reply, final_state} -> final_state
-        _ -> state
-      end
+      {:reply, _reply, final_state} = execute_managed_transition(state, updated, stop_intent, %{})
+      final_state
     else
       finalize_managed_agent_down(state, updated, nil, phase, issue_id)
     end
@@ -2851,8 +2838,6 @@ defmodule SymphonyElixir.Orchestrator do
         "mcpServer/elicitation/request"
   end
 
-  defp input_required_blocker?(_running_entry), do: false
-
   defp input_required_completion_outcome(completion) when is_map(completion) do
     outcome = Map.get(completion, :outcome) || Map.get(completion, "outcome")
     normalize_input_required_outcome(outcome)
@@ -2881,8 +2866,6 @@ defmodule SymphonyElixir.Orchestrator do
       codex_message_blocker_error(Map.get(running_entry, :last_codex_message)) ||
       fallback
   end
-
-  defp blocker_error(_running_entry, fallback), do: fallback
 
   defp codex_event_blocker_error(:turn_input_required), do: "codex turn requires operator input"
   defp codex_event_blocker_error(:approval_required), do: "codex turn requires approval"
@@ -3240,7 +3223,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp managed_workspace_preparer(issue, assignment, attempt, checkout_options) do
     fn workspace ->
-      Checkout.prepare(workspace, issue, assignment, attempt, checkout_options)
+      Checkout.prepare(workspace, issue, assignment, attempt, Map.to_list(checkout_options))
     end
   end
 
