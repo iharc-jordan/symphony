@@ -145,8 +145,12 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
   defp exact_identity(issue, assignment) do
     repository = get_in(issue.native_ref || %{}, ["repository", "name_with_owner"])
     issue_number = get_in(issue.native_ref || %{}, ["issue_number"])
+    project_item_id = native_value(issue, :project_item_id)
+    expected_project_item_id = text(assignment, :project_item_id) || text(assignment, :assignment_id)
 
-    if repository == text(assignment, :repository) and issue_number == Map.get(assignment, :issue_number) do
+    if repository == text(assignment, :repository) and
+         issue_number == Map.get(assignment, :issue_number) and
+         (is_nil(expected_project_item_id) or project_item_id == expected_project_item_id) do
       :ok
     else
       {:error, :managed_native_identity_mismatch, %{}}

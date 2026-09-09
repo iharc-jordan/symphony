@@ -74,7 +74,15 @@ defmodule SymphonyElixir.Orchestrator do
 
         case initialize_managed(config, state, opts) do
           {:ok, state} ->
-            state = if is_nil(state.managed), do: state, else: recover_managed_active_assignments(state)
+            state =
+              if is_nil(state.managed) do
+                state
+              else
+                state
+                |> recover_managed_usage_inflight()
+                |> recover_managed_active_assignments()
+              end
+
             if is_nil(state.managed), do: run_terminal_workspace_cleanup()
             state = schedule_tick(state, 0)
             {:ok, state}
@@ -535,10 +543,41 @@ defmodule SymphonyElixir.Orchestrator do
     assignment_id = map_value(map_value(payload, :attempt) || %{}, :assignment_id)
     assignment = get_in(state.managed.data, [:assignments, assignment_id])
 
-    if target && is_map(assignment) do
-      managed_apply_provider_transition(state, assignment, target)
-    else
-      {:ok, state}
+    cond do
+      is_nil(target) or not is_map(assignment) ->
+        {:ok, state}
+
+      target == :waiting and Map.has_key?(state.running, assignment_id) ->
+        # A context-needed report is terminal for the worker, but the provider
+        # transition must wait until the owned process has actually stopped.
+        # Keep the automatic intent durable and let the DOWN path reconcile it.
+        with {:ok, intent_state, intent_id} <-
+               ensure_managed_transition_intent(state, assignment, target),
+             data <-
+               intent_state.managed.data
+               |> put_in([:assignments, assignment_id, :stop_pending], true)
+               |> put_in([:assignments, assignment_id, :pending_effect], %{
+                 kind: :report,
+                 status: :deferred,
+                 target: target,
+                 request_id: intent_id
+               })
+               |> append_managed_event(%{
+                 operation: :provider_transition_deferred,
+                 assignment_id: assignment_id,
+                 target: target,
+                 request_id: intent_id,
+                 reason: :process_not_stopped
+               }),
+             {:ok, deferred_state} <- persist_managed_data(intent_state, data) do
+          {:ok, deferred_state}
+        else
+          {:error, failed_state, reason} -> {:error, failed_state, reason}
+          {:error, reason} -> {:error, state, {:managed_journal_write_failed, reason}}
+        end
+
+      true ->
+        managed_apply_provider_transition(state, assignment, target)
     end
   end
 
@@ -1062,7 +1101,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp managed_report_phase(assignment, "context_needed", summary) do
-    Map.merge(assignment, %{phase: :waiting, board_state: :waiting, blocked_reason: summary, pending_effect: %{kind: :report, status: :received}})
+    Map.merge(assignment, %{
+      phase: :waiting,
+      board_state: :waiting,
+      blocked_reason: summary,
+      stop_pending: true,
+      pending_effect: %{kind: :report, status: :received}
+    })
   end
 
   defp managed_report_phase(assignment, _kind, _summary), do: assignment
@@ -1140,11 +1185,23 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- managed_source_identity_matches?(assignment, issue),
          :ok <- managed_source_material_matches?(assignment, issue),
          {:ok, target} <- managed_source_target(issue) do
-      if target == assignment[:phase] and assignment[:stop_pending] != true do
+      assignment_id = assignment.assignment_id
+      observed_issue_id = source_native_value(issue, :issue_id)
+      observed_repository_id = source_native_repository_id(issue)
+      observed_project_item_id = source_native_value(issue, :project_item_id)
+
+      stop_pending = Map.has_key?(state.running, assignment_id)
+
+      source_changed? =
+        target != assignment[:phase] or assignment[:stop_pending] == true or
+          assignment[:source_authoritative] != true or assignment[:source_state] != issue.state or
+          assignment[:native_issue_id] != observed_issue_id or
+          assignment[:native_repository_id] != observed_repository_id or
+          assignment[:project_item_id] != observed_project_item_id
+
+      if not source_changed? do
         {:ok, state, :unchanged}
       else
-        assignment_id = assignment.assignment_id
-
         updated =
           assignment
           |> Map.merge(%{
@@ -1153,10 +1210,10 @@ defmodule SymphonyElixir.Orchestrator do
             source_authoritative: true,
             source_state: issue.state,
             source_observed_at: DateTime.utc_now(),
-            native_issue_id: source_native_value(issue, :issue_id) || assignment[:native_issue_id],
-            native_repository_id: source_native_repository_id(issue) || assignment[:native_repository_id],
-            project_item_id: source_native_value(issue, :project_item_id) || assignment[:project_item_id],
-            stop_pending: Map.has_key?(state.running, assignment_id),
+            native_issue_id: observed_issue_id || assignment[:native_issue_id],
+            native_repository_id: observed_repository_id || assignment[:native_repository_id],
+            project_item_id: observed_project_item_id || assignment[:project_item_id],
+            stop_pending: stop_pending,
             pending_effect: %{kind: :source_reconcile, status: :reconciled, target: target}
           })
 
@@ -1168,12 +1225,13 @@ defmodule SymphonyElixir.Orchestrator do
             assignment_id: assignment_id,
             source_state: issue.state,
             target: target,
-            stop_pending: Map.has_key?(state.running, assignment_id)
+            stop_pending: stop_pending
           })
 
         case persist_managed_data(state, data) do
           {:ok, reconciled_state} ->
-            {:ok, managed_stop_owned_process(reconciled_state, assignment_id), {:changed, target}}
+            result = if target == assignment[:phase] and not stop_pending, do: :unchanged, else: {:changed, target}
+            {:ok, managed_stop_owned_process(reconciled_state, assignment_id), result}
 
           {:error, reason} ->
             {:error, state, {:managed_journal_write_failed, reason}}
@@ -1189,15 +1247,18 @@ defmodule SymphonyElixir.Orchestrator do
     repository = source_native_value(issue, :repository) |> source_nested_value(:name_with_owner)
     issue_number = source_native_value(issue, :issue_number)
     content_type = source_native_value(issue, :content_type)
-    expected_issue_id = assignment[:native_issue_id] || assignment[:issue_id]
+    expected_issue_id = assignment[:native_issue_id]
     expected_repository_id = assignment[:native_repository_id] || assignment[:repository_id]
+    expected_project_item_id = assignment[:project_item_id] || assignment[:assignment_id]
     observed_issue_id = source_native_value(issue, :issue_id)
     observed_repository_id = source_native_value(issue, :repository) |> source_nested_value(:id)
+    observed_project_item_id = source_native_value(issue, :project_item_id)
 
     if content_type == "Issue" and repository == assignment[:repository] and
          issue_number == assignment[:issue_number] and
          (is_nil(expected_issue_id) or expected_issue_id == observed_issue_id) and
-         (is_nil(expected_repository_id) or expected_repository_id == observed_repository_id) do
+         (is_nil(expected_repository_id) or expected_repository_id == observed_repository_id) and
+         (is_nil(expected_project_item_id) or expected_project_item_id == observed_project_item_id) do
       :ok
     else
       {:error, :managed_source_identity_mismatch}
@@ -1307,6 +1368,34 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp recover_managed_reviews(state), do: state
 
+  defp recover_managed_usage_inflight(%State{managed: %{data: data}} = state) do
+    usage = data[:usage] || %{}
+    stale_inflight = nonnegative_integer(usage[:inflight_tokens], 0)
+
+    if stale_inflight == 0 do
+      state
+    else
+      recovered_data =
+        data
+        |> put_in([:usage, :inflight_tokens], 0)
+        |> append_managed_event(%{
+          operation: :startup_usage_recovery,
+          stale_inflight_tokens: stale_inflight
+        })
+
+      case persist_managed_data(state, recovered_data) do
+        {:ok, recovered_state} ->
+          recovered_state
+
+        {:error, reason} ->
+          Logger.error("Managed startup usage recovery could not be persisted: #{inspect(reason)}")
+          state
+      end
+    end
+  end
+
+  defp recover_managed_usage_inflight(state), do: state
+
   defp recover_managed_active_assignments(%State{managed: %{data: data}} = state) do
     data.assignments
     |> Enum.filter(fn {assignment_id, assignment} ->
@@ -1369,14 +1458,29 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp recover_managed_transitions(%State{managed: %{data: data}} = state) do
     data[:effect_intents]
-    |> Enum.filter(fn {_request_id, intent} -> is_map(intent) and intent[:status] == :pending and is_map(intent[:request]) end)
+    |> Enum.filter(fn {_request_id, intent} ->
+      is_map(intent) and intent[:status] in [:pending, :effect_reconciled]
+    end)
     |> Enum.reduce(state, fn {_request_id, intent}, acc ->
       assignment = get_in(acc.managed.data, [:assignments, intent.assignment_id])
 
       if is_map(assignment) do
-        case execute_managed_transition(acc, assignment, intent, %{}) do
-          {:reply, _reply, next_state} -> next_state
-          _ -> acc
+        case intent[:request] do
+          request when is_map(request) ->
+            case execute_managed_transition(acc, assignment, intent, %{}) do
+              {:reply, _reply, next_state} -> next_state
+              _ -> acc
+            end
+
+          _ ->
+            # Automatic intents (dispatch/report/recovery transitions) have no
+            # control request to replay. Re-apply the idempotent provider
+            # transition so a crash between journaling and the effect cannot
+            # leave the intent pending forever.
+            case managed_apply_provider_transition(acc, assignment, intent[:target]) do
+              {:ok, next_state} -> next_state
+              {:error, next_state, _reason} -> next_state
+            end
         end
       else
         acc
@@ -1823,38 +1927,47 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_managed_agent_down(reason, %State{} = state, issue_id, running_entry, attempt) do
-    assignment = get_in(state, [:managed, :data, :assignments, issue_id])
+    assignment = get_in(state.managed.data, [:assignments, issue_id])
 
     if is_map(assignment) and managed_attempt_matches?(assignment, attempt) == :ok do
+      stop_intent = managed_pending_stop_intent(state.managed.data, issue_id)
+
       {phase, board_state, pending_effect, stop_pending, blocked_reason} =
-        case {reason, assignment[:phase], assignment[:stop_pending], assignment[:source_authoritative]} do
-          {_reason, phase, true, true} ->
+        case {stop_intent, reason, assignment[:phase], assignment[:stop_pending], assignment[:source_authoritative]} do
+          {%{request: request, target: target}, _reason, phase, true, _source_authoritative}
+          when is_map(request) and target in [:ready, :waiting, :cancelled] ->
+            {phase, phase, %{kind: :run, status: :stop_confirmed, target: target, attempt_id: attempt.attempt_id}, true, assignment[:blocked_reason]}
+
+          {_intent, _reason, phase, true, true} ->
             {phase, phase, %{kind: :run, status: :source_stopped, attempt_id: attempt.attempt_id}, false, nil}
 
-          {{:managed_agent_guard_stop, _guard_reason}, phase, true, false} ->
+          {_intent, {:managed_agent_guard_stop, _guard_reason}, phase, true, false} ->
             {phase, phase, %{kind: :run, status: :stopped, attempt_id: attempt.attempt_id}, true, assignment[:blocked_reason]}
 
-          {{:managed_agent_terminal, _report}, phase, _, _} when phase in [:review, :accepted] ->
+          {_intent, {:managed_agent_terminal, _report}, phase, _, _} when phase in [:review, :accepted] ->
             {phase, phase, %{kind: :run, status: :completed, attempt_id: attempt.attempt_id}, false, nil}
 
-          {{:managed_agent_guard_stop, guard_reason}, phase, _, _} when phase in [:review, :waiting] ->
+          {_intent, {:managed_agent_terminal, _report}, phase, true, _} when phase in [:waiting, :cancelled] ->
+            {phase, phase, %{kind: :run, status: :report_deferred, attempt_id: attempt.attempt_id}, true, assignment[:blocked_reason]}
+
+          {_intent, {:managed_agent_guard_stop, guard_reason}, phase, _, _} when phase in [:review, :waiting] ->
             {phase, phase, %{kind: :run, status: :guard_stopped, reason: inspect(guard_reason), attempt_id: attempt.attempt_id}, false,
              if(phase == :waiting, do: assignment[:blocked_reason], else: nil)}
 
-          {{:managed_agent_guard_stop, guard_reason}, _phase, _, _} ->
+          {_intent, {:managed_agent_guard_stop, guard_reason}, _phase, _, _} ->
             {:waiting, :waiting, %{kind: :run, status: :guard_stopped, reason: inspect(guard_reason), attempt_id: attempt.attempt_id}, true, inspect(guard_reason)}
 
-          {{:managed_agent_failed, failure}, _phase, _, _} ->
+          {_intent, {:managed_agent_failed, failure}, _phase, _, _} ->
             if managed_retry_allowed?(assignment) and managed_transient_failure?(failure) do
               {:ready, :ready, %{kind: :run, status: :retry_pending, reason: inspect(failure), attempt_id: attempt.attempt_id}, false, nil}
             else
               {:waiting, :waiting, %{kind: :run, status: :unknown, reason: inspect(failure), attempt_id: attempt.attempt_id}, true, inspect(failure)}
             end
 
-          {:normal, phase, _, _} when phase in [:review, :waiting, :accepted] ->
+          {_intent, :normal, phase, _, _} when phase in [:review, :waiting, :accepted] ->
             {phase, phase, %{kind: :run, status: :completed, attempt_id: attempt.attempt_id}, false, nil}
 
-          {_other, _phase, _, _} ->
+          {_intent, _other, _phase, _, _} ->
             {:waiting, :waiting, %{kind: :run, status: :unknown, reason: inspect(reason), attempt_id: attempt.attempt_id}, true, inspect(reason)}
         end
 
@@ -1889,14 +2002,23 @@ defmodule SymphonyElixir.Orchestrator do
         })
 
       case persist_managed_data(state, data) do
-        {:ok, next_state} when phase in [:ready, :review, :waiting, :cancelled] ->
-          case managed_apply_provider_transition(next_state, updated, phase) do
-            {:ok, provider_state} -> provider_state
-            {:error, provider_state, _reason} -> provider_state
-          end
-
         {:ok, next_state} ->
-          next_state
+          cond do
+            is_map(stop_intent) and is_map(Map.get(stop_intent, :request)) ->
+              case execute_managed_transition(next_state, updated, stop_intent, %{}) do
+                {:reply, _reply, final_state} -> final_state
+                _ -> next_state
+              end
+
+            phase in [:ready, :review, :waiting, :cancelled] ->
+              case managed_apply_provider_transition(next_state, updated, phase) do
+                {:ok, provider_state} -> provider_state
+                {:error, provider_state, _reason} -> provider_state
+              end
+
+            true ->
+              next_state
+          end
 
         {:error, error} ->
           Logger.error("Managed agent completion could not be persisted for #{issue_id}: #{inspect(error)}")
@@ -1906,6 +2028,25 @@ defmodule SymphonyElixir.Orchestrator do
       state
     end
   end
+
+  defp managed_pending_stop_intent(data, assignment_id) when is_map(data) and is_binary(assignment_id) do
+    data[:effect_intents]
+    |> case do
+      intents when is_map(intents) ->
+        Enum.find_value(intents, fn {_request_id, intent} ->
+          if is_map(intent) and intent[:assignment_id] == assignment_id and
+               intent[:status] in [:pending, :effect_reconciled] and is_map(intent[:request]) and
+               intent[:target] in [:ready, :waiting, :cancelled] do
+            intent
+          end
+        end)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp managed_pending_stop_intent(_data, _assignment_id), do: nil
 
   defp managed_retry_allowed?(assignment) when is_map(assignment) do
     retry_count = assignment[:retry_count] || 0
@@ -2088,6 +2229,18 @@ defmodule SymphonyElixir.Orchestrator do
       when is_binary(issue_id) and is_integer(attempt) and attempt >= 0 and is_map(metadata) do
     {:noreply, updated_state} = handle_retry_issue_lookup(issue, state, issue_id, attempt, metadata)
     updated_state
+  end
+
+  @doc false
+  @spec recover_managed_usage_inflight_for_test(term()) :: term()
+  def recover_managed_usage_inflight_for_test(%State{} = state) do
+    recover_managed_usage_inflight(state)
+  end
+
+  @doc false
+  @spec recover_managed_transitions_for_test(term()) :: term()
+  def recover_managed_transitions_for_test(%State{} = state) do
+    recover_managed_transitions(state)
   end
 
   @doc false

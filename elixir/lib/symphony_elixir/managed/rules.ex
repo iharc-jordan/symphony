@@ -362,7 +362,7 @@ defmodule SymphonyElixir.Managed.Rules do
 
     with :ok <- present(reason, :reason),
          :ok <- phase_is(assignment.phase, :active) do
-      {:ok, :waiting, %{blocked_reason: reason, stop_pending: true}, %{operation: :interrupt, reason: reason}}
+      {:ok, :waiting, %{blocked_reason: reason, board_state: :waiting, stop_pending: true}, %{operation: :interrupt, reason: reason}}
     end
   end
 
@@ -372,7 +372,7 @@ defmodule SymphonyElixir.Managed.Rules do
     if assignment.phase in @terminal_phases do
       {:error, :already_terminal, %{phase: assignment.phase}}
     else
-      {:ok, :cancelled, %{disposition_reason: reason, stop_pending: true}, %{operation: :cancel, reason: reason}}
+      {:ok, :cancelled, %{disposition_reason: reason, board_state: :cancelled, stop_pending: true}, %{operation: :cancel, reason: reason}}
     end
   end
 
