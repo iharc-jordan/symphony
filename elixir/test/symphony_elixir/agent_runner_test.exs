@@ -86,6 +86,72 @@ defmodule SymphonyElixir.AgentRunnerTest do
     end
   end
 
+  test "managed runner reports exhausted budget when the final turn leaves issue active" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-managed-runner-final-budget-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-FINAL-BUDGET")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-final-budget"}}}' ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-final-budget"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-final-budget",
+        identifier: "MT-FINAL-BUDGET",
+        title: "Final budget",
+        description: "Final turn leaves issue active",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-FINAL-BUDGET",
+        labels: []
+      }
+
+      attempt = %{
+        assignment_id: "issue-final-budget",
+        revision: "rev-1",
+        generation: 0,
+        attempt_id: "attempt-final-budget"
+      }
+
+      assert catch_exit(
+               AgentRunner.run(issue, nil,
+                 managed_attempt: attempt,
+                 max_turns: 1,
+                 issue_state_fetcher: fn [_id] -> {:ok, [issue]} end
+               )
+             ) == {:managed_agent_guard_stop, :turn_budget_exhausted}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "managed runner rejects an exhausted turn allowance before launching AppServer" do
     test_root =
       Path.join(

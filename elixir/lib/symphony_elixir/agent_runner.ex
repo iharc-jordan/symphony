@@ -214,7 +214,11 @@ defmodule SymphonyElixir.AgentRunner do
         {:continue, refreshed_issue} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
-          :ok
+          if managed_attempt?(opts) do
+            {:error, :turn_budget_exhausted}
+          else
+            :ok
+          end
 
         {:done, _refreshed_issue} ->
           :ok
