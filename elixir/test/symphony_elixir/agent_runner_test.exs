@@ -107,7 +107,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
         case "$count" in
           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
           2) ;;
-          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-final-budget"}}}' ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-final-budget"},"model":"gpt-5.6-luna","reasoningEffort":"xhigh"}}' ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-final-budget"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
@@ -130,6 +130,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
         description: "Final turn leaves issue active",
         state: "In Progress",
         url: "https://example.org/issues/MT-FINAL-BUDGET",
+        dispatchable: true,
         labels: []
       }
 
@@ -143,6 +144,8 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert catch_exit(
                AgentRunner.run(issue, nil,
                  managed_attempt: attempt,
+                 model: "gpt-5.6-luna",
+                 effort: "xhigh",
                  max_turns: 1,
                  issue_state_fetcher: fn [_id] -> {:ok, [issue]} end
                )
