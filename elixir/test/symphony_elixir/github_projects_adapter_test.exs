@@ -44,6 +44,7 @@ defmodule SymphonyElixir.GitHubProjects.AdapterTest do
         "title" => "Ship it",
         "body" => "Body",
         "state" => "OPEN",
+        "stateReason" => "COMPLETED",
         "url" => "https://github.test/octo/one/issues/42",
         "repository" => repository("octo", "one"),
         "labels" => %{"nodes" => [%{"name" => " Bug "}, %{"name" => "bug"}]},
@@ -69,6 +70,7 @@ defmodule SymphonyElixir.GitHubProjects.AdapterTest do
     assert issue.native_ref["repository"]["name_with_owner"] == "octo/one"
     assert issue.native_ref["issue_number"] == 42
     assert issue.native_ref["content_type"] == "Issue"
+    assert issue.native_ref["issue_state_reason"] == "COMPLETED"
     assert issue.blocked_by == [%{"id" => "I_2", "identifier" => "octo/two#7", "state" => "CLOSED"}]
   end
 
@@ -83,6 +85,7 @@ defmodule SymphonyElixir.GitHubProjects.AdapterTest do
         "number" => 8,
         "title" => "PR",
         "state" => "OPEN",
+        "stateReason" => "REOPENED",
         "url" => "https://github.test/octo/one/pull/8",
         "repository" => repository("octo", "one")
       }
@@ -108,6 +111,9 @@ defmodule SymphonyElixir.GitHubProjects.AdapterTest do
           {:ok, %{status: 200, body: blocker_body()}}
 
         String.contains?(query, "ProjectItems") ->
+          assert query =~ ~r/\.\.\. on Issue \{\s+id number title body state stateReason url/
+          assert query =~ ~r/\.\.\. on PullRequest \{\s+id number title body state url/
+          refute query =~ ~r/\.\.\. on PullRequest \{\s+id number title body state stateReason url/
           send(self(), {:item_page, variables["after"]})
           {:ok, %{status: 200, body: item_body(variables["after"])}}
       end
@@ -132,6 +138,9 @@ defmodule SymphonyElixir.GitHubProjects.AdapterTest do
           {:ok, %{status: 200, body: fields_body()}}
 
         String.contains?(query, "ProjectItemsById") ->
+          assert query =~ ~r/\.\.\. on Issue \{\s+id number title body state stateReason url/
+          assert query =~ ~r/\.\.\. on PullRequest \{\s+id number title body state url/
+          refute query =~ ~r/\.\.\. on PullRequest \{\s+id number title body state stateReason url/
           refute String.contains?(query, "$projectId")
           refute Map.has_key?(variables, "projectId")
 

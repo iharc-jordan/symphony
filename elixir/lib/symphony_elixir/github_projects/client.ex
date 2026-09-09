@@ -71,7 +71,7 @@ defmodule SymphonyElixir.GitHubProjects.Client do
       createdAt updatedAt
     }
     ... on PullRequest {
-      id number title body state stateReason url
+      id number title body state url
       repository { id name nameWithOwner url owner { login } }
       labels(first: 100) { nodes { name } pageInfo { hasNextPage endCursor } }
       createdAt updatedAt
