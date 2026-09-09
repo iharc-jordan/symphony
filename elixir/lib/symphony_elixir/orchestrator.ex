@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.Managed.{Journal, Rules}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -40,7 +41,8 @@ defmodule SymphonyElixir.Orchestrator do
       blocked: %{},
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      managed: nil
     ]
   end
 
@@ -66,16 +68,141 @@ defmodule SymphonyElixir.Orchestrator do
           tick_token: nil,
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           codex_totals: @empty_codex_totals,
-          codex_rate_limits: nil
+          codex_rate_limits: nil,
+          managed: nil
         }
 
-        run_terminal_workspace_cleanup()
-        state = schedule_tick(state, 0)
+        case initialize_managed(config, state, opts) do
+          {:ok, state} ->
+            if is_nil(state.managed), do: run_terminal_workspace_cleanup()
+            state = schedule_tick(state, 0)
+            {:ok, state}
 
-        {:ok, state}
+          {:error, reason} ->
+            {:stop, reason}
+        end
 
       {:error, reason} ->
         {:stop, reason}
+    end
+  end
+
+  @impl true
+  def terminate(_reason, %State{managed: %{journal: journal}}) do
+    Journal.close(journal)
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
+
+  @impl true
+  def handle_call(:managed_state, _from, %State{managed: nil} = state), do: {:reply, {:error, :managed_mode_disabled}, state}
+
+  def handle_call(:managed_state, _from, %State{managed: %{data: data}} = state) do
+    {:reply, {:ok, Rules.snapshot(data)}, state}
+  end
+
+  def handle_call({:managed_events, _after_cursor, _limit}, _from, %State{managed: nil} = state) do
+    {:reply, {:error, :managed_mode_disabled}, state}
+  end
+
+  def handle_call({:managed_events, after_cursor, limit}, _from, %State{managed: %{data: data}} = state)
+      when is_integer(after_cursor) and is_integer(limit) do
+    events =
+      data
+      |> Map.get(:events, [])
+      |> Enum.filter(&(is_map(&1) and Map.get(&1, :cursor, 0) > after_cursor))
+      |> Enum.reverse()
+      |> Enum.take(max(min(limit, 100), 0))
+
+    {:reply, {:ok, events}, state}
+  end
+
+  def handle_call({:managed_control, _envelope}, _from, %State{managed: nil} = state) do
+    {:reply, {:error, :managed_mode_disabled}, state}
+  end
+
+  def handle_call({:managed_reconcile, _assignment_id, _facts}, _from, %State{managed: nil} = state) do
+    {:reply, {:error, :managed_mode_disabled}, state}
+  end
+
+  def handle_call({:managed_reconcile, assignment_id, facts}, _from, %State{managed: managed} = state)
+      when is_binary(assignment_id) and is_map(facts) do
+    case record_managed_reconciliation(managed.data, assignment_id, facts) do
+      {:ok, data, response} ->
+        case persist_managed_data(state, data) do
+          {:ok, next_state} -> {:reply, {:ok, response}, next_state}
+          {:error, reason} -> {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
+        end
+
+      {:error, code, details} ->
+        {:reply, {:error, code, details}, state}
+    end
+  end
+
+  def handle_call({:managed_session, _attempt, _info}, _from, %State{managed: nil} = state) do
+    {:reply, {:error, :managed_mode_disabled}, state}
+  end
+
+  def handle_call({:managed_session, attempt, info}, _from, %State{managed: managed} = state)
+      when is_map(attempt) and is_map(info) do
+    case record_managed_session(managed.data, attempt, info) do
+      {:ok, data} ->
+        case persist_managed_data(state, data) do
+          {:ok, next_state} -> {:reply, :ok, next_state}
+          {:error, reason} -> {:reply, {:error, reason}, state}
+        end
+
+      {:error, code, details} ->
+        {:reply, {:error, {code, details}}, state}
+    end
+  end
+
+  def handle_call({:managed_before_turn, _turn_context}, _from, %State{managed: nil} = state) do
+    {:reply, {:stop, :managed_mode_disabled}, state}
+  end
+
+  def handle_call({:managed_before_turn, turn_context}, _from, %State{} = state)
+      when is_map(turn_context) do
+    {decision, next_state} = managed_before_turn(state, turn_context)
+    {:reply, decision, next_state}
+  end
+
+  def handle_call({:managed_report, _payload}, _from, %State{managed: nil} = state) do
+    {:reply, {:error, :managed_mode_disabled}, state}
+  end
+
+  def handle_call({:managed_report, payload}, _from, %State{managed: managed} = state)
+      when is_map(payload) do
+    case record_managed_report(managed.data, payload) do
+      {:ok, data} ->
+        case persist_managed_data(state, data) do
+          {:ok, next_state} ->
+            case managed_report_provider_effect(next_state, payload) do
+              {:ok, provider_state} -> {:reply, :ok, provider_state}
+              {:error, provider_state, {code, details}} -> {:reply, {:error, {code, details}}, provider_state}
+              {:error, provider_state, reason} -> {:reply, {:error, reason}, provider_state}
+            end
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, state}
+        end
+
+      {:error, code, details} ->
+        {:reply, {:error, {code, details}}, state}
+    end
+  end
+
+  def handle_call(:snapshot, from, state), do: snapshot_call(from, state)
+
+  def handle_call(:request_refresh, from, state), do: request_refresh_call(from, state)
+
+  def handle_call({:managed_control, envelope}, _from, %State{managed: %{data: data}} = state)
+      when is_map(envelope) do
+    cond do
+      managed_review_envelope?(envelope) -> handle_managed_review_control(state, envelope)
+      managed_transition_envelope?(envelope) -> handle_managed_transition_control(state, envelope)
+      true -> apply_managed_control(state, envelope, managed_rules_context(data, envelope))
     end
   end
 
@@ -117,7 +244,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
-    state = maybe_dispatch(state)
+    state = recover_managed_reviews(state)
+    state = recover_managed_transitions(state)
+    state = dispatch_cycle(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
 
@@ -159,8 +288,10 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
 
+        next_state = %{state | running: Map.put(running, issue_id, updated_running_entry)}
+        next_state = managed_record_runtime(next_state, issue_id, runtime_info)
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, next_state}
     end
   end
 
@@ -205,7 +336,886 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
-  defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
+  defp managed_maybe_dispatch(%State{managed: %{data: data}} = state) do
+    if data.paused == true or data.disabled == true or available_slots(state) <= 0 do
+      state
+    else
+      case Tracker.fetch_issues_by_states(["READY"]) do
+        {:ok, issues} ->
+          Enum.reduce(issues, state, &managed_dispatch_candidate(&2, &1))
+
+        {:error, reason} ->
+          Logger.warning("Managed dispatch refresh failed: #{inspect(reason)}")
+          state
+      end
+    end
+  end
+
+  defp managed_maybe_dispatch(state), do: state
+
+  defp managed_dispatch_candidate(%State{} = state, %Issue{id: issue_id} = issue)
+       when is_binary(issue_id) do
+    case get_in(state, [:managed, :data, :assignments, issue_id]) do
+      %{phase: :ready, board_state: :ready} = assignment ->
+        if available_slots(state) > 0 and
+             managed_issue_matches_assignment?(issue, assignment) and
+             managed_dependencies_ready?(state.managed.data, assignment, issue) and
+             not Map.has_key?(state.running, issue_id) do
+          managed_start_assignment(state, issue, assignment)
+        else
+          state
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp managed_dispatch_candidate(state, _issue), do: state
+
+  defp managed_issue_matches_assignment?(%Issue{} = issue, assignment) do
+    repository =
+      get_in(issue.native_ref || %{}, ["repository", "name_with_owner"]) ||
+        get_in(issue.native_ref || %{}, [:repository, :name_with_owner])
+
+    number =
+      get_in(issue.native_ref || %{}, ["issue_number"]) ||
+        get_in(issue.native_ref || %{}, [:issue_number])
+
+    issue.dispatchable == true and issue_state_ready?(issue.state) and
+      repository == assignment.repository and number == assignment.issue_number
+  end
+
+  defp issue_state_ready?(state) when is_binary(state), do: String.downcase(String.trim(state)) == "ready"
+  defp issue_state_ready?(_state), do: false
+
+  defp managed_dependencies_ready?(data, assignment, issue) do
+    explicit_ready? =
+      Enum.all?(assignment[:dependencies] || [], fn id ->
+        accepted_dependency_receipt?(data, id)
+      end)
+
+    native_ready? =
+      Enum.all?(issue.blocked_by || [], fn blocker ->
+        case native_blocker_identity(blocker) do
+          nil ->
+            false
+
+          identity ->
+            case find_assignment_by_identity(data, identity) do
+              {id, _dependency} -> accepted_dependency_receipt?(data, id)
+              nil -> false
+            end
+        end
+      end)
+
+    explicit_ready? and native_ready?
+  end
+
+  defp native_blocker_identity(%{"identifier" => identifier, "state" => state}) when is_binary(identifier) and is_binary(state) do
+    if String.downcase(String.trim(state)) == "closed", do: identifier, else: nil
+  end
+
+  defp native_blocker_identity(_blocker), do: nil
+
+  defp find_assignment_by_identity(data, identifier) when is_binary(identifier) do
+    Enum.find(data.assignments, fn {_id, dependency} ->
+      dependency.repository <> "#" <> Integer.to_string(dependency.issue_number) == identifier
+    end)
+  end
+
+  defp find_assignment_by_identity(_data, _identifier), do: nil
+
+  defp accepted_dependency_receipt?(data, id) do
+    assignment = get_in(data, [:assignments, id])
+    reconciliation = get_in(data, [:external_reconciliations, id])
+    effects = if is_map(reconciliation), do: reconciliation[:external_effects] || %{}, else: %{}
+
+    is_map(assignment) and assignment[:phase] == :accepted and
+      is_list(assignment[:evidence]) and assignment[:evidence] != [] and
+      is_binary(assignment[:requirements_fingerprint]) and assignment[:requirements_fingerprint] != "" and
+      is_integer(assignment[:requirements_revision]) and assignment[:requirements_revision] >= 0 and
+      is_map(reconciliation) and reconciliation[:reconciled] == true and
+      reconciliation[:revision] in [assignment[:revision], assignment[:revision] - 1] and
+      effects[:status] in [:ok, "ok", :reconciled, "reconciled"] and
+      effects[:issue_close] in [:ok, "ok", :reconciled, "reconciled"] and
+      reconciliation[:provider_final_state] in [:accepted, "accepted"] and
+      reconciliation[:issue_final_state] in [:closed, "closed"]
+  end
+
+  defp managed_start_assignment(%State{} = state, %Issue{id: issue_id} = issue, assignment) do
+    generation = Map.get(assignment, :generation, 0) + 1
+    attempt_id = "managed-#{issue_id}-#{generation}-#{System.unique_integer([:positive])}"
+
+    attempt = %{
+      assignment_id: issue_id,
+      revision: Map.get(assignment, :revision, 0),
+      generation: generation,
+      attempt_id: attempt_id,
+      model: route_value(assignment.route, :model),
+      effort: route_value(assignment.route, :effort)
+    }
+
+    updated_assignment =
+      assignment
+      |> Map.merge(%{
+        phase: :active,
+        board_state: :active,
+        generation: generation,
+        attempt_id: attempt_id,
+        pending_effect: %{kind: :start, status: :pending, at: DateTime.utc_now()},
+        started_at: DateTime.utc_now()
+      })
+
+    data =
+      state.managed.data
+      |> put_in([:assignments, issue_id], updated_assignment)
+      |> append_managed_event(%{
+        operation: :dispatch,
+        assignment_id: issue_id,
+        attempt_id: attempt_id,
+        phase: :active
+      })
+
+    case persist_managed_data(state, data) do
+      {:ok, next_state} ->
+        case managed_apply_provider_transition(next_state, updated_assignment, :active) do
+          {:ok, provider_state} -> dispatch_managed_attempt(provider_state, issue, attempt)
+          {:error, provider_state, reason} -> managed_mark_dispatch_failed(provider_state, issue_id, attempt, reason)
+        end
+
+      {:error, reason} ->
+        Logger.error("Managed dispatch intent could not be persisted for #{issue_id}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp managed_report_provider_effect(%State{} = state, payload) do
+    kind = map_value(payload, :kind)
+
+    target =
+      case kind do
+        "result" -> :review
+        "context_needed" -> :waiting
+        _ -> nil
+      end
+
+    assignment_id = map_value(map_value(payload, :attempt) || %{}, :assignment_id)
+    assignment = get_in(state.managed.data, [:assignments, assignment_id])
+
+    if target && is_map(assignment) do
+      managed_apply_provider_transition(state, assignment, target)
+    else
+      {:ok, state}
+    end
+  end
+
+  defp managed_apply_provider_transition(%State{managed: %{effects: module, data: data}} = state, assignment, target)
+       when is_atom(module) and is_map(assignment) and is_atom(target) do
+    if function_exported?(module, :transition, 3) do
+      context = %{
+        binding: data[:binding],
+        process_stopped: not Map.has_key?(state.running, assignment.assignment_id)
+      }
+
+      case safe_managed_effect_call(module, :transition, [assignment, target, context]) do
+        {:ok, facts} when is_map(facts) ->
+          effect = %{kind: :provider_transition, target: target, status: :reconciled, facts: facts, at: DateTime.utc_now()}
+
+          next_data =
+            data
+            |> update_in([:assignments, assignment.assignment_id], &Map.put(&1, :pending_effect, effect))
+            |> append_managed_event(%{operation: :provider_transition, assignment_id: assignment.assignment_id, target: target, status: :reconciled})
+
+          case persist_managed_data(state, next_data) do
+            {:ok, next_state} -> {:ok, next_state}
+            {:error, reason} -> {:error, state, {:managed_journal_write_failed, reason}}
+          end
+
+        {:error, code, details} ->
+          managed_provider_transition_failed(state, assignment, target, {code, details})
+
+        {:error, reason} ->
+          managed_provider_transition_failed(state, assignment, target, {:managed_provider_effect_failed, reason})
+      end
+    else
+      {:ok, state}
+    end
+  end
+
+  defp managed_apply_provider_transition(state, _assignment, _target), do: {:ok, state}
+
+  defp managed_provider_transition_failed(%State{} = state, assignment, target, reason) do
+    data =
+      state.managed.data
+      |> update_in([:assignments, assignment.assignment_id, :pending_effect], fn _ ->
+        %{kind: :provider_transition, target: target, status: :failed, error: managed_effect_error_code(reason), at: DateTime.utc_now()}
+      end)
+      |> append_managed_event(%{operation: :provider_transition_failed, assignment_id: assignment.assignment_id, target: target, error: managed_effect_error_code(reason)})
+
+    case persist_managed_data(state, data) do
+      {:ok, next_state} -> {:error, next_state, reason}
+      {:error, _journal_reason} -> {:error, state, reason}
+    end
+  end
+
+  defp managed_effect_error_code({code, _details}) when is_atom(code), do: code
+  defp managed_effect_error_code(code) when is_atom(code), do: code
+  defp managed_effect_error_code(_reason), do: :managed_provider_effect_failed
+
+  defp safe_managed_effect_call(module, function, args) do
+    apply(module, function, args)
+  rescue
+    error -> {:error, :managed_provider_effect_failed, %{reason: Exception.message(error)}}
+  catch
+    kind, reason -> {:error, :managed_provider_effect_failed, %{reason: inspect({kind, reason})}}
+  end
+
+  defp dispatch_managed_attempt(%State{} = state, %Issue{} = issue, attempt) do
+    recipient = self()
+
+    state =
+      case select_worker_host(state, nil) do
+        :no_worker_capacity -> state
+        worker_host -> spawn_issue_on_worker_host(state, issue, nil, recipient, worker_host)
+      end
+
+    case Map.get(state.running, issue.id) do
+      %{pid: pid} ->
+        data =
+          state.managed.data
+          |> update_in([:assignments, issue.id], fn assignment ->
+            if is_map(assignment) do
+              Map.put(assignment, :pending_effect, %{kind: :start, status: :started, process_id: inspect(pid), attempt_id: attempt.attempt_id})
+            else
+              assignment
+            end
+          end)
+          |> append_managed_event(%{operation: :dispatch_started, assignment_id: issue.id, attempt_id: attempt.attempt_id})
+
+        case persist_managed_data(state, data) do
+          {:ok, next_state} ->
+            next_state
+
+          {:error, reason} ->
+            Logger.error("Managed dispatch result could not be persisted for #{issue.id}: #{inspect(reason)}")
+            state
+        end
+
+      _ ->
+        managed_mark_dispatch_failed(state, issue.id, attempt, :spawn_failed)
+    end
+  end
+
+  defp managed_mark_dispatch_failed(%State{} = state, issue_id, attempt, reason) do
+    data =
+      state.managed.data
+      |> update_in([:assignments, issue_id], fn assignment ->
+        if is_map(assignment) do
+          assignment
+          |> Map.put(:phase, :ready)
+          |> Map.put(:board_state, :ready)
+          |> Map.put(:pending_effect, %{kind: :start, status: :failed, reason: inspect(reason), attempt_id: attempt.attempt_id})
+        else
+          assignment
+        end
+      end)
+      |> append_managed_event(%{operation: :dispatch_failed, assignment_id: issue_id, attempt_id: attempt.attempt_id})
+
+    case persist_managed_data(state, data) do
+      {:ok, next_state} -> next_state
+      {:error, _reason} -> state
+    end
+  end
+
+  defp record_managed_reconciliation(data, assignment_id, facts) do
+    case Map.fetch(data.assignments, assignment_id) do
+      :error ->
+        {:error, :assignment_not_found, %{assignment_id: assignment_id}}
+
+      {:ok, assignment} ->
+        revision = map_value(facts, :revision)
+
+        cond do
+          not is_nil(revision) and revision != assignment.revision ->
+            {:error, :stale_revision, %{expected: revision, actual: assignment.revision}}
+
+          not is_nil(map_value(facts, :external_effects)) and
+              not is_map(map_value(facts, :external_effects)) ->
+            {:error, :invalid_argument, %{argument: :external_effects}}
+
+          true ->
+            reconciliation =
+              facts
+              |> Map.take([
+                :provider_state,
+                :provider_final_state,
+                :issue_final_state,
+                :external_effects,
+                :reconciled,
+                :stop_reconciled,
+                :review_request_id,
+                :observed_issue_id,
+                :observed_project_item_id
+              ])
+              |> Map.put(:revision, assignment.revision)
+              |> Map.put(:at, DateTime.utc_now())
+
+            data =
+              data
+              |> Map.put(:external_reconciliations, Map.put(data[:external_reconciliations] || %{}, assignment_id, reconciliation))
+              |> append_managed_event(%{operation: :reconcile, assignment_id: assignment_id, revision: assignment.revision})
+
+            {:ok, data, %{assignment_id: assignment_id, revision: assignment.revision, reconciled: reconciliation[:reconciled] == true}}
+        end
+    end
+  end
+
+  defp managed_record_runtime(%State{managed: %{data: data}} = state, issue_id, runtime_info)
+       when is_map(runtime_info) do
+    case get_in(data, [:assignments, issue_id]) do
+      assignment when is_map(assignment) ->
+        patch =
+          runtime_info
+          |> Map.take([:worker_host, :workspace_path, :codex_app_server_pid])
+          |> Map.put(:runtime_identity, Map.get(runtime_info, :attempt))
+
+        next_data = put_in(data, [:assignments, issue_id], Map.merge(assignment, patch))
+
+        case persist_managed_data(state, next_data) do
+          {:ok, next_state} -> next_state
+          {:error, _reason} -> state
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp managed_record_runtime(state, _issue_id, _runtime_info), do: state
+
+  defp record_managed_session(data, attempt, info) do
+    assignment_id = map_value(attempt, :assignment_id)
+
+    with {:ok, assignment} <- Map.fetch(data.assignments, assignment_id),
+         :ok <- managed_attempt_matches?(assignment, attempt),
+         thread_id when is_binary(thread_id) <- map_value(info, :thread_id) do
+      patch =
+        info
+        |> Map.take([:thread_id, :workspace, :worker_host, :model, :effort, :thread_reasoning_effort, :metadata])
+        |> Map.put(:session_id, thread_id)
+        |> Map.put(:pending_effect, %{kind: :start, status: :session_started, thread_id: thread_id})
+
+      data =
+        data
+        |> put_in([:assignments, assignment_id], Map.merge(assignment, patch))
+        |> append_managed_event(%{operation: :session_started, assignment_id: assignment_id, thread_id: thread_id})
+
+      {:ok, data}
+    else
+      :error -> {:error, :assignment_not_found, %{assignment_id: assignment_id}}
+      {:error, code, details} -> {:error, code, details}
+      _ -> {:error, :invalid_session_info, %{}}
+    end
+  end
+
+  defp managed_before_turn(%State{managed: %{data: data}} = state, turn_context) do
+    decision = managed_before_turn_decision(data, turn_context)
+
+    case decision do
+      :allow ->
+        managed_reserve_turn(state, turn_context)
+
+      _ ->
+        {decision, state}
+    end
+  end
+
+  defp managed_before_turn(state, _turn_context), do: {{:stop, :managed_mode_disabled}, state}
+
+  defp managed_reserve_turn(%State{managed: %{data: data}} = state, turn_context) do
+    attempt = map_value(turn_context, :attempt)
+    assignment_id = map_value(attempt || %{}, :assignment_id)
+    assignment = get_in(data, [:assignments, assignment_id])
+    reserved = Map.get(assignment, :turns_reserved, 0)
+    limit = Map.get(assignment, :turn_limit, 20)
+
+    if is_integer(reserved) and is_integer(limit) and reserved < limit do
+      updated = Map.put(assignment, :turns_reserved, reserved + 1)
+
+      next_data =
+        data
+        |> put_in([:assignments, assignment_id], updated)
+        |> append_managed_event(%{
+          operation: :turn_reserved,
+          assignment_id: assignment_id,
+          attempt_id: map_value(attempt, :attempt_id),
+          turns_reserved: reserved + 1,
+          turn_limit: limit
+        })
+
+      case persist_managed_data(state, next_data) do
+        {:ok, next_state} -> {:allow, next_state}
+        {:error, reason} -> {{:stop, {:managed_journal_write_failed, reason}}, state}
+      end
+    else
+      {{:stop, :managed_turn_budget_exhausted}, state}
+    end
+  end
+
+  defp managed_before_turn_decision(data, turn_context) do
+    attempt = map_value(turn_context, :attempt)
+    assignment_id = map_value(attempt || %{}, :assignment_id)
+
+    with {:ok, assignment} <- Map.fetch(data.assignments, assignment_id),
+         :ok <- managed_attempt_matches?(assignment, attempt) do
+      cond do
+        data[:disabled] == true -> {:stop, :managed_disabled}
+        assignment[:stop_pending] == true -> {:stop, :managed_stop_pending}
+        assignment[:phase] != :active -> {:stop, {:managed_phase_changed, assignment[:phase]}}
+        true -> :allow
+      end
+    else
+      :error -> {:stop, :managed_assignment_not_found}
+      {:error, code, _details} -> {:stop, code}
+    end
+  end
+
+  defp record_managed_report(data, payload) do
+    attempt = map_value(payload, :attempt)
+    assignment_id = map_value(attempt || %{}, :assignment_id)
+    report_id = map_value(payload, :report_id)
+    kind = map_value(payload, :kind)
+    summary = map_value(payload, :summary)
+    evidence = map_value(payload, :evidence)
+
+    with {:ok, assignment} <- Map.fetch(data.assignments, assignment_id),
+         :ok <- managed_attempt_matches?(assignment, attempt),
+         :ok <- valid_managed_report(kind, report_id, summary, evidence) do
+      reports = assignment[:reports] || %{}
+      canonical = %{report_id: report_id, kind: kind, summary: String.slice(summary, 0, 2_000), evidence: Enum.take(evidence, 20)}
+
+      case Map.get(reports, report_id) do
+        ^canonical ->
+          {:ok, data}
+
+        existing when is_map(existing) ->
+          {:error, :report_id_conflict, %{report_id: report_id}}
+
+        nil ->
+          updated =
+            assignment
+            |> Map.put(:reports, Map.put(reports, report_id, canonical))
+            |> Map.put(:last_report, canonical)
+            |> managed_report_phase(kind, summary)
+
+          data =
+            data
+            |> put_in([:assignments, assignment_id], updated)
+            |> append_managed_event(%{
+              operation: :report,
+              assignment_id: assignment_id,
+              report_id: report_id,
+              kind: kind,
+              phase: updated[:phase]
+            })
+
+          {:ok, data}
+      end
+    else
+      :error -> {:error, :assignment_not_found, %{assignment_id: assignment_id}}
+      {:error, code, details} -> {:error, code, details}
+    end
+  end
+
+  defp managed_report_phase(assignment, "result", _summary) do
+    Map.merge(assignment, %{phase: :review, board_state: :review, pending_effect: %{kind: :report, status: :received}})
+  end
+
+  defp managed_report_phase(assignment, "context_needed", summary) do
+    Map.merge(assignment, %{phase: :waiting, board_state: :waiting, blocked_reason: summary, pending_effect: %{kind: :report, status: :received}})
+  end
+
+  defp managed_report_phase(assignment, _kind, _summary), do: assignment
+
+  defp valid_managed_report(kind, report_id, summary, evidence)
+       when kind in ["result", "checkpoint", "context_needed"] and is_binary(report_id) and
+              byte_size(report_id) > 0 and is_binary(summary) and is_list(evidence),
+       do: :ok
+
+  defp valid_managed_report(_kind, _report_id, _summary, _evidence),
+    do: {:error, :invalid_managed_report, %{}}
+
+  defp managed_attempt_matches?(assignment, attempt) when is_map(assignment) and is_map(attempt) do
+    Enum.all?([:assignment_id, :revision, :generation, :attempt_id], fn key ->
+      map_value(attempt, key) == Map.get(assignment, key)
+    end)
+    |> if(do: :ok, else: {:error, :stale_managed_attempt, %{}})
+  end
+
+  defp managed_attempt_matches?(_assignment, _attempt), do: {:error, :invalid_managed_attempt, %{}}
+
+  defp managed_rules_context(data, envelope) do
+    args = map_value(envelope, :args) || %{}
+    assignment_id = map_value(args, :assignment_id)
+    Map.get(data[:external_reconciliations] || %{}, assignment_id, %{})
+  end
+
+  defp map_value(map, key) when is_map(map), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
+  defp map_value(_map, _key), do: nil
+
+  defp route_value(route, key) when is_map(route), do: Map.get(route, key, Map.get(route, Atom.to_string(key)))
+  defp route_value(_route, _key), do: nil
+
+  defp recover_managed_reviews(%State{managed: %{data: data}} = state) do
+    data[:review_intents]
+    |> Enum.filter(fn {_request_id, intent} -> is_map(intent) and intent[:status] == :pending and is_map(intent[:request]) end)
+    |> Enum.reduce(state, fn {_request_id, intent}, acc ->
+      case Rules.prepare_review(acc.managed.data, intent.request) do
+        {:ok, prepared} ->
+          case execute_managed_review(acc, prepared) do
+            {:reply, _reply, next_state} -> next_state
+            _ -> acc
+          end
+
+        {:duplicate, _response} ->
+          committed = complete_managed_review_intent(acc.managed.data, intent.request.request_id)
+
+          case persist_managed_data(acc, committed) do
+            {:ok, next_state} -> next_state
+            {:error, _reason} -> acc
+          end
+
+        {:error, _code, _details} ->
+          acc
+      end
+    end)
+  end
+
+  defp recover_managed_reviews(state), do: state
+
+  defp recover_managed_transitions(%State{managed: %{data: data}} = state) do
+    data[:effect_intents]
+    |> Enum.filter(fn {_request_id, intent} -> is_map(intent) and intent[:status] == :pending and is_map(intent[:request]) end)
+    |> Enum.reduce(state, fn {_request_id, intent}, acc ->
+      assignment = get_in(acc.managed.data, [:assignments, intent.assignment_id])
+
+      if is_map(assignment) do
+        case execute_managed_transition(acc, assignment, intent, %{}) do
+          {:reply, _reply, next_state} -> next_state
+          _ -> acc
+        end
+      else
+        acc
+      end
+    end)
+  end
+
+  defp recover_managed_transitions(state), do: state
+
+  defp managed_review_envelope?(envelope) when is_map(envelope) do
+    Map.get(envelope, :operation, Map.get(envelope, "operation")) in [:review, "review"]
+  end
+
+  defp managed_review_envelope?(_envelope), do: false
+
+  defp managed_transition_envelope?(envelope) when is_map(envelope) do
+    Map.get(envelope, :operation, Map.get(envelope, "operation")) in [:revise, "revise", :interrupt, "interrupt", :cancel, "cancel"]
+  end
+
+  defp managed_transition_envelope?(_envelope), do: false
+
+  defp transition_target(envelope) do
+    case Map.get(envelope, :operation, Map.get(envelope, "operation")) do
+      operation when operation in [:revise, "revise"] -> :ready
+      operation when operation in [:interrupt, "interrupt"] -> :waiting
+      operation when operation in [:cancel, "cancel"] -> :cancelled
+      _ -> nil
+    end
+  end
+
+  defp handle_managed_transition_control(%State{} = state, envelope) do
+    target = transition_target(envelope)
+    context = %{stop_reconciled: managed_process_stopped_for_envelope?(state, envelope)}
+
+    case Rules.apply(state.managed.data, envelope, context) do
+      {:duplicate, response} ->
+        {:reply, {:ok, Map.put(response, :duplicate, true)}, state}
+
+      {:error, code, details} ->
+        {:reply, {:error, code, details}, state}
+
+      {:ok, preview, response} ->
+        assignment_id = map_value(map_value(envelope, :args) || %{}, :assignment_id)
+        assignment = get_in(preview, [:assignments, assignment_id]) || get_in(state.managed.data, [:assignments, assignment_id])
+        request_id = map_value(envelope, :request_id)
+        intent = %{request: envelope, request_id: request_id, assignment_id: assignment_id, target: target, context: context}
+
+        data =
+          state.managed.data
+          |> put_in([:effect_intents, request_id], Map.merge(intent, %{status: :pending, at: DateTime.utc_now()}))
+          |> append_managed_event(%{operation: :provider_transition_intent, request_id: request_id, assignment_id: assignment_id, target: target})
+
+        case persist_managed_data(state, data) do
+          {:ok, intent_state} ->
+            execute_managed_transition(intent_state, assignment, intent, response)
+
+          {:error, reason} ->
+            {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
+        end
+    end
+  end
+
+  defp managed_process_stopped_for_envelope?(state, envelope) do
+    assignment_id = map_value(map_value(envelope, :args) || %{}, :assignment_id)
+    not Map.has_key?(state.running, assignment_id)
+  end
+
+  defp execute_managed_transition(%State{} = state, assignment, intent, _response) do
+    case managed_apply_provider_transition(state, assignment, intent.target) do
+      {:ok, reconciled_state} ->
+        context = Map.put(intent.context, :stop_reconciled, managed_process_stopped_for_envelope?(reconciled_state, intent.request))
+
+        case Rules.apply(reconciled_state.managed.data, intent.request, context) do
+          {:ok, committed_data, committed_response} ->
+            data =
+              committed_data
+              |> put_in([:effect_intents, intent.request_id, :status], :committed)
+              |> put_in([:effect_intents, intent.request_id, :committed_at], DateTime.utc_now())
+              |> append_managed_event(%{operation: :provider_transition_committed, request_id: intent.request_id, assignment_id: intent.assignment_id, target: intent.target})
+
+            case persist_managed_data(reconciled_state, data) do
+              {:ok, final_state} -> {:reply, {:ok, committed_response}, final_state}
+              {:error, reason} -> {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, reconciled_state}
+            end
+
+          {:duplicate, committed_response} ->
+            {:reply, {:ok, Map.put(committed_response, :duplicate, true)}, reconciled_state}
+
+          {:error, code, details} ->
+            {:reply, {:error, code, details}, reconciled_state}
+        end
+
+      {:error, failed_state, reason} ->
+        failed_data =
+          failed_state.managed.data
+          |> update_in([:effect_intents, intent.request_id], fn existing ->
+            (existing || %{}) |> Map.put(:last_error, reason) |> Map.put(:last_error_at, DateTime.utc_now())
+          end)
+          |> append_managed_event(%{operation: :provider_transition_failed, request_id: intent.request_id, assignment_id: intent.assignment_id, target: intent.target})
+
+        case persist_managed_data(failed_state, failed_data) do
+          {:ok, next_state} -> {:reply, {:error, reason}, next_state}
+          {:error, journal_reason} -> {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(journal_reason)}}, failed_state}
+        end
+    end
+  end
+
+  defp apply_managed_control(%State{managed: %{journal: journal, data: data}} = state, envelope, context) do
+    case Rules.apply(data, envelope, context) do
+      {:ok, next_data, response} ->
+        case Journal.append(journal, next_data) do
+          :ok ->
+            {:reply, {:ok, response}, %{state | managed: %{state.managed | data: next_data}}}
+
+          {:error, reason} ->
+            {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
+        end
+
+      {:duplicate, response} ->
+        {:reply, {:ok, Map.put(response, :duplicate, true)}, state}
+
+      {:error, code, details} ->
+        {:reply, {:error, code, details}, state}
+    end
+  end
+
+  defp handle_managed_review_control(%State{} = state, envelope) do
+    case Rules.prepare_review(state.managed.data, envelope) do
+      {:duplicate, response} ->
+        {:reply, {:ok, Map.put(response, :duplicate, true)}, state}
+
+      {:error, code, details} ->
+        {:reply, {:error, code, details}, state}
+
+      {:ok, %{requires_effects: false}} ->
+        apply_managed_control(state, envelope, %{})
+
+      {:ok, intent} ->
+        begin_managed_review(state, intent)
+    end
+  end
+
+  defp begin_managed_review(%State{} = state, intent) do
+    request = intent.request
+    request_id = request.request_id
+    existing = get_in(state.managed.data, [:review_intents, request_id])
+
+    cond do
+      is_map(existing) and existing[:canonical] != intent.canonical ->
+        {:reply, {:error, :request_id_conflict, %{request_id: request_id}}, state}
+
+      is_map(existing) and existing[:status] == :committed ->
+        apply_managed_control(state, request, %{})
+
+      true ->
+        data =
+          state.managed.data
+          |> Map.put(
+            :review_intents,
+            Map.put(state.managed.data[:review_intents] || %{}, request_id, %{
+              request_id: request_id,
+              canonical: intent.canonical,
+              request: request,
+              assignment_id: request.args.assignment_id,
+              revision: intent.assignment.revision,
+              status: :pending,
+              at: DateTime.utc_now()
+            })
+          )
+          |> append_managed_event(%{
+            operation: :review_intent,
+            request_id: request_id,
+            assignment_id: request.args.assignment_id,
+            revision: intent.assignment.revision,
+            phase: :review_pending
+          })
+
+        case persist_managed_data(state, data) do
+          {:ok, intent_state} ->
+            execute_managed_review(intent_state, intent)
+
+          {:error, reason} ->
+            {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
+        end
+    end
+  end
+
+  defp execute_managed_review(%State{} = state, intent) do
+    case managed_review_effects(state, intent) do
+      {:ok, facts} ->
+        facts =
+          facts
+          |> Map.put(:revision, intent.assignment.revision)
+          |> Map.put(:review_request_id, intent.request.request_id)
+
+        with {:ok, reconciled_data, _reconcile_response} <-
+               record_managed_reconciliation(state.managed.data, intent.assignment.assignment_id, facts),
+             {:ok, reconciled_state} <- persist_managed_data(state, reconciled_data),
+             {:ok, next_data, response} <- Rules.apply(reconciled_data, intent.request, facts),
+             completed_data <- complete_managed_review_intent(next_data, intent.request.request_id) do
+          case persist_managed_data(reconciled_state, completed_data) do
+            {:ok, final_state} ->
+              {:reply, {:ok, response}, final_state}
+
+            {:error, reason} ->
+              {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, reconciled_state}
+          end
+        else
+          {:duplicate, response} -> {:reply, {:ok, Map.put(response, :duplicate, true)}, state}
+          {:error, code, details} -> managed_review_failed(state, intent, code, details)
+          {:error, reason} -> managed_review_failed(state, intent, :managed_review_failed, %{reason: inspect(reason)})
+        end
+
+      {:error, code, details} ->
+        managed_review_failed(state, intent, code, details)
+    end
+  end
+
+  defp managed_review_effects(%State{managed: %{effects: module, data: data}} = state, intent)
+       when is_atom(module) do
+    cond do
+      not function_exported?(module, :review, 3) and not function_exported?(module, :review, 2) ->
+        {:error, :managed_review_effects_unavailable, %{}}
+
+      true ->
+        try do
+          result =
+            if function_exported?(module, :review, 3) do
+              module.review(intent.assignment, intent.request.args, %{
+                binding: data[:binding],
+                process_stopped: not Map.has_key?(state.running, intent.assignment.assignment_id)
+              })
+            else
+              module.review(intent.assignment, intent.request.args)
+            end
+
+          case result do
+            {:ok, facts} when is_map(facts) -> {:ok, facts}
+            {:error, code, details} when is_atom(code) and is_map(details) -> {:error, code, details}
+            {:error, reason} -> {:error, :managed_review_effects_failed, %{reason: inspect(reason)}}
+            _ -> {:error, :managed_review_effects_failed, %{}}
+          end
+        rescue
+          error -> {:error, :managed_review_effects_failed, %{reason: Exception.message(error)}}
+        catch
+          kind, reason -> {:error, :managed_review_effects_failed, %{reason: inspect({kind, reason})}}
+        end
+    end
+  end
+
+  defp managed_review_effects(_state, _intent), do: {:error, :managed_review_effects_unavailable, %{}}
+
+  defp managed_review_failed(%State{} = state, intent, code, details) do
+    request_id = intent.request.request_id
+
+    data =
+      state.managed.data
+      |> update_in([:review_intents, request_id], fn existing ->
+        (existing || %{})
+        |> Map.put(:status, :pending)
+        |> Map.put(:last_error, code)
+        |> Map.put(:last_error_at, DateTime.utc_now())
+      end)
+      |> append_managed_event(%{operation: :review_effect_failed, request_id: request_id, assignment_id: intent.assignment.assignment_id, error: code})
+
+    case persist_managed_data(state, data) do
+      {:ok, failed_state} -> {:reply, {:error, code, details}, failed_state}
+      {:error, reason} -> {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
+    end
+  end
+
+  defp complete_managed_review_intent(data, request_id) do
+    data
+    |> update_in([:review_intents, request_id], fn existing ->
+      (existing || %{})
+      |> Map.put(:status, :committed)
+      |> Map.put(:committed_at, DateTime.utc_now())
+    end)
+    |> append_managed_event(%{operation: :review_committed, request_id: request_id})
+  end
+
+  defp append_managed_event(data, event_data) do
+    cursor = Map.get(data, :event_cursor, 0) + 1
+
+    event =
+      event_data
+      |> Map.put(:cursor, cursor)
+      |> Map.put(:at, DateTime.utc_now())
+
+    data
+    |> Map.put(:event_cursor, cursor)
+    |> Map.put(:events, [event | Enum.take(Map.get(data, :events, []), 99)])
+  end
+
+  defp persist_managed_data(%State{managed: %{journal: journal}} = state, data) do
+    case Journal.append(journal, data) do
+      :ok -> {:ok, %{state | managed: %{state.managed | data: data}}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
+    case Map.get(running_entry, :managed_attempt) do
+      attempt when is_map(attempt) ->
+        handle_managed_agent_down(reason, state, issue_id, running_entry, attempt)
+
+      _ ->
+        handle_generic_agent_down(reason, state, issue_id, running_entry, session_id)
+    end
+  end
+
+  defp handle_generic_agent_down(:normal, state, issue_id, running_entry, session_id) do
     if input_required_blocker?(running_entry) do
       block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
     else
@@ -223,13 +1233,84 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
+  defp handle_generic_agent_down(reason, state, issue_id, running_entry, session_id) do
     if input_required_blocker?(running_entry) do
       block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
     else
       retry_agent_down(state, issue_id, running_entry, session_id, reason)
     end
   end
+
+  defp handle_managed_agent_down(reason, %State{} = state, issue_id, running_entry, attempt) do
+    assignment = get_in(state, [:managed, :data, :assignments, issue_id])
+
+    if is_map(assignment) and managed_attempt_matches?(assignment, attempt) == :ok do
+      {phase, board_state, pending_effect, stop_pending, blocked_reason} =
+        case {reason, assignment[:phase]} do
+          {{:managed_agent_terminal, _report}, phase} when phase in [:review, :accepted] ->
+            {phase, phase, %{kind: :run, status: :completed, attempt_id: attempt.attempt_id}, false, nil}
+
+          {{:managed_agent_guard_stop, guard_reason}, phase} when phase in [:review, :waiting] ->
+            {phase, phase, %{kind: :run, status: :guard_stopped, reason: inspect(guard_reason), attempt_id: attempt.attempt_id}, phase == :waiting,
+             if(phase == :waiting, do: assignment[:blocked_reason], else: nil)}
+
+          {{:managed_agent_guard_stop, guard_reason}, _phase} ->
+            {:waiting, :waiting, %{kind: :run, status: :guard_stopped, reason: inspect(guard_reason), attempt_id: attempt.attempt_id}, true, inspect(guard_reason)}
+
+          {{:managed_agent_failed, failure}, _phase} ->
+            {:waiting, :waiting, %{kind: :run, status: :unknown, reason: inspect(failure), attempt_id: attempt.attempt_id}, true, inspect(failure)}
+
+          {:normal, phase} when phase in [:review, :waiting, :accepted] ->
+            {phase, phase, %{kind: :run, status: :completed, attempt_id: attempt.attempt_id}, false, nil}
+
+          {_other, _phase} ->
+            {:waiting, :waiting, %{kind: :run, status: :unknown, reason: inspect(reason), attempt_id: attempt.attempt_id}, true, inspect(reason)}
+        end
+
+      updated =
+        assignment
+        |> Map.merge(%{phase: phase, board_state: board_state, pending_effect: pending_effect})
+        |> Map.put(:usage, %{
+          input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+          output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+          total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+          seconds_running: running_seconds(Map.get(running_entry, :started_at), DateTime.utc_now())
+        })
+        |> maybe_put_managed(:stop_pending, stop_pending)
+        |> maybe_put_managed(:blocked_reason, blocked_reason)
+
+      data =
+        state.managed.data
+        |> put_in([:assignments, issue_id], updated)
+        |> append_managed_event(%{
+          operation: :agent_down,
+          assignment_id: issue_id,
+          attempt_id: attempt.attempt_id,
+          phase: phase,
+          reason: inspect(reason)
+        })
+
+      case persist_managed_data(state, data) do
+        {:ok, next_state} when phase in [:review, :waiting] ->
+          case managed_apply_provider_transition(next_state, updated, phase) do
+            {:ok, provider_state} -> provider_state
+            {:error, provider_state, _reason} -> provider_state
+          end
+
+        {:ok, next_state} ->
+          next_state
+
+        {:error, error} ->
+          Logger.error("Managed agent completion could not be persisted for #{issue_id}: #{inspect(error)}")
+          state
+      end
+    else
+      state
+    end
+  end
+
+  defp maybe_put_managed(map, key, nil), do: Map.delete(map, key)
+  defp maybe_put_managed(map, key, value), do: Map.put(map, key, value)
 
   defp block_input_required_agent_down(state, issue_id, running_entry, session_id, reason) do
     error = blocker_error(running_entry, "agent exited: #{inspect(reason)}")
@@ -252,6 +1333,8 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_path: Map.get(running_entry, :workspace_path)
     })
   end
+
+  defp maybe_dispatch(%State{managed: managed} = state) when not is_nil(managed), do: state
 
   defp maybe_dispatch(%State{} = state) do
     state =
@@ -778,6 +1861,9 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp dispatch_cycle(%State{managed: nil} = state), do: maybe_dispatch(state)
+  defp dispatch_cycle(%State{} = state), do: managed_maybe_dispatch(state)
+
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
@@ -950,9 +2036,60 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp managed_attempt_for_issue(%State{managed: %{data: data}}, issue_id) do
+    case get_in(data, [:assignments, issue_id]) do
+      %{attempt_id: attempt_id, revision: revision, generation: generation} = assignment
+      when is_binary(attempt_id) and is_integer(revision) and is_integer(generation) ->
+        %{
+          assignment_id: issue_id,
+          revision: revision,
+          generation: generation,
+          attempt_id: attempt_id,
+          model: route_value(assignment[:route], :model),
+          effort: route_value(assignment[:route], :effort)
+        }
+
+      _ ->
+        nil
+    end
+  end
+
+  defp managed_attempt_for_issue(_state, _issue_id), do: nil
+
+  defp managed_run_options(%State{managed: %{data: data}} = _state, %Issue{id: issue_id}) do
+    case managed_attempt_for_issue(%State{managed: %{data: data}}, issue_id) do
+      %{assignment_id: ^issue_id} = attempt ->
+        owner = self()
+
+        [
+          managed_attempt: attempt,
+          model: attempt[:model],
+          effort: attempt[:effort],
+          on_session: fn info -> managed_callback_call(owner, {:managed_session, attempt, info}) end,
+          before_turn: fn context -> managed_callback_call(owner, {:managed_before_turn, context}) end,
+          report_callback: fn payload -> managed_callback_call(owner, {:managed_report, payload}) end
+        ]
+
+      _ ->
+        []
+    end
+  end
+
+  defp managed_run_options(_state, _issue), do: []
+
+  defp managed_callback_call(owner, message) when is_pid(owner) do
+    try do
+      GenServer.call(owner, message, 15_000)
+    catch
+      :exit, reason -> {:error, {:managed_orchestrator_unavailable, reason}}
+    end
+  end
+
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    run_opts = [attempt: attempt, worker_host: worker_host] ++ managed_run_options(state, issue)
+
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient, run_opts)
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -980,6 +2117,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
+            managed_attempt: managed_attempt_for_issue(state, issue.id),
             started_at: DateTime.utc_now()
           })
 
@@ -1173,6 +2311,32 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
     end
   end
+
+  defp initialize_managed(config, %State{} = state, opts) do
+    enabled = config.managed.enabled == true or Application.get_env(:symphony_elixir, :managed_mode, false) == true
+
+    if enabled do
+      with {:ok, journal, loaded} <- Journal.open(config.managed.journal_path),
+           {:ok, data} <- managed_data(loaded) do
+        effects = Keyword.get(opts, :managed_effects, Application.get_env(:symphony_elixir, :managed_effects, SymphonyElixir.Managed.GitHubEffects))
+        {:ok, %{state | managed: %{journal: journal, data: data, effects: effects}}}
+      end
+    else
+      {:ok, state}
+    end
+  end
+
+  defp managed_data(%{} = data) when map_size(data) == 0, do: {:ok, Rules.new()}
+
+  defp managed_data(%{version: version} = data) do
+    if version == Rules.version() do
+      {:ok, Map.merge(Rules.new(), data)}
+    else
+      {:error, :managed_journal_schema_mismatch}
+    end
+  end
+
+  defp managed_data(_data), do: {:error, :managed_journal_schema_mismatch}
 
   defp notify_dashboard do
     StatusDashboard.notify_update()
@@ -1405,8 +2569,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  @impl true
-  def handle_call(:snapshot, _from, state) do
+  defp snapshot_call(_from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
     now_ms = System.monotonic_time(:millisecond)
@@ -1484,7 +2647,7 @@ defmodule SymphonyElixir.Orchestrator do
      }, state}
   end
 
-  def handle_call(:request_refresh, _from, state) do
+  defp request_refresh_call(_from, state) do
     now_ms = System.monotonic_time(:millisecond)
     already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
     coalesced = state.poll_check_in_progress == true or already_due?

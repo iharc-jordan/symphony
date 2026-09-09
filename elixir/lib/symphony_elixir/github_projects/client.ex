@@ -57,7 +57,7 @@ defmodule SymphonyElixir.GitHubProjects.Client do
   content {
     __typename
     ... on Issue {
-      id number title body state url
+      id number title body state stateReason url
       repository { id name nameWithOwner url owner { login } }
       assignees(first: 1) { nodes { id login } }
       labels(first: 100) { nodes { name } pageInfo { hasNextPage endCursor } }
@@ -71,7 +71,7 @@ defmodule SymphonyElixir.GitHubProjects.Client do
       createdAt updatedAt
     }
     ... on PullRequest {
-      id number title body state url
+      id number title body state stateReason url
       repository { id name nameWithOwner url owner { login } }
       labels(first: 100) { nodes { name } pageInfo { hasNextPage endCursor } }
       createdAt updatedAt
@@ -656,7 +656,9 @@ defmodule SymphonyElixir.GitHubProjects.Client do
              "issue_id" => issue_id,
              "repository" => repository,
              "issue_number" => number,
-             "content_type" => type
+             "content_type" => type,
+             "issue_state" => content["state"],
+             "issue_state_reason" => content["stateReason"]
            },
            identifier: repository["name_with_owner"] <> "#" <> Integer.to_string(number),
            title: title,

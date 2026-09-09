@@ -37,6 +37,50 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec managed_state(Conn.t(), map()) :: Conn.t()
+  def managed_state(conn, _params) do
+    with :ok <- authorize_managed(conn),
+         {:ok, payload} <- SymphonyElixir.Managed.Control.state(orchestrator(), snapshot_timeout_ms()) do
+      json(conn, payload)
+    else
+      {:error, :unauthorized} -> managed_error(conn, 401, "unauthorized", "Unauthorized")
+      {:error, :forbidden} -> managed_error(conn, 403, "loopback_required", "Loopback access required")
+      {:error, :managed_mode_disabled} -> managed_error(conn, 503, "managed_mode_disabled", "Managed mode is disabled")
+      {:error, reason} -> managed_error(conn, 503, "managed_unavailable", safe_managed_message(reason))
+      {:error, code, details} -> managed_error(conn, 409, Atom.to_string(code), safe_managed_message(details))
+    end
+  end
+
+  @spec managed_events(Conn.t(), map()) :: Conn.t()
+  def managed_events(conn, params) do
+    with :ok <- authorize_managed(conn),
+         {:ok, after_cursor} <- bounded_integer(params["after"], 0, 0, :infinity),
+         {:ok, limit} <- bounded_integer(params["limit"], 100, 1, 100),
+         {:ok, wait_ms} <- bounded_integer(params["wait_ms"], 0, 0, 60_000),
+         {:ok, events} <- wait_for_managed_events(after_cursor, limit, wait_ms) do
+      json(conn, %{after: after_cursor, events: events, cursor: (List.last(events) && List.last(events).cursor) || after_cursor})
+    else
+      {:error, :unauthorized} -> managed_error(conn, 401, "unauthorized", "Unauthorized")
+      {:error, :forbidden} -> managed_error(conn, 403, "loopback_required", "Loopback access required")
+      {:error, :managed_mode_disabled} -> managed_error(conn, 503, "managed_mode_disabled", "Managed mode is disabled")
+      {:error, reason} -> managed_error(conn, 400, "invalid_request", safe_managed_message(reason))
+    end
+  end
+
+  @spec managed_control(Conn.t(), map()) :: Conn.t()
+  def managed_control(conn, params) do
+    with :ok <- authorize_managed(conn),
+         {:ok, response} <- SymphonyElixir.Managed.Control.submit(orchestrator(), params, snapshot_timeout_ms()) do
+      conn |> put_status(200) |> json(response)
+    else
+      {:error, :unauthorized} -> managed_error(conn, 401, "unauthorized", "Unauthorized")
+      {:error, :forbidden} -> managed_error(conn, 403, "loopback_required", "Loopback access required")
+      {:error, :managed_mode_disabled} -> managed_error(conn, 503, "managed_mode_disabled", "Managed mode is disabled")
+      {:error, code, details} when is_atom(code) -> managed_error(conn, 409, Atom.to_string(code), safe_managed_message(details))
+      {:error, reason} -> managed_error(conn, 400, "invalid_request", safe_managed_message(reason))
+    end
+  end
+
   @spec method_not_allowed(Conn.t(), map()) :: Conn.t()
   def method_not_allowed(conn, _params) do
     error_response(conn, 405, "method_not_allowed", "Method not allowed")
@@ -46,6 +90,79 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   def not_found(conn, _params) do
     error_response(conn, 404, "not_found", "Route not found")
   end
+
+  defp authorize_managed(conn) do
+    cond do
+      not loopback?(conn.remote_ip) -> {:error, :forbidden}
+      not valid_bearer?(conn) -> {:error, :unauthorized}
+      true -> :ok
+    end
+  end
+
+  defp loopback?({127, _, _, _}), do: true
+  defp loopback?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
+  defp loopback?(_), do: false
+
+  defp valid_bearer?(conn) do
+    expected = SymphonyElixir.Config.managed_control_token()
+    [header | _] = get_req_header(conn, "authorization") ++ [""]
+    token = String.replace_prefix(header, "Bearer ", "")
+    is_binary(expected) and expected != "" and byte_size(token) == byte_size(expected) and Plug.Crypto.secure_compare(token, expected)
+  end
+
+  defp bounded_integer(nil, default, _minimum, _maximum), do: {:ok, default}
+
+  defp bounded_integer(value, _default, minimum, maximum) when is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} when integer >= minimum ->
+        if within_max?(integer, maximum), do: {:ok, integer}, else: {:error, :invalid_integer}
+
+      _ ->
+        {:error, :invalid_integer}
+    end
+  end
+
+  defp bounded_integer(value, _default, minimum, maximum) when is_integer(value) and value >= minimum do
+    if within_max?(value, maximum), do: {:ok, value}, else: {:error, :invalid_integer}
+  end
+
+  defp bounded_integer(_value, _default, _minimum, _maximum), do: {:error, :invalid_integer}
+
+  defp within_max?(_value, :infinity), do: true
+  defp within_max?(value, maximum), do: value <= maximum
+
+  defp wait_for_managed_events(after_cursor, limit, wait_ms) do
+    deadline = System.monotonic_time(:millisecond) + wait_ms
+    wait_for_managed_events(after_cursor, limit, deadline, wait_ms)
+  end
+
+  defp wait_for_managed_events(after_cursor, limit, deadline, _wait_ms) do
+    case SymphonyElixir.Managed.Control.events(orchestrator(), after_cursor, limit, 1_000) do
+      {:ok, events} when events != [] ->
+        {:ok, events}
+
+      {:ok, []} ->
+        remaining = deadline - System.monotonic_time(:millisecond)
+
+        if remaining > 0 do
+          Process.sleep(min(50, remaining))
+          wait_for_managed_events(after_cursor, limit, deadline, remaining)
+        else
+          {:ok, []}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp managed_error(conn, status, code, message) do
+    conn |> put_status(status) |> json(%{error: %{code: code, message: message}})
+  end
+
+  defp safe_managed_message(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp safe_managed_message(%{argument: argument}) when is_atom(argument), do: "invalid argument: " <> Atom.to_string(argument)
+  defp safe_managed_message(_reason), do: "Managed request failed"
 
   defp error_response(conn, status, code, message) do
     conn

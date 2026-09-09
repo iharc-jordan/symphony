@@ -270,6 +270,40 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Managed do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: false)
+      field(:journal_path, :string, default: Path.join(System.tmp_dir!(), "symphony_managed/journal.log"))
+      field(:control_token, :string)
+      field(:control_token_file, :string)
+      field(:control_token_env, :string, default: "SYMPHONY_MANAGED_TOKEN")
+      field(:event_limit, :integer, default: 100)
+      field(:event_wait_ms, :integer, default: 5_000)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:enabled, :journal_path, :control_token, :control_token_file, :control_token_env, :event_limit, :event_wait_ms], empty_values: [])
+      |> validate_number(:event_limit, greater_than: 0, less_than_or_equal_to: 100)
+      |> validate_number(:event_wait_ms, greater_than_or_equal_to: 0, less_than_or_equal_to: 60_000)
+      |> validate_required([:journal_path])
+      |> validate_change(:journal_path, fn :journal_path, value ->
+        if is_binary(value) and String.trim(value) != "", do: [], else: [journal_path: "must not be blank"]
+      end)
+      |> validate_change(:control_token_file, fn :control_token_file, value ->
+        if is_nil(value) or (is_binary(value) and String.trim(value) != ""),
+          do: [],
+          else: [control_token_file: "must not be blank"]
+      end)
+    end
+  end
+
   defmodule Server do
     @moduledoc false
     use Ecto.Schema
@@ -299,6 +333,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:managed, Managed, on_replace: :update, defaults_to_struct: true)
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -310,7 +345,12 @@ defmodule SymphonyElixir.Config.Schema do
     |> apply_action(:validate)
     |> case do
       {:ok, settings} ->
-        {:ok, finalize_settings(settings)}
+        settings = finalize_settings(settings)
+
+        case validate_managed_settings(settings.managed) do
+          :ok -> {:ok, settings}
+          {:error, message} -> {:error, {:invalid_workflow_config, message}}
+        end
 
       {:error, changeset} ->
         {:error, {:invalid_workflow_config, format_errors(changeset)}}
@@ -393,6 +433,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> cast_embed(:managed, with: &Managed.changeset/2)
   end
 
   defp finalize_settings(settings) do
@@ -454,13 +495,62 @@ defmodule SymphonyElixir.Config.Schema do
       | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
     }
 
+    managed = %{
+      settings.managed
+      | journal_path: resolve_path_value(settings.managed.journal_path, Path.join(System.tmp_dir!(), "symphony_managed/journal.log")),
+        control_token_file: resolve_path_value(settings.managed.control_token_file, nil),
+        control_token: managed_control_token(settings.managed)
+    }
+
     codex = %{
       settings.codex
       | approval_policy: normalize_keys(settings.codex.approval_policy),
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, managed: managed}
+  end
+
+  defp validate_managed_settings(%Managed{enabled: false}), do: :ok
+
+  defp validate_managed_settings(%Managed{} = managed) do
+    token =
+      case managed.control_token_file do
+        file when is_binary(file) ->
+          case File.read(file) do
+            {:ok, value} -> String.trim(value)
+            {:error, _reason} -> nil
+          end
+
+        _ ->
+          managed.control_token
+      end
+
+    if is_binary(token) and token != "" do
+      :ok
+    else
+      {:error, "managed.enabled=true requires a readable non-empty control_token_file or control_token"}
+    end
+  end
+
+  defp managed_control_token(%Managed{} = managed) do
+    token_from_file =
+      case managed.control_token_file do
+        file when is_binary(file) ->
+          case File.read(file) do
+            {:ok, value} -> String.trim(value)
+            _ -> nil
+          end
+
+        _ ->
+          nil
+      end
+
+    token_from_file ||
+      resolve_secret_setting(
+        managed.control_token,
+        System.get_env(managed.control_token_env || "SYMPHONY_MANAGED_TOKEN")
+      )
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -513,6 +603,8 @@ defmodule SymphonyElixir.Config.Schema do
         path
     end
   end
+
+  defp resolve_path_value(_value, default), do: default
 
   defp resolve_env_value(value, fallback) when is_binary(value) do
     case env_reference_name(value) do
