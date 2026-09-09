@@ -93,7 +93,6 @@ defmodule SymphonyElixir.Managed.Rules do
       end
     else
       {:error, code, details} -> {:error, code, details}
-      {:error, reason} -> {:error, reason, %{}}
     end
   end
 
@@ -120,7 +119,6 @@ defmodule SymphonyElixir.Managed.Rules do
       end
     else
       {:error, code, details} -> {:error, code, details}
-      {:error, reason} -> {:error, reason, %{}}
     end
   end
 
@@ -281,10 +279,6 @@ defmodule SymphonyElixir.Managed.Rules do
     end
   end
 
-  defp apply_new(_state, %{operation: operation}, _canonical, _context) do
-    {:error, :unsupported_operation, %{operation: operation}}
-  end
-
   defp apply_binding(state, request, canonical, args) do
     with :ok <- expected_revision(state, args, :global),
          {:ok, binding} <- binding_from_args(args),
@@ -394,9 +388,6 @@ defmodule SymphonyElixir.Managed.Rules do
       disposition in [:waiting, :rework] ->
         review_deferred(disposition, args)
 
-      disposition == :blocked ->
-        review_blocked(args)
-
       true ->
         {:error, :invalid_disposition, %{disposition: disposition}}
     end
@@ -423,16 +414,6 @@ defmodule SymphonyElixir.Managed.Rules do
       updates = %{board_state: next_phase, disposition_reason: reason}
       response = %{operation: :review, disposition: disposition, reason: reason}
       {:ok, next_phase, updates, response}
-    end
-  end
-
-  defp review_blocked(args) do
-    reason = text_value(args, :reason)
-
-    with :ok <- present(reason, :reason) do
-      updates = %{board_state: :waiting, blocked_reason: reason}
-      response = %{operation: :review, disposition: :blocked, reason: reason}
-      {:ok, :waiting, updates, response}
     end
   end
 
@@ -691,8 +672,6 @@ defmodule SymphonyElixir.Managed.Rules do
     end
   end
 
-  defp dependencies_accepted(_assignment, _state), do: {:error, :dependency_not_accepted, %{}}
-
   defp duplicate_identity_free?(state, assignment),
     do: duplicate_identity_free_after_revision?(state, nil, assignment)
 
@@ -718,8 +697,6 @@ defmodule SymphonyElixir.Managed.Rules do
       repository <> "#" <> Integer.to_string(issue_number)
     end
   end
-
-  defp assignment_identity(_assignment), do: ""
 
   defp resources_free?(state, resources, own_id \\ nil) do
     conflicting =
@@ -905,7 +882,6 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp normalize_evidence(evidence), do: Enum.take(evidence, 20)
 
-  defp transition_targets(nil), do: [:bound, :ready]
   defp transition_targets(:idle), do: [:bound]
   defp transition_targets(:bound), do: [:ready, :cancelled]
   defp transition_targets(:ready), do: [:active, :cancelled, :waiting]
