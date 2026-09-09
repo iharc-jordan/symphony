@@ -22,7 +22,7 @@ defmodule SymphonyElixir.Managed.Checkout do
          {:ok, input} <- attempt_input(paths.workspace, issue, assignment, attempt),
          {:ok, context} <- HookContext.encode(issue),
          {:ok, input_file} <- write_input(paths.input_root, input) do
-      invoke_helper(node, helper, policy_file, input_file, paths.workspace, context)
+      invoke_helper(paths.node, paths.helper, paths.policy_file, input_file, paths.workspace, context)
     end
   rescue
     error in [ArgumentError, File.Error, ErlangError] ->
@@ -66,7 +66,7 @@ defmodule SymphonyElixir.Managed.Checkout do
          false <- within?(helper, workspace_root),
          false <- within?(node, workspace_root),
          true <- descendant?(input_root, control_root) do
-      {:ok, %{workspace: workspace, input_root: input_root}}
+      {:ok, %{workspace: workspace, input_root: input_root, node: node, helper: helper, policy_file: policy_file}}
     else
       _ -> {:error, :checkout_path_boundary_invalid}
     end

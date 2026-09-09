@@ -22,7 +22,7 @@ defmodule SymphonyElixir.Managed.CheckoutTest do
     assert sys.argv[4] == '--policy'
     payload = {'input': json.loads(pathlib.Path(sys.argv[3]).read_text()),
                'context': json.loads(os.environ['SYMPHONY_ISSUE_CONTEXT']),
-               'argv': sys.argv[1:]}
+               'argv': sys.argv[1:], 'helper': sys.argv[0], 'executable': sys.executable}
     pathlib.Path('helper-proof.json').write_text(json.dumps(payload))
     """)
 
@@ -77,6 +77,21 @@ defmodule SymphonyElixir.Managed.CheckoutTest do
     assert {:error, :checkout_attempt_identity_invalid} = prepare(%{c | attempt: %{c.attempt | revision: 2}})
     assert {:error, :checkout_attempt_identity_invalid} = prepare(%{c | issue: %{c.issue | id: "other-item"}})
     refute File.exists?(Path.join(c.control, "attempts"))
+  end
+
+  test "invokes canonical trusted paths when configuration uses symlinks", c do
+    helper_alias = Path.join(c.root, "helper alias")
+    policy_alias = Path.join(c.root, "policy alias")
+    node_alias = Path.join(c.root, "node alias")
+    File.ln_s!(c.helper, helper_alias)
+    File.ln_s!(c.policy, policy_alias)
+    File.ln_s!(Keyword.fetch!(c.opts, :node_executable), node_alias)
+    opts = [node_executable: node_alias, helper_path: helper_alias, policy_file: policy_alias]
+    assert :ok = prepare(%{c | opts: opts})
+    proof = c.workspace |> Path.join("helper-proof.json") |> File.read!() |> Jason.decode!()
+    assert proof["helper"] == c.helper
+    assert List.last(proof["argv"]) == c.policy
+    refute proof["executable"] == node_alias
   end
 
   test "does not overwrite conflicting or symlinked attempt inputs", c do
