@@ -364,9 +364,9 @@ defmodule SymphonyElixir.Managed.Rules do
 
     with :ok <- present(reason, :reason),
          :ok <- phase_is(assignment.phase, :active) do
-      {:ok, :waiting,
-       %{blocked_reason: reason, board_state: :waiting, stop_pending: true},
-       %{operation: :interrupt, reason: reason}}
+      updates = %{blocked_reason: reason, board_state: :waiting, stop_pending: true}
+      response = %{operation: :interrupt, reason: reason}
+      {:ok, :waiting, updates, response}
     end
   end
 
@@ -376,9 +376,9 @@ defmodule SymphonyElixir.Managed.Rules do
     if assignment.phase in @terminal_phases do
       {:error, :already_terminal, %{phase: assignment.phase}}
     else
-      {:ok, :cancelled,
-       %{disposition_reason: reason, board_state: :cancelled, stop_pending: true},
-       %{operation: :cancel, reason: reason}}
+      updates = %{disposition_reason: reason, board_state: :cancelled, stop_pending: true}
+      response = %{operation: :cancel, reason: reason}
+      {:ok, :cancelled, updates, response}
     end
   end
 
@@ -408,9 +408,9 @@ defmodule SymphonyElixir.Managed.Rules do
          :ok <- evidence_present(evidence),
          :ok <- dependencies_accepted(assignment, state),
          :ok <- external_effects_reconciled(context) do
-      {:ok, :accepted,
-       %{board_state: :accepted, evidence: normalize_evidence(evidence), issue_close: :ok},
-       %{operation: :review, disposition: :accepted, issue_close: :ok}}
+      updates = %{board_state: :accepted, evidence: normalize_evidence(evidence), issue_close: :ok}
+      response = %{operation: :review, disposition: :accepted, issue_close: :ok}
+      {:ok, :accepted, updates, response}
     end
   end
 
@@ -420,8 +420,9 @@ defmodule SymphonyElixir.Managed.Rules do
     with :ok <- present(reason, :reason) do
       next_phase = if disposition == :waiting, do: :waiting, else: :ready
 
-      {:ok, next_phase, %{board_state: next_phase, disposition_reason: reason},
-       %{operation: :review, disposition: disposition, reason: reason}}
+      updates = %{board_state: next_phase, disposition_reason: reason}
+      response = %{operation: :review, disposition: disposition, reason: reason}
+      {:ok, next_phase, updates, response}
     end
   end
 
@@ -429,8 +430,9 @@ defmodule SymphonyElixir.Managed.Rules do
     reason = text_value(args, :reason)
 
     with :ok <- present(reason, :reason) do
-      {:ok, :waiting, %{board_state: :waiting, blocked_reason: reason},
-       %{operation: :review, disposition: :blocked, reason: reason}}
+      updates = %{board_state: :waiting, blocked_reason: reason}
+      response = %{operation: :review, disposition: :blocked, reason: reason}
+      {:ok, :waiting, updates, response}
     end
   end
 

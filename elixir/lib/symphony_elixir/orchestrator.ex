@@ -204,10 +204,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp managed_report_call(state, payload) do
     case managed_source_reconcile(state, payload) do
-      {:ok, source_state, :unchanged} -> persist_managed_report(source_state, payload)
+      {:ok, source_state, :unchanged} ->
+        persist_managed_report(source_state, payload)
+
       {:ok, source_state, {:changed, target}} ->
         {:reply, {:error, {:managed_source_state_changed, target}}, source_state}
-      {:error, source_state, reason} -> {:reply, {:error, reason}, source_state}
+
+      {:error, source_state, reason} ->
+        {:reply, {:error, reason}, source_state}
     end
   end
 
@@ -490,6 +494,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp accepted_external_effects?(reconciliation) when is_map(reconciliation) do
     effects = reconciliation[:external_effects] || %{}
+
     is_map(effects) and effects[:status] in [:ok, "ok", :reconciled, "reconciled"] and
       effects[:issue_close] in [:ok, "ok", :reconciled, "reconciled"]
   end
@@ -896,11 +901,12 @@ defmodule SymphonyElixir.Orchestrator do
                 revision: assignment.revision
               })
 
-            {:ok, data, %{
-              assignment_id: assignment_id,
-              revision: assignment.revision,
-              reconciled: reconciliation[:reconciled] == true
-            }}
+            {:ok, data,
+             %{
+               assignment_id: assignment_id,
+               revision: assignment.revision,
+               reconciled: reconciliation[:reconciled] == true
+             }}
         end
     end
   end
@@ -1321,6 +1327,7 @@ defmodule SymphonyElixir.Orchestrator do
          stop_pending
        ) do
     assignment_id = assignment.assignment_id
+
     updated =
       assignment
       |> Map.merge(%{
@@ -1765,8 +1772,8 @@ defmodule SymphonyElixir.Orchestrator do
     data =
       state.managed.data
       |> update_in([:assignments, intent.assignment_id], fn existing ->
-        if running? and is_map(existing || assignment) do
-          Map.merge(existing || assignment, %{
+        if running? and is_map(existing) do
+          Map.merge(existing, %{
             stop_pending: true,
             pending_effect: %{kind: :stop, status: :pending, target: intent.target, request_id: intent.request_id}
           })
@@ -1811,7 +1818,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp execute_managed_transition(%State{} = state, assignment, intent, _response) do
     case managed_apply_provider_transition(state, assignment, intent.target) do
-      {:ok, reconciled_state} -> commit_managed_transition(reconciled_state, intent)
+      {:ok, reconciled_state} ->
+        commit_managed_transition(reconciled_state, intent)
 
       {:error, failed_state, reason} ->
         fail_managed_transition(failed_state, intent, reason)
@@ -1847,7 +1855,9 @@ defmodule SymphonyElixir.Orchestrator do
       })
 
     case persist_managed_data(state, data) do
-      {:ok, final_state} -> {:reply, {:ok, committed_response}, final_state}
+      {:ok, final_state} ->
+        {:reply, {:ok, committed_response}, final_state}
+
       {:error, reason} ->
         {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
     end
@@ -1869,7 +1879,9 @@ defmodule SymphonyElixir.Orchestrator do
       })
 
     case persist_managed_data(state, failed_data) do
-      {:ok, next_state} -> {:reply, {:error, reason}, next_state}
+      {:ok, next_state} ->
+        {:reply, {:error, reason}, next_state}
+
       {:error, journal_reason} ->
         {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(journal_reason)}}, state}
     end
@@ -1957,7 +1969,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp execute_managed_review(%State{} = state, intent) do
     case managed_review_effects(state, intent) do
-      {:ok, facts} -> commit_managed_review(state, intent, facts)
+      {:ok, facts} ->
+        commit_managed_review(state, intent, facts)
 
       {:error, code, details} ->
         managed_review_failed(state, intent, code, details)
@@ -1986,7 +1999,8 @@ defmodule SymphonyElixir.Orchestrator do
     completed_data = complete_managed_review_intent(data, intent.request.request_id)
 
     case persist_managed_data(state, completed_data) do
-      {:ok, final_state} -> {:reply, {:ok, response}, final_state}
+      {:ok, final_state} ->
+        {:reply, {:ok, response}, final_state}
 
       {:error, reason} ->
         {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
@@ -2158,6 +2172,7 @@ defmodule SymphonyElixir.Orchestrator do
       )
 
     previous_usage_total = get_in(assignment, [:usage, :total_tokens]) || 0
+
     retrying? =
       phase == :ready and managed_retry_allowed?(assignment) and match?({:managed_agent_failed, _}, reason)
 
@@ -2272,6 +2287,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp managed_guard_result({:managed_agent_guard_stop, guard_reason}, phase, assignment, attempt)
        when phase in [:review, :waiting] do
     blocked_reason = if phase == :waiting, do: assignment[:blocked_reason], else: nil
+
     pending_effect = %{
       kind: :run,
       status: :guard_stopped,
