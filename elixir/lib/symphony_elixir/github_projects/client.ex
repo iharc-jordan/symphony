@@ -96,7 +96,7 @@ defmodule SymphonyElixir.GitHubProjects.Client do
   """
 
   @items_by_id_query """
-  query SymphonyGitHubProjectItemsById($itemIds: [ID!]!, $projectId: ID!, $statusFieldName: String!, $blockerFirst: Int!) {
+  query SymphonyGitHubProjectItemsById($itemIds: [ID!]!, $statusFieldName: String!, $blockerFirst: Int!) {
     nodes(ids: $itemIds) {
       ... on ProjectV2Item {
         #{@item_fields}
@@ -139,6 +139,8 @@ defmodule SymphonyElixir.GitHubProjects.Client do
     }
   }
   """
+  @typep cursor_seen :: map()
+
   @spec validate_settings(map()) :: :ok | {:error, term()}
   def validate_settings(tracker_settings) do
     with {:ok, _settings} <- settings(tracker_settings), do: :ok
@@ -237,7 +239,7 @@ defmodule SymphonyElixir.GitHubProjects.Client do
            {:ok, project} <- fetch_project(settings, request_fun),
            {:ok, status_field} <- fetch_status_field(settings, project.id, request_fun),
            {:ok, raw_items} <-
-             fetch_items_by_ids(settings, project.id, status_field, ids, request_fun),
+             fetch_items_by_ids(settings, status_field, ids, request_fun),
            {:ok, items} <- hydrate_items(raw_items, settings, request_fun),
            {:ok, issues} <- normalize_items(items, project.id, status_field, :refresh) do
         by_id = Map.new(issues, &{&1.id, &1})
@@ -263,9 +265,11 @@ defmodule SymphonyElixir.GitHubProjects.Client do
   end
 
   defp fetch_status_field(settings, project_id, request_fun) do
-    fetch_status_fields(settings, project_id, nil, [], request_fun, MapSet.new())
+    fetch_status_fields(settings, project_id, nil, [], request_fun, %{})
   end
 
+  @spec fetch_status_fields(map(), String.t(), nil | String.t(), list(), function(), cursor_seen()) ::
+          {:ok, term()} | {:error, term()}
   # credo:disable-for-next-line
   defp fetch_status_fields(settings, project_id, after_cursor, acc, request_fun, seen) do
     with {:ok, seen} <- validate_cursor(after_cursor, seen),
@@ -338,9 +342,11 @@ defmodule SymphonyElixir.GitHubProjects.Client do
   defp option_nodes(_), do: []
 
   defp fetch_items(settings, project_id, field, request_fun) do
-    fetch_item_pages(settings, project_id, field, nil, [], request_fun, MapSet.new())
+    fetch_item_pages(settings, project_id, field, nil, [], request_fun, %{})
   end
 
+  @spec fetch_item_pages(map(), String.t(), map(), nil | String.t(), list(), function(), cursor_seen()) ::
+          {:ok, term()} | {:error, term()}
   defp fetch_item_pages(settings, project_id, field, after_cursor, acc, request_fun, seen) do
     with {:ok, seen} <- validate_cursor(after_cursor, seen),
          variables <- %{
@@ -374,11 +380,10 @@ defmodule SymphonyElixir.GitHubProjects.Client do
   end
 
   # credo:disable-for-next-line
-  defp fetch_items_by_ids(settings, project_id, field, ids, request_fun) do
+  defp fetch_items_by_ids(settings, field, ids, request_fun) do
     Enum.reduce_while(Enum.chunk_every(ids, @page_size), {:ok, []}, fn batch, {:ok, acc} ->
       variables = %{
         "itemIds" => batch,
-        "projectId" => project_id,
         "statusFieldName" => field.name,
         "blockerFirst" => @page_size
       }
@@ -498,9 +503,11 @@ defmodule SymphonyElixir.GitHubProjects.Client do
   end
 
   defp fetch_blocker_pages(settings, issue_id, after_cursor, request_fun, acc) do
-    fetch_blocker_pages(settings, issue_id, after_cursor, request_fun, acc, MapSet.new())
+    fetch_blocker_pages(settings, issue_id, after_cursor, request_fun, acc, %{})
   end
 
+  @spec fetch_blocker_pages(map(), String.t(), String.t(), function(), list(), cursor_seen()) ::
+          {:ok, term()} | {:error, term()}
   defp fetch_blocker_pages(settings, issue_id, after_cursor, request_fun, acc, seen) do
     with {:ok, seen} <- validate_cursor(after_cursor, seen),
          variables <- %{"issueId" => issue_id, "first" => @page_size, "after" => after_cursor},
@@ -527,9 +534,11 @@ defmodule SymphonyElixir.GitHubProjects.Client do
   end
 
   defp fetch_label_pages(settings, issue_id, after_cursor, request_fun, acc) do
-    fetch_label_pages(settings, issue_id, after_cursor, request_fun, acc, MapSet.new())
+    fetch_label_pages(settings, issue_id, after_cursor, request_fun, acc, %{})
   end
 
+  @spec fetch_label_pages(map(), String.t(), String.t(), function(), list(), cursor_seen()) ::
+          {:ok, term()} | {:error, term()}
   defp fetch_label_pages(settings, issue_id, after_cursor, request_fun, acc, seen) do
     with {:ok, seen} <- validate_cursor(after_cursor, seen),
          variables <- %{"issueId" => issue_id, "first" => @page_size, "after" => after_cursor},
@@ -677,9 +686,9 @@ defmodule SymphonyElixir.GitHubProjects.Client do
     value = item["fieldValueByName"] || item["status"] || item["field_value"]
 
     case value do
-      %{"name" => name} when is_binary(name) -> if present_string?(name), do: String.trim(name)
       %{"optionId" => id} -> Map.get(options, id)
       %{"option_id" => id} -> Map.get(options, id)
+      %{"name" => name} when is_binary(name) -> if present_string?(name), do: String.trim(name)
       name when is_binary(name) -> if present_string?(name), do: String.trim(name)
       _ -> nil
     end
@@ -788,17 +797,17 @@ defmodule SymphonyElixir.GitHubProjects.Client do
 
   defp next_page_cursor(_), do: {:error, :github_projects_malformed_page_info}
 
+  @spec validate_cursor(nil | String.t(), cursor_seen()) ::
+          {:ok, cursor_seen()} | {:error, atom()}
   defp validate_cursor(nil, seen), do: {:ok, seen}
 
-  defp validate_cursor(cursor, seen) when is_binary(cursor) do
-    if MapSet.member?(seen, cursor) do
+  defp validate_cursor(cursor, seen) when is_binary(cursor) and is_map(seen) do
+    if Map.has_key?(seen, cursor) do
       {:error, :github_projects_repeated_cursor}
     else
-      {:ok, MapSet.put(seen, cursor)}
+      {:ok, Map.put(seen, cursor, true)}
     end
   end
-
-  defp validate_cursor(_cursor, _seen), do: {:error, :github_projects_malformed_cursor}
 
   # credo:disable-for-next-line
   defp call_graphql(query, variables, tracker, request_fun) when is_map(tracker) do
