@@ -239,7 +239,16 @@ defmodule SymphonyElixir.GitHubProjects.AdapterTest do
                request_fun: fn payload, settings ->
                  assert payload["query"] == "query"
                  assert payload["variables"] == %{"answer" => 42}
-                 assert settings == tracker_settings()
+
+                 assert settings == %{
+                          owner_type: "org",
+                          owner: "octo",
+                          project_number: 9,
+                          status_field_name: "Status",
+                          token: "test-token",
+                          graphql_url: "https://api.github.com/graphql"
+                        }
+
                  {:ok, %{status: 200, body: %{"data" => %{}}}}
                end
              )

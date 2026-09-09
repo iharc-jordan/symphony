@@ -206,7 +206,10 @@ defmodule SymphonyElixir.GitHubProjects.Client do
       when is_binary(query) and is_map(variables) and is_list(opts) do
     tracker = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
     request_fun = Keyword.get(opts, :request_fun, &perform_request/2)
-    call_graphql(query, variables, tracker, request_fun)
+
+    with {:ok, settings} <- settings(tracker) do
+      call_graphql(query, variables, settings, request_fun)
+    end
   end
 
   @doc false
