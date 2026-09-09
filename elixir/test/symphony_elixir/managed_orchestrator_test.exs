@@ -770,6 +770,69 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     assert assignment.pending_effect == provider_effect
     assert failed.managed.data.effect_intents["auto-active"] == intent
   end
+
+  test "startup transition recovery loads an unloaded provider beam" do
+    module = Module.concat(__MODULE__, :"ColdEffects#{System.unique_integer([:positive])}")
+    module_name = inspect(module)
+    root = Path.join(System.tmp_dir!(), "managed-cold-effects-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+
+    source = """
+    defmodule #{module_name} do
+      def transition(assignment, target, _context) do
+        send(self(), {:cold_provider_transition, assignment.assignment_id, target})
+        {:ok, %{provider_state: target, reconciled: true, external_effects: %{status: :ok}}}
+      end
+    end
+    """
+
+    [{^module, beam}] = Code.compile_string(source, Path.join(root, "cold_effects.ex"))
+    beam_path = Path.join(root, Atom.to_string(module) <> ".beam")
+    File.write!(beam_path, beam)
+    code_path = String.to_charlist(root)
+    true = :code.add_patha(code_path)
+
+    on_exit(fn ->
+      :code.purge(module)
+      :code.delete(module)
+      :code.del_path(code_path)
+      File.rm_rf(root)
+    end)
+
+    assert {:file, _path} = :code.is_loaded(module)
+    :code.purge(module)
+    :code.delete(module)
+    assert false == :code.is_loaded(module)
+
+    {pid, _path} = managed_server()
+    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+
+    state = :sys.get_state(pid)
+
+    data =
+      state.managed.data
+      |> put_in([:assignments, "item-1", :phase], :ready)
+      |> put_in([:assignments, "item-1", :board_state], :ready)
+      |> put_in([:effect_intents, "cold-active"], %{
+        request_id: "cold-active",
+        request: nil,
+        assignment_id: "item-1",
+        target: :active,
+        status: :pending
+      })
+
+    recovered =
+      Orchestrator.recover_managed_transitions_for_test(%{
+        state
+        | managed: %{state.managed | data: data, effects: module}
+      })
+
+    assert_receive {:cold_provider_transition, "item-1", :active}
+    assert {:file, _path} = :code.is_loaded(module)
+    assert recovered.managed.data.assignments["item-1"].pending_effect.status == :reconciled
+    assert recovered.managed.data.effect_intents["cold-active"].status == :effect_reconciled
+  end
 end
 
 defmodule SymphonyElixir.ManagedOrchestratorSourceReconciliationTest do
