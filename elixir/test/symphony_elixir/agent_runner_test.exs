@@ -63,6 +63,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
                  issue,
                  parent,
                  managed_attempt: attempt,
+                 workspace_preparer: fn _workspace -> :ok end,
                  model: "gpt-5.6-luna",
                  effort: "xhigh",
                  max_turns: 1,
@@ -144,12 +145,119 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert catch_exit(
                AgentRunner.run(issue, nil,
                  managed_attempt: attempt,
+                 workspace_preparer: fn _workspace -> :ok end,
                  model: "gpt-5.6-luna",
                  effort: "xhigh",
                  max_turns: 1,
                  issue_state_fetcher: fn [_id] -> {:ok, [issue]} end
                )
              ) == {:managed_agent_guard_stop, :turn_budget_exhausted}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "managed runner requires workspace preparation before launching Codex" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-managed-runner-preparer-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-PREPARER")
+      codex_binary = Path.join(test_root, "fake-codex")
+      marker = Path.join(test_root, "launched")
+      File.mkdir_p!(workspace)
+      File.write!(codex_binary, "#!/bin/sh\ntouch #{marker}\n")
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-preparer",
+        identifier: "MT-PREPARER",
+        title: "Workspace preparation",
+        description: "Require managed workspace preparation",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-PREPARER",
+        labels: ["backend"]
+      }
+
+      attempt = %{
+        assignment_id: "issue-preparer",
+        revision: "rev-1",
+        generation: 0,
+        attempt_id: "attempt-preparer"
+      }
+
+      assert catch_exit(
+               AgentRunner.run(issue, nil,
+                 managed_attempt: attempt,
+                 max_turns: 1
+               )
+             ) == {:managed_agent_failed, :missing_workspace_preparer}
+
+      refute File.exists?(marker)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "managed runner reports workspace preparation failures before Codex" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-managed-runner-preparer-failure-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-PREPARER-FAILURE")
+      codex_binary = Path.join(test_root, "fake-codex")
+      marker = Path.join(test_root, "launched")
+      File.mkdir_p!(workspace)
+      File.write!(codex_binary, "#!/bin/sh\ntouch #{marker}\n")
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-preparer-failure",
+        identifier: "MT-PREPARER-FAILURE",
+        title: "Workspace preparation failure",
+        description: "Do not launch after preparation failure",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-PREPARER-FAILURE",
+        labels: ["backend"]
+      }
+
+      attempt = %{
+        assignment_id: "issue-preparer-failure",
+        revision: "rev-1",
+        generation: 0,
+        attempt_id: "attempt-preparer-failure"
+      }
+
+      assert catch_exit(
+               AgentRunner.run(issue, nil,
+                 managed_attempt: attempt,
+                 workspace_preparer: fn prepared_workspace ->
+                   assert File.dir?(prepared_workspace)
+                   {:error, :bootstrap_failed}
+                 end,
+                 max_turns: 1
+               )
+             ) == {:managed_agent_failed, {:workspace_preparer, :bootstrap_failed}}
+
+      refute File.exists?(marker)
     after
       File.rm_rf(test_root)
     end
@@ -197,6 +305,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert catch_exit(
                AgentRunner.run(issue, nil,
                  managed_attempt: attempt,
+                 workspace_preparer: fn _workspace -> :ok end,
                  max_turns: 0,
                  remaining_turns: 0
                )

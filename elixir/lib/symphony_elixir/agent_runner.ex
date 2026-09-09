@@ -55,16 +55,17 @@ defmodule SymphonyElixir.AgentRunner do
 
     case Workspace.create_for_issue(issue, worker_host) do
       {:ok, workspace} ->
-        send_worker_runtime_info(
-          codex_update_recipient,
-          issue,
-          worker_host,
-          workspace,
-          Keyword.get(opts, :managed_attempt)
-        )
-
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          with :ok <- invoke_workspace_preparer(workspace, opts),
+               :ok <-
+                 send_worker_runtime_info(
+                   codex_update_recipient,
+                   issue,
+                   worker_host,
+                   workspace,
+                   Keyword.get(opts, :managed_attempt)
+                 ),
+               :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
             run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
           end
         after
@@ -113,6 +114,34 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _managed_attempt), do: :ok
+
+  defp invoke_workspace_preparer(workspace, opts) when is_binary(workspace) do
+    preparer = Keyword.get(opts, :workspace_preparer)
+
+    cond do
+      is_function(preparer, 1) ->
+        normalize_workspace_preparer_result(preparer.(workspace))
+
+      managed_attempt?(opts) and is_nil(preparer) ->
+        {:error, :missing_workspace_preparer}
+
+      is_nil(preparer) ->
+        :ok
+
+      true ->
+        {:error, :invalid_workspace_preparer}
+    end
+  rescue
+    error -> {:error, {:workspace_preparer, {:callback_exception, Exception.message(error)}}}
+  end
+
+  defp normalize_workspace_preparer_result(:ok), do: :ok
+
+  defp normalize_workspace_preparer_result({:error, reason}),
+    do: {:error, {:workspace_preparer, reason}}
+
+  defp normalize_workspace_preparer_result(other),
+    do: {:error, {:workspace_preparer, {:invalid_callback_result, other}}}
 
   defp maybe_scope_runtime_info(runtime_info, managed_attempt) when is_map(managed_attempt),
     do: Map.put(runtime_info, :attempt, managed_attempt)
