@@ -1855,12 +1855,24 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp execute_managed_transition(%State{} = state, assignment, intent, _response) do
-    case managed_apply_provider_transition(state, assignment, intent.target) do
-      {:ok, reconciled_state} ->
-        commit_managed_transition(reconciled_state, intent)
+    with {:ok, provider_assignment} <- managed_transition_provider_assignment(state, assignment, intent),
+         {:ok, reconciled_state} <- managed_apply_provider_transition(state, provider_assignment, intent.target) do
+      commit_managed_transition(reconciled_state, intent)
+    else
+      {:error, failed_state, reason} -> fail_managed_transition(failed_state, intent, reason)
+      {:error, reason} -> fail_managed_transition(state, intent, reason)
+    end
+  end
 
-      {:error, failed_state, reason} ->
-        fail_managed_transition(failed_state, intent, reason)
+  defp managed_transition_provider_assignment(state, assignment, %{request: request, assignment_id: assignment_id}) do
+    if map_value(request, :operation) in [:revise, "revise"] do
+      case Rules.apply(state.managed.data, request, %{stop_reconciled: true}) do
+        {:ok, preview, _response} -> {:ok, Map.fetch!(preview.assignments, assignment_id)}
+        {:duplicate, _response} -> {:ok, assignment}
+        {:error, code, details} -> {:error, {code, details}}
+      end
+    else
+      {:ok, assignment}
     end
   end
 
