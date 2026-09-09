@@ -868,9 +868,6 @@ defmodule SymphonyElixir.GitHubProjects.Client do
     end
   end
 
-  # credo:disable-for-next-line
-  defp call_graphql(_, _, _, _), do: {:error, :github_projects_unknown_payload}
-
   defp decode_body(%{"errors" => errors}) when is_list(errors) and errors != [],
     do: {:error, {:github_projects_graphql_errors, errors}}
 
