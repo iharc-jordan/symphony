@@ -1763,18 +1763,33 @@ defmodule SymphonyElixir.Orchestrator do
 
     case get_in(state.managed.data, [:effect_intents, request_id]) do
       existing when is_map(existing) ->
-        handle_existing_managed_transition(state, current_assignment, existing, request_id)
+        handle_existing_managed_transition(state, current_assignment, existing, envelope)
 
       _ ->
         prepare_managed_transition(state, envelope, current_assignment, target, assignment_id, request_id)
     end
   end
 
-  defp handle_existing_managed_transition(state, assignment, intent, request_id) do
-    if intent[:status] in [:pending, :effect_reconciled] do
-      execute_managed_transition(state, assignment, intent, %{})
-    else
-      {:reply, {:error, :request_id_conflict, %{request_id: request_id}}, state}
+  defp handle_existing_managed_transition(state, assignment, intent, envelope) do
+    request_id = map_value(envelope, :request_id)
+
+    cond do
+      not is_map(intent[:request]) or Rules.canonical_input(intent.request) != Rules.canonical_input(envelope) ->
+        {:reply, {:error, :request_id_conflict, %{request_id: request_id}}, state}
+
+      intent[:status] in [:pending, :effect_reconciled] ->
+        execute_managed_transition(state, assignment, intent, %{})
+
+      true ->
+        completed_managed_transition_response(state, envelope, request_id)
+    end
+  end
+
+  defp completed_managed_transition_response(state, envelope, request_id) do
+    case Rules.apply(state.managed.data, envelope, %{stop_reconciled: true}) do
+      {:duplicate, response} -> {:reply, {:ok, Map.put(response, :duplicate, true)}, state}
+      {:error, code, details} -> {:reply, {:error, code, details}, state}
+      {:ok, _data, _response} -> {:reply, {:error, :request_id_conflict, %{request_id: request_id}}, state}
     end
   end
 
