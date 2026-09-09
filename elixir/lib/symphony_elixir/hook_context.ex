@@ -56,19 +56,14 @@ defmodule SymphonyElixir.HookContext do
   end
 
   defp encode_context(context) do
-    try do
-      case Jason.encode(context) do
-        {:ok, encoded} when byte_size(encoded) <= @max_bytes ->
-          {:ok, encoded}
+    case Jason.encode(context) do
+      {:ok, encoded} when byte_size(encoded) <= @max_bytes ->
+        {:ok, encoded}
 
-        {:ok, encoded} ->
-          {:error, {:too_large, byte_size(encoded), @max_bytes}}
+      {:ok, encoded} ->
+        {:error, {:too_large, byte_size(encoded), @max_bytes}}
 
-        {:error, _reason} ->
-          {:error, :invalid_issue_context}
-      end
-    rescue
-      _error in [ArgumentError, Protocol.UndefinedError] ->
+      {:error, _reason} ->
         {:error, :invalid_issue_context}
     end
   end
@@ -113,31 +108,39 @@ defmodule SymphonyElixir.HookContext do
     if struct?(value) do
       {:error, :non_json_value}
     else
-      Enum.reduce_while(value, {:ok, %{}}, fn {key, child}, {:ok, acc} ->
-        case json_key(key) do
-          {:ok, string_key} ->
-            cond do
-              forbidden_key?(string_key) ->
-                {:halt, {:error, {:forbidden_key, string_key}}}
-
-              true ->
-                case sanitize_native_ref(child) do
-                  {:ok, sanitized_child} ->
-                    {:cont, {:ok, Map.put(acc, string_key, sanitized_child)}}
-
-                  {:error, reason} ->
-                    {:halt, {:error, reason}}
-                end
-            end
-
-          :error ->
-            {:halt, {:error, :non_json_key}}
-        end
-      end)
+      sanitize_native_ref_map(value)
     end
   end
 
   defp sanitize_native_ref(_value), do: {:error, :non_json_value}
+
+  defp sanitize_native_ref_map(value) do
+    Enum.reduce_while(value, {:ok, %{}}, &sanitize_native_ref_map_entry/2)
+  end
+
+  defp sanitize_native_ref_map_entry({key, child}, {:ok, acc}) do
+    case json_key(key) do
+      {:ok, string_key} ->
+        sanitize_native_ref_map_value(string_key, child, acc)
+
+      :error ->
+        {:halt, {:error, :non_json_key}}
+    end
+  end
+
+  defp sanitize_native_ref_map_value(string_key, child, acc) do
+    if forbidden_key?(string_key) do
+      {:halt, {:error, {:forbidden_key, string_key}}}
+    else
+      case sanitize_native_ref(child) do
+        {:ok, sanitized_child} ->
+          {:cont, {:ok, Map.put(acc, string_key, sanitized_child)}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end
+  end
 
   defp reverse_sanitized_list({:ok, values}), do: {:ok, Enum.reverse(values)}
   defp reverse_sanitized_list(error), do: error
