@@ -623,8 +623,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp managed_apply_provider_transition(%State{managed: %{effects: module}} = state, assignment, target)
        when is_atom(module) and is_map(assignment) and is_atom(target) do
-    with {:ok, intent_state, intent_id} <- ensure_managed_transition_intent(state, assignment, target),
-         true <- Code.ensure_loaded?(module) and function_exported?(module, :transition, 3) do
+    with true <- Code.ensure_loaded?(module) and function_exported?(module, :transition, 3),
+         {:ok, intent_state, intent_id} <- ensure_managed_transition_intent(state, assignment, target) do
       context = %{
         binding: intent_state.managed.data[:binding],
         process_stopped: not Map.has_key?(intent_state.running, assignment.assignment_id)
