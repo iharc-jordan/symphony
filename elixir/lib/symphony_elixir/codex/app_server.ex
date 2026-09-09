@@ -803,7 +803,28 @@ defmodule SymphonyElixir.Codex.AppServer do
       managed_path(managed, :checkout_helper_path)
     ]
     |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+    |> Enum.map(&Path.expand/1)
+    |> minimal_denied_paths()
+  end
+
+  defp minimal_denied_paths(paths) when is_list(paths) do
+    paths
     |> Enum.uniq()
+    |> Enum.sort_by(fn path -> {length(Path.split(path)), path} end)
+    |> Enum.reduce([], fn path, minimal_paths ->
+      if Enum.any?(minimal_paths, &path_covers?(&1, path)) do
+        minimal_paths
+      else
+        [path | minimal_paths]
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  defp path_covers?(ancestor, path) when is_binary(ancestor) and is_binary(path) do
+    ancestor_parts = Path.split(ancestor)
+    path_parts = Path.split(path)
+    Enum.take(path_parts, length(ancestor_parts)) == ancestor_parts
   end
 
   defp managed_codex_home do

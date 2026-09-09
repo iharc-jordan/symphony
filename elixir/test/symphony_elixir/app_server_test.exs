@@ -50,6 +50,27 @@ defmodule SymphonyElixir.AppServerTest do
         codex_command: "#{codex_binary} app-server"
       )
 
+      previous_codex_home = System.get_env("CODEX_HOME")
+      previous_gh_config_dir = System.get_env("GH_CONFIG_DIR")
+      codex_home = Path.join(Path.expand("~/.codex-other"), "nested")
+      gh_config_dir = Path.join(Path.expand("~/.config/codex-orchestration"), "gh-nested")
+      System.put_env("CODEX_HOME", codex_home)
+      System.put_env("GH_CONFIG_DIR", gh_config_dir)
+
+      on_exit(fn ->
+        if is_binary(previous_codex_home) do
+          System.put_env("CODEX_HOME", previous_codex_home)
+        else
+          System.delete_env("CODEX_HOME")
+        end
+
+        if is_binary(previous_gh_config_dir) do
+          System.put_env("GH_CONFIG_DIR", previous_gh_config_dir)
+        else
+          System.delete_env("GH_CONFIG_DIR")
+        end
+      end)
+
       issue = %Issue{
         id: "issue-managed",
         identifier: "MT-MANAGED",
@@ -105,8 +126,10 @@ defmodule SymphonyElixir.AppServerTest do
       assert filesystem[workspace] == "write"
       assert filesystem[Path.join(workspace, ".git")] == "write"
       assert filesystem[workspace_root] == "deny"
-      assert filesystem["~/.codex"] == "deny"
-      assert filesystem["~/.config/codex-orchestration"] == "deny"
+      assert filesystem[Path.expand("~/.codex")] == "deny"
+      assert filesystem[Path.expand("~/.config/codex-orchestration")] == "deny"
+      assert filesystem[codex_home] == "deny"
+      refute Map.has_key?(filesystem, gh_config_dir)
 
       payloads =
         trace_file
