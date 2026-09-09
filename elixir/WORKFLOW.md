@@ -20,6 +20,9 @@ polling:
 workspace:
   root: ~/code/symphony-workspaces
 hooks:
+  # Commands receive SYMPHONY_ISSUE_CONTEXT JSON: id, identifier, native_ref.
+  # Context is limited to 16 KiB; unavailable fields are null. Unsafe native
+  # references fail before the hook runs. Issue text and credentials are excluded.
   after_create: |
     git clone --depth 1 https://github.com/openai/symphony .
     if command -v mise >/dev/null 2>&1; then
