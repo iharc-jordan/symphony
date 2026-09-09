@@ -1972,8 +1972,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp retire_obsolete_managed_auto_intents(data, _intent), do: data
-
   defp retire_managed_auto_intents(intents, assignment_id, revision) do
     Enum.reduce(intents, {%{}, []}, fn {intent_id, intent}, {acc, retired} ->
       case retire_managed_auto_intent(intent, assignment_id, revision) do
