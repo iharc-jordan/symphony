@@ -46,6 +46,7 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
          :ok <- native_issue_only(before),
          :ok <- ensure_project_accepted(before, context),
          {:ok, status_check} <- fetch_exact_assignment(assignment),
+         :ok <- verify_material(status_check, assignment),
          :ok <- provider_status_is(status_check, :accepted),
          :ok <- close_native_item(status_check),
          {:ok, after_close} <- fetch_exact_assignment(assignment),
@@ -134,9 +135,8 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
     else
       false -> {:error, :invalid_assignment_identity, %{}}
       {:ok, []} -> {:error, :managed_native_item_not_found, %{}}
-      {:ok, _issues} -> {:error, :managed_native_item_ambiguous, %{}}
       {:error, reason} -> {:error, :managed_native_fetch_failed, %{reason: inspect(reason)}}
-      _ -> {:error, :managed_native_item_malformed, %{}}
+      {:error, code, details} -> {:error, code, details}
     end
   end
 
@@ -220,9 +220,6 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
       current_state == "closed" ->
         close_closed_issue(current_reason)
 
-      not is_binary(id) ->
-        {:error, :managed_native_issue_id_missing, %{}}
-
       true ->
         close_open_issue(id)
     end
@@ -235,7 +232,6 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
     case graphql(@close_issue_mutation, %{"issueId" => id}) do
       {:ok, body} -> close_response_ok(body, "Issue", id)
       {:error, reason} -> {:error, :managed_issue_close_failed, %{reason: inspect(reason)}}
-      _ -> {:error, :managed_issue_close_failed, %{}}
     end
   end
 
@@ -256,7 +252,7 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
     else
       false -> {:error, :managed_project_status_identity_missing, %{}}
       {:error, reason} -> {:error, :managed_project_status_failed, %{reason: inspect(reason)}}
-      _ -> {:error, :managed_project_status_failed, %{}}
+      {:error, code, details} -> {:error, code, details}
     end
   end
 
@@ -294,6 +290,5 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
   end
 
   defp native_value(issue, key), do: get_in(issue.native_ref || %{}, [Atom.to_string(key)])
-  defp text(map, key) when is_map(map), do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
-  defp text(_map, _key), do: nil
+  defp text(map, key), do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
 end
