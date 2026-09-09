@@ -77,22 +77,23 @@ defmodule SymphonyElixir.Managed.Journal do
         {:ok, latest}
 
       {next, records} when is_list(records) ->
-        case latest_record(records, latest) do
-          {:ok, state} -> read_records(name, next, state)
-          {:error, reason} -> {:error, reason}
-        end
+        continue_records(name, next, records, latest)
 
       {next, records, bad_bytes} when is_list(records) and bad_bytes == 0 ->
-        case latest_record(records, latest) do
-          {:ok, state} -> read_records(name, next, state)
-          {:error, reason} -> {:error, reason}
-        end
+        continue_records(name, next, records, latest)
 
       {_next, _records, bad_bytes} ->
         {:error, {:managed_journal_corrupt, bad_bytes}}
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp continue_records(name, next, records, latest) do
+    case latest_record(records, latest) do
+      {:ok, state} -> read_records(name, next, state)
+      {:error, reason} -> {:error, reason}
     end
   end
 

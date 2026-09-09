@@ -144,16 +144,13 @@ defmodule SymphonyElixir.Managed.Rules do
   end
 
   defp validate_review_intent(assignment, :accepted, args) do
-    with :ok <- phase_is(assignment.phase, :review),
-         :ok <- evidence_present(Map.get(args, :evidence, [])) do
-      :ok
+    with :ok <- phase_is(assignment.phase, :review) do
+      evidence_present(Map.get(args, :evidence, []))
     end
   end
 
   defp validate_review_intent(_assignment, disposition, args) when disposition in [:waiting, :rework, :blocked] do
-    if disposition == :blocked or disposition == :waiting or disposition == :rework do
-      present(text_value(args, :reason), :reason)
-    end
+    present(text_value(args, :reason), :reason)
   end
 
   defp validate_review_intent(_assignment, disposition, _args), do: {:error, :invalid_disposition, %{disposition: disposition}}
@@ -306,15 +303,19 @@ defmodule SymphonyElixir.Managed.Rules do
     if state.binding == binding do
       :ok
     else
-      case Enum.find(state.assignments, fn {_id, assignment} ->
-             is_map(assignment) and phase(assignment[:phase]) not in @terminal_phases
-           end) do
-        nil ->
-          :ok
+      binding_rebind_conflict(state)
+    end
+  end
 
-        {assignment_id, assignment} ->
-          {:error, :binding_in_use, %{assignment_id: assignment_id, phase: phase(assignment[:phase])}}
-      end
+  defp binding_rebind_conflict(state) do
+    case Enum.find(state.assignments, fn {_id, assignment} ->
+           is_map(assignment) and phase(assignment[:phase]) not in @terminal_phases
+         end) do
+      nil ->
+        :ok
+
+      {assignment_id, assignment} ->
+        {:error, :binding_in_use, %{assignment_id: assignment_id, phase: phase(assignment[:phase])}}
     end
   end
 
@@ -363,7 +364,9 @@ defmodule SymphonyElixir.Managed.Rules do
 
     with :ok <- present(reason, :reason),
          :ok <- phase_is(assignment.phase, :active) do
-      {:ok, :waiting, %{blocked_reason: reason, board_state: :waiting, stop_pending: true}, %{operation: :interrupt, reason: reason}}
+      {:ok, :waiting,
+       %{blocked_reason: reason, board_state: :waiting, stop_pending: true},
+       %{operation: :interrupt, reason: reason}}
     end
   end
 
@@ -373,7 +376,9 @@ defmodule SymphonyElixir.Managed.Rules do
     if assignment.phase in @terminal_phases do
       {:error, :already_terminal, %{phase: assignment.phase}}
     else
-      {:ok, :cancelled, %{disposition_reason: reason, board_state: :cancelled, stop_pending: true}, %{operation: :cancel, reason: reason}}
+      {:ok, :cancelled,
+       %{disposition_reason: reason, board_state: :cancelled, stop_pending: true},
+       %{operation: :cancel, reason: reason}}
     end
   end
 
@@ -384,31 +389,48 @@ defmodule SymphonyElixir.Managed.Rules do
 
     cond do
       disposition == :accepted ->
-        with :ok <- phase_is(assignment.phase, :review),
-             :ok <- provider_phase_is(provider_state, :review),
-             :ok <- evidence_present(evidence),
-             :ok <- dependencies_accepted(assignment, state),
-             :ok <- external_effects_reconciled(context) do
-          {:ok, :accepted, %{board_state: :accepted, evidence: normalize_evidence(evidence), issue_close: :ok}, %{operation: :review, disposition: :accepted, issue_close: :ok}}
-        end
+        review_accepted(assignment, provider_state, evidence, state, context)
 
       disposition in [:waiting, :rework] ->
-        reason = text_value(args, :reason)
-
-        with :ok <- present(reason, :reason) do
-          next_phase = if disposition == :waiting, do: :waiting, else: :ready
-          {:ok, next_phase, %{board_state: next_phase, disposition_reason: reason}, %{operation: :review, disposition: disposition, reason: reason}}
-        end
+        review_deferred(disposition, args)
 
       disposition == :blocked ->
-        reason = text_value(args, :reason)
-
-        with :ok <- present(reason, :reason) do
-          {:ok, :waiting, %{board_state: :waiting, blocked_reason: reason}, %{operation: :review, disposition: :blocked, reason: reason}}
-        end
+        review_blocked(args)
 
       true ->
         {:error, :invalid_disposition, %{disposition: disposition}}
+    end
+  end
+
+  defp review_accepted(assignment, provider_state, evidence, state, context) do
+    with :ok <- phase_is(assignment.phase, :review),
+         :ok <- provider_phase_is(provider_state, :review),
+         :ok <- evidence_present(evidence),
+         :ok <- dependencies_accepted(assignment, state),
+         :ok <- external_effects_reconciled(context) do
+      {:ok, :accepted,
+       %{board_state: :accepted, evidence: normalize_evidence(evidence), issue_close: :ok},
+       %{operation: :review, disposition: :accepted, issue_close: :ok}}
+    end
+  end
+
+  defp review_deferred(disposition, args) do
+    reason = text_value(args, :reason)
+
+    with :ok <- present(reason, :reason) do
+      next_phase = if disposition == :waiting, do: :waiting, else: :ready
+
+      {:ok, next_phase, %{board_state: next_phase, disposition_reason: reason},
+       %{operation: :review, disposition: disposition, reason: reason}}
+    end
+  end
+
+  defp review_blocked(args) do
+    reason = text_value(args, :reason)
+
+    with :ok <- present(reason, :reason) do
+      {:ok, :waiting, %{board_state: :waiting, blocked_reason: reason},
+       %{operation: :review, disposition: :blocked, reason: reason}}
     end
   end
 
@@ -423,7 +445,14 @@ defmodule SymphonyElixir.Managed.Rules do
          :ok <- positive(project_number, :project_number),
          {:ok, options} <- status_options(project),
          {:ok, repositories} <- repository_allowlist(project) do
-      {:ok, %{project_id: project_id, project_number: project_number, status_field_id: status_field_id, status_options: options, repositories: repositories}}
+      {:ok,
+       %{
+         project_id: project_id,
+         project_number: project_number,
+         status_field_id: status_field_id,
+         status_options: options,
+         repositories: repositories
+       }}
     end
   end
 
@@ -468,12 +497,23 @@ defmodule SymphonyElixir.Managed.Rules do
     repository = text_value(args, :repository)
     issue_number = number_value(args, :issue_number)
     base_commit = text_value(args, :base_commit)
-    board_state = args |> Map.get(:board_state, Map.get(args, "board_state", Map.get(args, :phase, Map.get(args, "phase", "READY")))) |> phase()
-    route = Map.get(args, :route, Map.get(args, "route", %{model: "gpt-5.6-luna", effort: "xhigh"}))
+
+    board_state =
+      args
+      |> Map.get(:board_state, Map.get(args, "board_state", Map.get(args, :phase, Map.get(args, "phase", "READY"))))
+      |> phase()
+
+    route =
+      Map.get(args, :route, Map.get(args, "route", %{model: "gpt-5.6-luna", effort: "xhigh"}))
+
     resources = Map.get(args, :resources, Map.get(args, "resources", []))
     dependencies = Map.get(args, :dependencies, Map.get(args, "dependencies", []))
     project_item_id = text_value(args, :project_item_id) || text_value(args, :native_project_item_id) || assignment_id
-    native_issue_id = text_value(args, :native_issue_id) || text_value(args, :issue_id) || text_value(args, :issue_node_id)
+
+    native_issue_id =
+      text_value(args, :native_issue_id) ||
+        text_value(args, :issue_id) ||
+        text_value(args, :issue_node_id)
 
     native_repository_id =
       text_value(args, :native_repository_id) ||
@@ -537,40 +577,43 @@ defmodule SymphonyElixir.Managed.Rules do
   defp revision_changes(args) do
     changes = Map.get(args, :changes, Map.get(args, "changes", %{}))
 
-    if is_map(changes) do
-      unknown = Map.keys(changes) |> Enum.reject(&(&1 in @revision_change_keys))
+    cond do
+      not is_map(changes) ->
+        {:error, :changes_must_be_map, %{}}
 
-      if unknown != [] do
+      (unknown = Map.keys(changes) |> Enum.reject(&(&1 in @revision_change_keys))) != [] ->
         {:error, :invalid_argument, %{argument: :changes, fields: unknown}}
-      else
-        requirement_body = Map.get(changes, :requirements)
-        fingerprint = text_value(changes, :requirements_fingerprint)
-        requirement_revision = Map.get(changes, :requirements_revision)
-        escalation_reason = text_value(changes, :escalation_reason)
-        base_commit = text_value(changes, :base_commit)
-        resources = Map.get(changes, :resources)
-        dependencies = Map.get(changes, :dependencies)
 
-        with :ok <- optional_requirements(requirement_body, fingerprint),
-             :ok <- optional_text(base_commit, :base_commit),
-             :ok <- optional_route(changes),
-             :ok <- optional_list_of_binaries(resources, :resources),
-             :ok <- optional_list_of_binaries(dependencies, :dependencies),
-             :ok <- optional_fingerprint(fingerprint),
-             :ok <- optional_requirement_revision(requirement_revision) do
-          sanitized =
-            changes
-            |> Map.take(@revision_change_keys -- [:requirements])
-            |> maybe_put(:base_commit, base_commit)
-            |> maybe_put(:requirements_fingerprint, fingerprint)
-            |> maybe_put(:requirements_revision, requirement_revision)
-            |> maybe_put(:escalation_reason, escalation_reason)
+      true ->
+        validate_and_sanitize_revision_changes(changes)
+    end
+  end
 
-          {:ok, sanitized}
-        end
-      end
-    else
-      {:error, :changes_must_be_map, %{}}
+  defp validate_and_sanitize_revision_changes(changes) do
+    requirement_body = Map.get(changes, :requirements)
+    fingerprint = text_value(changes, :requirements_fingerprint)
+    requirement_revision = Map.get(changes, :requirements_revision)
+    escalation_reason = text_value(changes, :escalation_reason)
+    base_commit = text_value(changes, :base_commit)
+    resources = Map.get(changes, :resources)
+    dependencies = Map.get(changes, :dependencies)
+
+    with :ok <- optional_requirements(requirement_body, fingerprint),
+         :ok <- optional_text(base_commit, :base_commit),
+         :ok <- optional_route(changes),
+         :ok <- optional_list_of_binaries(resources, :resources),
+         :ok <- optional_list_of_binaries(dependencies, :dependencies),
+         :ok <- optional_fingerprint(fingerprint),
+         :ok <- optional_requirement_revision(requirement_revision) do
+      sanitized =
+        changes
+        |> Map.take(@revision_change_keys -- [:requirements])
+        |> maybe_put(:base_commit, base_commit)
+        |> maybe_put(:requirements_fingerprint, fingerprint)
+        |> maybe_put(:requirements_revision, requirement_revision)
+        |> maybe_put(:escalation_reason, escalation_reason)
+
+      {:ok, sanitized}
     end
   end
 
