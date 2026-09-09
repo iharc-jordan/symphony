@@ -59,6 +59,62 @@ defmodule SymphonyElixir.HookContextTest do
     assert Jason.decode!(encoded) == %{"id" => nil, "identifier" => "MT-42", "native_ref" => nil}
   end
 
+  test "encodes string keyed identities and scalar metadata" do
+    issue = %{
+      "id" => true,
+      "identifier" => 42,
+      "native_ref" => %{"available" => true, "weight" => 1.5}
+    }
+
+    assert {:ok, encoded} = HookContext.encode(issue)
+
+    assert Jason.decode!(encoded) == %{
+             "id" => true,
+             "identifier" => 42,
+             "native_ref" => %{"available" => true, "weight" => 1.5}
+           }
+  end
+
+  test "sanitizes unsupported identity values to null" do
+    issue = %{id: self(), identifier: [:private], native_ref: nil}
+
+    assert {:ok, encoded} = HookContext.encode(issue)
+    assert Jason.decode!(encoded) == %{"id" => nil, "identifier" => nil, "native_ref" => nil}
+
+    assert {:ok, encoded} = HookContext.encode(%{id: 1.5})
+    assert Jason.decode!(encoded)["id"] == 1.5
+  end
+
+  test "encodes scalar and nested list native references" do
+    for value <- [true, 42, 1.5] do
+      assert {:ok, encoded} = HookContext.encode(%{native_ref: value})
+      assert Jason.decode!(encoded)["native_ref"] == value
+    end
+
+    issue = %{
+      native_ref: [
+        %{1 => "one", 2.5 => "two", "safe" => [true, 42, 1.5]}
+      ]
+    }
+
+    assert {:ok, encoded} = HookContext.encode(issue)
+
+    assert Jason.decode!(encoded)["native_ref"] == [
+             %{"1" => "one", "2.5" => "two", "safe" => [true, 42, 1.5]}
+           ]
+  end
+
+  test "rejects structs and invalid list children or map keys" do
+    assert {:error, {:invalid_native_ref, :non_json_value}} =
+             HookContext.encode(%{native_ref: %{__struct__: __MODULE__}})
+
+    assert {:error, {:invalid_native_ref, :non_json_value}} =
+             HookContext.encode(%{native_ref: [self()]})
+
+    assert {:error, {:invalid_native_ref, :non_json_key}} =
+             HookContext.encode(%{native_ref: %{self() => "private"}})
+  end
+
   test "rejects forbidden fields anywhere in an opaque native reference" do
     for key <- ["issue_body", "user_info", "access_token", "refresh_token", "private_key_file", "command"] do
       issue = %{id: "issue-1", identifier: "MT-1", native_ref: %{key => "sensitive"}}
