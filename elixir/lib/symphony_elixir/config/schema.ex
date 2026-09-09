@@ -215,7 +215,7 @@ defmodule SymphonyElixir.Config.Schema do
       )
       |> validate_required([:command])
       |> validate_change(:command, fn :command, command ->
-        if command != "" and String.trim(command) == "" do
+        if String.trim(command) == "" do
           [command: "can't be blank"]
         else
           []
