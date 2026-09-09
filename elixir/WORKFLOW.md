@@ -1,5 +1,8 @@
 ---
 tracker:
+  # For GitHub Projects use kind: github_projects and provider owner_type,
+  # owner, project_number, and optional status_field_name (default: Status).
+  # active_states and terminal_states must match the Project status options.
   kind: linear
   provider:
     project_slug: "symphony-0c79b11b75ea"
