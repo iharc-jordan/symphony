@@ -4,13 +4,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH, Workflow}
 
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
   @thread_resume_id 4
   @turn_interrupt_id 5
+  @config_read_id 6
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @managed_default_model "gpt-5.6-luna"
@@ -389,6 +390,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, managed_config} <- managed_config(opts),
+         {:ok, managed_config} <- prepare_managed_config(expanded_workspace, managed_config),
          {:ok, resume_thread_id} <- resume_thread_id(opts),
          :ok <- validate_managed_worker_host(worker_host, managed_config),
          :ok <- validate_managed_runtime(worker_host, managed_config),
@@ -674,7 +676,12 @@ defmodule SymphonyElixir.Codex.AppServer do
         %{permissions_profile: profile} ->
           managed_process_wrapper(
             workspace,
-            launch_command <> managed_cli_overrides(workspace, profile),
+            launch_command <>
+              managed_cli_overrides(
+                workspace,
+                profile,
+                Map.get(managed_config, :mcp_server_names, [])
+              ),
             managed_config
           )
 
@@ -697,7 +704,12 @@ defmodule SymphonyElixir.Codex.AppServer do
     launch_command =
       case managed_config do
         %{permissions_profile: profile} ->
-          launch_command <> managed_cli_overrides(workspace, profile)
+          launch_command <>
+            managed_cli_overrides(
+              workspace,
+              profile,
+              Map.get(managed_config, :mcp_server_names, [])
+            )
 
         nil ->
           launch_command
@@ -725,7 +737,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     |> Enum.join(" ")
   end
 
-  defp managed_cli_overrides(workspace, profile) do
+  defp managed_cli_overrides(workspace, profile, mcp_server_names) do
     filesystem =
       managed_filesystem_paths(workspace)
       |> Enum.map(&{&1, "deny"})
@@ -749,8 +761,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     config_overrides =
       config_overrides ++
         ["agents.enabled=false"] ++
-        (managed_mcp_server_names(workspace)
-         |> Enum.map(&"mcp_servers.#{&1}.enabled=false"))
+        Enum.map(mcp_server_names, fn name ->
+          "mcp_servers.#{toml_key(name)}.enabled=false"
+        end)
 
     (feature_overrides ++ Enum.flat_map(config_overrides, &["-c", shell_escape(&1)]))
     |> Enum.join(" ")
@@ -772,45 +785,482 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     [
       "~/.codex",
+      managed_codex_home(),
       "~/.ssh",
       "~/.config/gh",
       "~/.config/codex-orchestration",
       "~/.local/state/codex-orchestration",
       System.get_env("GH_CONFIG_DIR"),
       Config.local_workspace_root(),
+      Workflow.workflow_file_path(),
       managed_path(managed, :control_token_file),
-      managed_path(managed, :journal_path)
+      managed_path(managed, :journal_path),
+      managed_path(managed, :checkout_policy_file),
+      managed_path(managed, :checkout_helper_path)
     ]
     |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
     |> Enum.uniq()
   end
 
+  defp managed_codex_home do
+    case System.get_env("CODEX_HOME") do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          value -> Path.expand(value)
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp prepare_managed_config(_workspace, nil), do: {:ok, nil}
+
+  defp prepare_managed_config(workspace, managed_config) when is_binary(workspace) do
+    with {:ok, names} <- managed_mcp_server_names(workspace) do
+      {:ok, Map.put(managed_config, :mcp_server_names, names)}
+    end
+  end
+
   defp managed_mcp_server_names(workspace) when is_binary(workspace) do
+    workspace
+    |> managed_config_paths()
+    |> Enum.reduce_while({:ok, MapSet.new()}, fn path, {:ok, names} ->
+      case mcp_server_names_from_config(path) do
+        :absent ->
+          {:cont, {:ok, names}}
+
+        {:ok, path_names} ->
+          names = Enum.reduce(path_names, names, &MapSet.put(&2, &1))
+          {:cont, {:ok, names}}
+
+        {:error, reason} ->
+          {:halt, {:error, {:managed_mcp_config_unreadable, path, reason}}}
+      end
+    end)
+    |> case do
+      {:ok, names} -> {:ok, names |> MapSet.to_list() |> Enum.sort()}
+      error -> error
+    end
+  end
+
+  defp managed_config_paths(workspace) when is_binary(workspace) do
     codex_home = System.get_env("CODEX_HOME")
 
-    config_paths =
-      [
-        if(is_binary(codex_home) and String.trim(codex_home) != "", do: codex_home, else: Path.expand("~/.codex")),
-        Path.join(workspace, ".codex")
-      ]
-      |> Enum.map(&Path.join(&1, "config.toml"))
-      |> Enum.uniq()
+    user_config =
+      if is_binary(codex_home) and String.trim(codex_home) != "" do
+        Path.join(Path.expand(codex_home), "config.toml")
+      else
+        Path.expand("~/.codex/config.toml")
+      end
 
-    config_paths
-    |> Enum.flat_map(&mcp_server_names_from_config/1)
-    |> Enum.uniq()
+    project_configs =
+      workspace
+      |> Path.expand()
+      |> ancestor_paths()
+      |> Enum.map(&Path.join([&1, ".codex", "config.toml"]))
+
+    [user_config | project_configs] |> Enum.uniq()
+  end
+
+  defp ancestor_paths(path) when is_binary(path) do
+    path = Path.expand(path)
+    do_ancestor_paths(path, [])
+  end
+
+  defp do_ancestor_paths(path, acc) do
+    parent = Path.dirname(path)
+
+    if parent == path do
+      Enum.reverse([path | acc])
+    else
+      do_ancestor_paths(parent, [path | acc])
+    end
   end
 
   defp mcp_server_names_from_config(path) when is_binary(path) do
-    case File.read(path) do
-      {:ok, contents} ->
-        Regex.scan(~r/^\[mcp_servers\.("(?:\\.|[^"])+"|[A-Za-z0-9_-]+)(?:\..*)?\]\s*$/m, contents, capture: :all_but_first)
-        |> Enum.map(&List.first/1)
+    case File.stat(path) do
+      {:error, reason} when reason in [:enoent, :enotdir] ->
+        :absent
 
-      _ ->
-        []
+      {:error, reason} ->
+        {:error, reason}
+
+      {:ok, %{type: :regular}} ->
+        case File.read(path) do
+          {:ok, contents} -> parse_mcp_config(contents)
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:ok, _file_info} ->
+        {:error, :not_a_regular_file}
     end
   end
+
+  defp parse_mcp_config(contents) when is_binary(contents) do
+    with {:ok, statements} <- toml_logical_statements(contents) do
+      scan_mcp_statements(statements, [], MapSet.new())
+    end
+  end
+
+  defp scan_mcp_statements([], _current_path, names),
+    do: {:ok, names |> MapSet.to_list() |> Enum.sort()}
+
+  defp scan_mcp_statements([statement | rest], current_path, names) do
+    statement = String.trim(statement)
+
+    cond do
+      statement == "" ->
+        scan_mcp_statements(rest, current_path, names)
+
+      String.starts_with?(statement, "[") ->
+        case parse_toml_header(statement) do
+          {:ok, path} ->
+            names = add_mcp_path_name(names, path)
+            scan_mcp_statements(rest, path, names)
+
+          {:error, reason} ->
+            if String.contains?(statement, "mcp_servers") do
+              {:error, {:invalid_mcp_config, reason}}
+            else
+              scan_mcp_statements(rest, current_path, names)
+            end
+        end
+
+      true ->
+        case split_toml_assignment(statement) do
+          {:ok, key, value} ->
+            case toml_key_segments(key) do
+              {:ok, key_path} ->
+                full_path = current_path ++ key_path
+
+                with {:ok, names} <- add_mcp_assignment(names, full_path, value) do
+                  scan_mcp_statements(rest, current_path, names)
+                end
+
+              {:error, reason} ->
+                if String.contains?(statement, "mcp_servers") or mcp_path?(current_path) do
+                  {:error, {:invalid_mcp_config, reason}}
+                else
+                  scan_mcp_statements(rest, current_path, names)
+                end
+            end
+
+          :error ->
+            if String.contains?(statement, "mcp_servers") or mcp_path?(current_path) do
+              {:error, {:invalid_mcp_config, :invalid_assignment}}
+            else
+              scan_mcp_statements(rest, current_path, names)
+            end
+        end
+    end
+  end
+
+  defp add_mcp_path_name(names, ["mcp_servers", name | _]), do: MapSet.put(names, name)
+  defp add_mcp_path_name(names, _path), do: names
+
+  defp add_mcp_assignment(names, ["mcp_servers"], value),
+    do: parse_mcp_inline_table(value, names)
+
+  defp add_mcp_assignment(names, ["mcp_servers", name | _], _value),
+    do: {:ok, MapSet.put(names, name)}
+
+  defp add_mcp_assignment(names, _path, _value), do: {:ok, names}
+
+  defp mcp_path?(["mcp_servers" | _]), do: true
+  defp mcp_path?(_path), do: false
+
+  defp parse_mcp_inline_table(value, names) do
+    value = String.trim(value)
+
+    if String.starts_with?(value, "{") and String.ends_with?(value, "}") do
+      value
+      |> String.slice(1, byte_size(value) - 2)
+      |> split_toml_top_level(?,)
+      |> Enum.reduce_while({:ok, names}, fn entry, {:ok, names} ->
+        entry = String.trim(entry)
+
+        if entry == "" do
+          {:cont, {:ok, names}}
+        else
+          with {:ok, key, _entry_value} <- split_toml_assignment(entry),
+               {:ok, [name | _]} <- toml_key_segments(key) do
+            {:cont, {:ok, MapSet.put(names, name)}}
+          else
+            _ -> {:halt, {:error, {:invalid_mcp_config, :invalid_inline_table}}}
+          end
+        end
+      end)
+    else
+      {:error, {:invalid_mcp_config, :mcp_servers_not_table}}
+    end
+  end
+
+  defp parse_toml_header(statement) do
+    statement = String.trim(statement)
+
+    cond do
+      String.starts_with?(statement, "[[") ->
+        {:error, :array_header_not_supported}
+
+      String.starts_with?(statement, "[") and String.ends_with?(statement, "]") ->
+        statement
+        |> String.slice(1, byte_size(statement) - 2)
+        |> then(fn inner ->
+          result = toml_key_segments(inner)
+          result
+        end)
+
+      true ->
+        {:error, :invalid_header}
+    end
+  end
+
+  defp toml_logical_statements(contents) when is_binary(contents) do
+    result =
+      contents
+      |> String.split("\n")
+      |> Enum.reduce_while({:ok, {[], "", 0}}, fn line, {:ok, {statements, current, _depth}} ->
+        line = line |> strip_toml_comment() |> String.trim()
+
+        if line == "" and current == "" do
+          {:cont, {:ok, {statements, current, 0}}}
+        else
+          statement = if current == "", do: line, else: current <> "\n" <> line
+          depth = toml_delimiter_balance(statement)
+
+          if depth < 0 do
+            {:halt, {:error, :unbalanced_delimiters}}
+          else
+            if depth == 0 do
+              {:cont, {:ok, {[statement | statements], "", 0}}}
+            else
+              {:cont, {:ok, {statements, statement, depth}}}
+            end
+          end
+        end
+      end)
+
+    case result do
+      {:ok, {statements, "", 0}} -> {:ok, Enum.reverse(statements)}
+      {:ok, {_statements, _current, _depth}} -> {:error, :unterminated_value}
+      error -> error
+    end
+  end
+
+  defp strip_toml_comment(line) when is_binary(line) do
+    {chars, _quote, _escaped} =
+      line
+      |> String.to_charlist()
+      |> Enum.reduce_while({[], nil, false}, fn char, {acc, quote, escaped} ->
+        cond do
+          quote == ?" and escaped ->
+            {:cont, {[char | acc], quote, false}}
+
+          quote == ?" and char == ?\\ ->
+            {:cont, {[char | acc], quote, true}}
+
+          quote != nil and char == quote ->
+            {:cont, {[char | acc], nil, false}}
+
+          quote == nil and char in [?", ?'] ->
+            {:cont, {[char | acc], char, false}}
+
+          quote == nil and char == ?# ->
+            {:halt, {acc, quote, escaped}}
+
+          true ->
+            {:cont, {[char | acc], quote, false}}
+        end
+      end)
+
+    chars |> Enum.reverse() |> List.to_string()
+  end
+
+  defp toml_delimiter_balance(statement) when is_binary(statement) do
+    {_quote, _escaped, depth} =
+      statement
+      |> String.to_charlist()
+      |> Enum.reduce({nil, false, 0}, fn char, {quote, escaped, depth} ->
+        cond do
+          quote == ?" and escaped ->
+            {quote, false, depth}
+
+          quote == ?" and char == ?\\ ->
+            {quote, true, depth}
+
+          quote != nil and char == quote ->
+            {nil, false, depth}
+
+          quote == nil and char in [?", ?'] ->
+            {char, false, depth}
+
+          quote == nil and char in [?{, ?[] ->
+            {quote, escaped, depth + 1}
+
+          quote == nil and char in [?}, ?]] ->
+            {quote, escaped, depth - 1}
+
+          true ->
+            {quote, escaped, depth}
+        end
+      end)
+
+    depth
+  end
+
+  defp split_toml_assignment(statement) when is_binary(statement) do
+    do_split_toml_assignment(String.to_charlist(statement), [], nil, false, 0)
+  end
+
+  defp do_split_toml_assignment([], _left, _quote, _escaped, _depth), do: :error
+
+  defp do_split_toml_assignment([?= | rest], left, nil, false, 0),
+    do: {:ok, left |> Enum.reverse() |> List.to_string(), rest |> List.to_string()}
+
+  defp do_split_toml_assignment([char | rest], left, quote, escaped, depth) do
+    cond do
+      quote == ?" and escaped ->
+        do_split_toml_assignment(rest, [char | left], quote, false, depth)
+
+      quote == ?" and char == ?\\ ->
+        do_split_toml_assignment(rest, [char | left], quote, true, depth)
+
+      quote != nil and char == quote ->
+        do_split_toml_assignment(rest, [char | left], nil, false, depth)
+
+      quote == nil and char in [?", ?'] ->
+        do_split_toml_assignment(rest, [char | left], char, false, depth)
+
+      quote == nil and char in [?{, ?[] ->
+        do_split_toml_assignment(rest, [char | left], quote, false, depth + 1)
+
+      quote == nil and char in [?}, ?]] ->
+        do_split_toml_assignment(rest, [char | left], quote, false, max(depth - 1, 0))
+
+      true ->
+        do_split_toml_assignment(rest, [char | left], quote, false, depth)
+    end
+  end
+
+  defp split_toml_top_level(value, separator) when is_binary(value) do
+    do_split_toml_top_level(String.to_charlist(value), [], [], nil, false, 0, separator)
+  end
+
+  defp do_split_toml_top_level([], current, entries, _quote, _escaped, _depth, _separator),
+    do: Enum.reverse([current |> Enum.reverse() |> List.to_string() | entries])
+
+  defp do_split_toml_top_level([separator | rest], current, entries, nil, false, 0, separator) do
+    do_split_toml_top_level(rest, [], [current |> Enum.reverse() |> List.to_string() | entries], nil, false, 0, separator)
+  end
+
+  defp do_split_toml_top_level([char | rest], current, entries, quote, escaped, depth, separator) do
+    {quote, escaped, depth} =
+      cond do
+        quote == ?" and escaped ->
+          {quote, false, depth}
+
+        quote == ?" and char == ?\\ ->
+          {quote, true, depth}
+
+        quote != nil and char == quote ->
+          {nil, false, depth}
+
+        quote == nil and char in [?", ?'] ->
+          {char, false, depth}
+
+        quote == nil and char in [?{, ?[] ->
+          {quote, escaped, depth + 1}
+
+        quote == nil and char in [?}, ?]] ->
+          {quote, escaped, max(depth - 1, 0)}
+
+        true ->
+          {quote, false, depth}
+      end
+
+    do_split_toml_top_level(rest, [char | current], entries, quote, escaped, depth, separator)
+  end
+
+  defp toml_key_segments(key) when is_binary(key) do
+    parse_toml_key_segments(String.to_charlist(String.trim(key)), [])
+  end
+
+  defp parse_toml_key_segments(chars, segments) do
+    chars = Enum.drop_while(chars, &toml_space?/1)
+
+    case chars do
+      [] ->
+        if segments == [], do: {:error, :empty_key}, else: {:ok, Enum.reverse(segments)}
+
+      [?. | _rest] ->
+        {:error, :empty_key_segment}
+
+      [?" | rest] ->
+        with {:ok, value, rest} <- take_toml_quoted_key(rest, ?", [], false),
+             {:ok, rest} <- finish_toml_key_segment(rest) do
+          parse_toml_key_segments(rest, [value | segments])
+        end
+
+      [?' | rest] ->
+        with {:ok, value, rest} <- take_toml_quoted_key(rest, ?', [], false),
+             {:ok, rest} <- finish_toml_key_segment(rest) do
+          parse_toml_key_segments(rest, [value | segments])
+        end
+
+      _ ->
+        {segment, rest} = Enum.split_while(chars, fn char -> char != ?. and not toml_space?(char) end)
+        value = List.to_string(segment)
+
+        if segment != [] and String.match?(value, ~r/^[A-Za-z0-9_-]+$/) do
+          with {:ok, rest} <- finish_toml_key_segment(rest) do
+            parse_toml_key_segments(rest, [value | segments])
+          end
+        else
+          {:error, :invalid_key_segment}
+        end
+    end
+  end
+
+  defp finish_toml_key_segment(chars) do
+    chars = Enum.drop_while(chars, &toml_space?/1)
+
+    case chars do
+      [] -> {:ok, []}
+      [?. | rest] -> {:ok, rest}
+      _ -> {:error, :invalid_key_separator}
+    end
+  end
+
+  defp take_toml_quoted_key([], _quote, _acc, _escaped), do: {:error, :unterminated_key}
+
+  defp take_toml_quoted_key([char | rest], quote, acc, escaped) do
+    cond do
+      quote == ?" and escaped ->
+        take_toml_quoted_key(rest, quote, [toml_basic_key_escape(char) | acc], false)
+
+      quote == ?" and char == ?\\ ->
+        take_toml_quoted_key(rest, quote, acc, true)
+
+      char == quote ->
+        {:ok, acc |> Enum.reverse() |> List.to_string(), rest}
+
+      true ->
+        take_toml_quoted_key(rest, quote, [char | acc], false)
+    end
+  end
+
+  defp toml_basic_key_escape(?b), do: ?\b
+  defp toml_basic_key_escape(?t), do: ?\t
+  defp toml_basic_key_escape(?n), do: ?\n
+  defp toml_basic_key_escape(?f), do: ?\f
+  defp toml_basic_key_escape(?r), do: ?\r
+  defp toml_basic_key_escape(?"), do: ?"
+  defp toml_basic_key_escape(?\\), do: ?\\
+  defp toml_basic_key_escape(char), do: char
+
+  defp toml_space?(char), do: char in [32, ?\t, ?\r]
 
   defp managed_path(managed, key) when is_map(managed), do: Map.get(managed, key)
   defp managed_path(_managed, _key), do: nil
@@ -871,6 +1321,10 @@ defmodule SymphonyElixir.Codex.AppServer do
           nil
       end
     end
+  end
+
+  defp toml_key(value) when is_binary(value) do
+    if String.match?(value, ~r/^[A-Za-z0-9_-]+$/), do: value, else: toml_string(value)
   end
 
   defp toml_string(value) when is_binary(value) do
@@ -948,7 +1402,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           end
 
         _ ->
-          %{}
+          managed_scope_metadata(worker_host, managed_config, workspace)
       end
 
     case worker_host do
@@ -957,6 +1411,19 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp managed_scope_metadata(nil, managed_config, workspace) when is_map(managed_config) do
+    unit = systemd_unit_for_managed(workspace, managed_config)
+
+    %{
+      containment: :unverified,
+      containment_error: :os_pid_unavailable,
+      systemd_unit: unit,
+      systemd_unit_identity: managed_unit_identity(managed_config),
+      parent_systemd_service: systemd_parent_service_unit()
+    }
+  end
+
+  defp managed_scope_metadata(_worker_host, _managed_config, _workspace), do: %{}
   defp validate_managed_metadata(_metadata, nil), do: :ok
 
   defp validate_managed_metadata(
@@ -1194,18 +1661,45 @@ defmodule SymphonyElixir.Codex.AppServer do
        ) do
     case send_initialize(port) do
       :ok ->
-        start_thread_or_resume(
-          port,
-          workspace,
-          session_policies,
-          dynamic_tool_binding,
-          wire_route,
-          resume_thread_id,
-          permissions_profile
-        )
+        with :ok <- validate_managed_mcp_configuration(port, workspace, permissions_profile) do
+          start_thread_or_resume(
+            port,
+            workspace,
+            session_policies,
+            dynamic_tool_binding,
+            wire_route,
+            resume_thread_id,
+            permissions_profile
+          )
+        end
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp validate_managed_mcp_configuration(_port, _workspace, nil), do: :ok
+
+  defp validate_managed_mcp_configuration(port, workspace, _permissions_profile)
+       when is_port(port) and is_binary(workspace) do
+    send_message(port, %{
+      "method" => "config/read",
+      "id" => @config_read_id,
+      "params" => %{"cwd" => workspace, "includeLayers" => true}
+    })
+
+    case await_response(port, @config_read_id) do
+      {:ok, %{"config" => %{"mcp_servers" => mcp_servers}}} when is_map(mcp_servers) ->
+        case Enum.find(mcp_servers, fn {_name, config} -> Map.get(config, "enabled", true) != false end) do
+          nil -> :ok
+          {name, _config} -> {:error, {:managed_mcp_server_enabled, name}}
+        end
+
+      {:ok, _response} ->
+        {:error, {:managed_mcp_configuration_unavailable, :invalid_response}}
+
+      {:error, reason} ->
+        {:error, {:managed_mcp_configuration_read_failed, reason}}
     end
   end
 
@@ -2096,7 +2590,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp stop_port(port, metadata) when is_port(port) do
-    stop_result = stop_recorded_metadata(metadata)
+    stop_result =
+      if managed_process_metadata?(metadata) do
+        stop_recorded_metadata(metadata)
+      else
+        :ok
+      end
 
     close_result = close_port(port)
 
@@ -2108,6 +2607,9 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:process_stop_unconfirmed, reason}}
     end
   end
+
+  defp managed_process_metadata?(%{systemd_unit: unit}) when is_binary(unit) and unit != "", do: true
+  defp managed_process_metadata?(_metadata), do: false
 
   defp stop_recorded_metadata(%{
          containment: :systemd_scope,
@@ -2127,6 +2629,10 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp stop_recorded_metadata(%{containment: :systemd_scope}),
     do: {:error, :missing_systemd_invocation_identity}
 
+  defp stop_recorded_metadata(%{containment: :unverified, systemd_unit: unit} = metadata)
+       when is_binary(unit) and unit != "",
+       do: stop_unverified_systemd_scope(unit, metadata)
+
   defp stop_recorded_metadata(%{containment: :unverified} = metadata),
     do: {:error, {:process_stop_unconfirmed, Map.get(metadata, :containment_error)}}
 
@@ -2135,12 +2641,26 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp stop_recorded_metadata(_metadata), do: {:error, :recorded_process_stop_unsupported}
 
+  defp stop_unverified_systemd_scope(unit, metadata) do
+    case systemd_scope_identity(unit) do
+      {:error, :not_found} ->
+        :ok
+
+      {:ok, _identity} ->
+        {:error, {:process_stop_unconfirmed, Map.get(metadata, :containment_error)}}
+
+      {:error, reason} ->
+        {:error, {:process_stop_unconfirmed, reason}}
+    end
+  end
+
   defp stop_systemd_scope(unit, %{pid: pid} = identity, invocation_id)
        when is_binary(unit) and is_integer(pid) and is_binary(invocation_id) do
     case process_identity(pid) do
       {:ok, ^identity} ->
         case verify_systemd_scope_identity(unit, invocation_id) do
           :ok -> terminate_systemd_scope(unit, identity, invocation_id)
+          {:error, :not_found} -> :ok
           {:error, reason} -> {:error, reason}
         end
 

@@ -27,12 +27,14 @@ defmodule SymphonyElixir.AppServerTest do
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
         case "$count" in
           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
-          2) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-managed"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
-          3) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-managed"}}}' ;;
-          4)
+          2) ;;
+          3) printf '%s\\n' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
+          4) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-managed"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-managed"}}}'
             printf '%s\\n' '{"id":99,"method":"item/tool/call","params":{"tool":"orchestration_report","arguments":{"kind":"checkpoint","report_id":"report-1","summary":"validated","evidence":[{"test":"green"}]}}}'
             ;;
-          5)
+          6)
             printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-managed","turn":{"id":"turn-managed","status":"completed","items":[]}}}'
             exit 0
             ;;
@@ -142,13 +144,14 @@ defmodule SymphonyElixir.AppServerTest do
         case "$count" in
           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
           2) ;;
-          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-terminal"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
-          4)
+          3) printf '%s\\n' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
+          4) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-terminal"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
+          5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-terminal"}}}'
             printf '%s\\n' '{"id":99,"method":"item/tool/call","params":{"tool":"orchestration_report","arguments":{"kind":"result","report_id":"report-terminal","summary":"done","evidence":[]}}}'
             ;;
-          5) ;;
-          6) exit 0 ;;
+          6) ;;
+          7) exit 0 ;;
         esac
       done
       """)
@@ -282,9 +285,13 @@ defmodule SymphonyElixir.AppServerTest do
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
         case "$count" in
           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
-          2) printf '%s\\n' '{"id":4,"result":{"thread":{"id":"thread-resume"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
-          3) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-resume"}}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
           4)
+            printf '%s\\n' '{"id":4,"result":{"thread":{"id":"thread-resume"},"model":"gpt-5.6-luna","reasoningEffort":null}}'
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-resume"}}}'
+            ;;
+          5)
             printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-resume","turn":{"id":"turn-resume","status":"completed","items":[]}}}'
             exit 0
             ;;
@@ -361,6 +368,7 @@ defmodule SymphonyElixir.AppServerTest do
     while IFS= read -r line; do
       case "$line" in
         *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+        *'"method":"config/read"'*) printf '%s\\n' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
         *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-stale"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
       esac
     done
@@ -448,6 +456,7 @@ defmodule SymphonyElixir.AppServerTest do
     while IFS= read -r line; do
       case "$line" in
         *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+        *'"method":"config/read"'*) printf '%s\\n' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
         *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-recorded"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
       esac
     done
@@ -549,7 +558,10 @@ defmodule SymphonyElixir.AppServerTest do
           case "$count" in
             1) printf '%s
         ' '{"id":1,"result":{}}' ;;
-            2) printf '%s
+            2) ;;
+            3) printf '%s
+        ' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
+            4) printf '%s
         ' '{"id":#{response_id},"result":{"thread":{"id":"thread-model"}#{extra_response}}}' ;;
             *) exit 0 ;;
           esac
