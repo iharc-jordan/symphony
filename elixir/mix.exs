@@ -79,6 +79,7 @@ defmodule SymphonyElixir.MixProject do
       {:req, "~> 0.7.4"},
       {:jason, "~> 1.4.5"},
       {:yaml_elixir, "~> 2.12"},
+      {:toml_elixir, "3.1.0"},
       {:solid, "~> 1.3"},
       {:ecto, "~> 3.14"},
       {:burrito, "~> 1.5", only: :prod, runtime: false},
