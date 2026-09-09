@@ -1949,6 +1949,7 @@ defmodule SymphonyElixir.Orchestrator do
        when is_map(request) do
     if map_value(request, :operation) in [:revise, "revise"] do
       revision = get_in(data, [:assignments, assignment_id, :revision])
+      request_id = map_value(request, :request_id)
 
       {intents, retired_ids} =
         retire_managed_auto_intents(data[:effect_intents] || %{}, assignment_id, revision)
@@ -1961,7 +1962,7 @@ defmodule SymphonyElixir.Orchestrator do
         append_managed_event(data, %{
           operation: :provider_transition_intents_retired,
           assignment_id: assignment_id,
-          request_id: request.request_id,
+          request_id: request_id,
           intent_ids: Enum.reverse(retired_ids),
           revision: revision
         })
