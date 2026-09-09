@@ -35,6 +35,9 @@ Check out [elixir/README.md](elixir/README.md) for instructions on how to set up
 and run the Elixir-based Symphony implementation. You can also ask your favorite coding agent to
 help with the setup:
 
+The release build recipe and its pinned Linux runtime requirements are documented in the
+[Elixir implementation guide](elixir/README.md#burrito-releases).
+
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 

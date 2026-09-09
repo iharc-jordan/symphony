@@ -113,10 +113,17 @@ defmodule SymphonyElixir.MixProject do
             macos_arm64: [os: :darwin, cpu: :aarch64],
             macos_x86_64: [os: :darwin, cpu: :x86_64],
             linux_arm64: [os: :linux, cpu: :aarch64],
-            linux_x86_64: [os: :linux, cpu: :x86_64]
+            linux_x86_64: [os: :linux, cpu: :x86_64] ++ custom_erts_qualifier()
           ]
         ]
       ]
     ]
+  end
+
+  defp custom_erts_qualifier do
+    case System.get_env("SYMPHONY_CUSTOM_ERTS") do
+      path when is_binary(path) and byte_size(path) > 0 -> [custom_erts: path]
+      _ -> []
+    end
   end
 end

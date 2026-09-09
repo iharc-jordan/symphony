@@ -90,6 +90,13 @@ Supported release targets:
 `v*` tags publish all four targets with checksums. A manual workflow run builds the same
 artifacts without creating a release.
 
+For the reviewed Linux x86_64 release path, run `scripts/build-linux-x86_64-custom-erts.sh` with
+`SYMPHONY_CUSTOM_ERTS` set to the reviewed OTP 28.5 ERTS `.tar.gz` and
+`SYMPHONY_CUSTOM_ERTS_SHA256` set to its verified digest. The pinned build toolchain is
+Erlang/OTP 28.5, Elixir 1.19.5-otp-28, Zig 0.15.2, and Burrito 1.5.0. This release path is
+for Ubuntu 24.04 (noble) x86_64 hosts and requires the host `libcrypto.so.3` supplied by
+`libssl3t64`; other Burrito targets remain unchanged.
+
 After downloading the executable for your platform from a release:
 
 ```bash
