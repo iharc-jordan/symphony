@@ -97,6 +97,11 @@ Erlang/OTP 28.5, Elixir 1.19.5-otp-28, Zig 0.15.2, and Burrito 1.5.0. This relea
 for Ubuntu 24.04 (noble) x86_64 hosts and requires the host `libcrypto.so.3` supplied by
 `libssl3t64`; other Burrito targets remain unchanged.
 
+
+Burrito production executables reuse an existing extraction when the application version is
+unchanged. Bump the project version for every changed binary release so an upgrade selects a fresh
+extraction directory; retain the prior versioned executable when rollback is required.
+
 After downloading the executable for your platform from a release:
 
 ```bash
