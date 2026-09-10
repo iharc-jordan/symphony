@@ -206,27 +206,32 @@ defmodule SymphonyElixirWeb.Presenter do
   defp put_assignment(acc, _key, _assignment, _principals), do: acc
 
   defp assignment_payload(assignment, assignment_id, principals) do
-    projection = projection_payload(Map.get(assignment, :projection))
-    title = text_value(Map.get(assignment, :title))
+    projection = assignment_projection(assignment)
+    title = text_value(field_value(assignment, :title))
 
     compact(%{
       assignment_id: assignment_id,
-      project_id: text_value(Map.get(assignment, :project_id)),
-      repository: text_value(Map.get(assignment, :repository)),
-      issue_number: Map.get(assignment, :issue_number),
+      project_id: text_value(field_value(assignment, :project_id)),
+      repository: text_value(field_value(assignment, :repository)),
+      issue_number: field_value(assignment, :issue_number),
       issue_url: managed_issue_url(assignment),
       title: title,
-      task: %{id: text_value(Map.get(assignment, :task_uuid)), title: title},
-      phase: phase_name(Map.get(assignment, :phase)),
+      task: %{id: text_value(field_value(assignment, :task_uuid)), title: title},
+      phase: phase_name(field_value(assignment, :phase)),
       status: assignment_status(assignment),
-      board_state: text_value(Map.get(assignment, :board_state)),
-      ownership: ownership_payload(Map.get(assignment, :ownership), principals),
-      dispatch_paused: Map.get(assignment, :dispatch_paused) == true,
+      board_state: text_value(field_value(assignment, :board_state)),
+      ownership: ownership_payload(field_value(assignment, :ownership), principals),
+      dispatch_paused: field_value(assignment, :dispatch_paused) == true,
+      stop_pending: field_value(assignment, :stop_pending) == true,
+      route: assignment_route(assignment),
+      last_report: safe_last_report(field_value(assignment, :last_report)),
+      blocked_reason: safe_text(field_value(assignment, :blocked_reason)),
+      started_at: iso8601(field_value(assignment, :started_at)),
       worker: safe_worker(assignment),
       projection: projection,
-      reports: safe_reports(Map.get(assignment, :reports)),
-      usage: safe_usage(Map.get(assignment, :usage)),
-      attempt: safe_attempt(Map.get(assignment, :attempt)),
+      reports: safe_reports(field_value(assignment, :reports)),
+      usage: safe_usage(field_value(assignment, :usage)),
+      attempt: safe_attempt(field_value(assignment, :attempt)),
       thread: safe_thread(assignment),
       workspace: safe_workspace(assignment)
     })
@@ -265,39 +270,83 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
+  defp assignment_projection(assignment) do
+    case Map.fetch(assignment, :projection) do
+      {:ok, projection} when is_map(projection) -> projection_payload(projection)
+      {:ok, nil} -> projection_payload(projection_from_pending_effect(field_value(assignment, :pending_effect)))
+      :error -> projection_payload(projection_from_pending_effect(field_value(assignment, :pending_effect)))
+      _ -> projection_payload(nil)
+    end
+  end
+
+  defp projection_from_pending_effect(effect) when is_map(effect) do
+    kind = field_value(effect, :kind)
+    status = projection_status(field_value(effect, :status))
+    updated_at = projection_timestamp(field_value(effect, :at) || field_value(effect, :updated_at))
+
+    if kind in [:provider_transition, "provider_transition"] and
+         status in ["synced", "pending", "failed"] and is_binary(updated_at) do
+      %{
+        status: status,
+        revision: integer_or_nil(field_value(effect, :revision)),
+        updated_at: updated_at,
+        synced_at: if(status == "synced", do: updated_at, else: nil),
+        retry_at: iso8601(field_value(effect, :retry_at)),
+        error: safe_text(field_value(effect, :error) || field_value(effect, :reason))
+      }
+    else
+      nil
+    end
+  end
+
+  defp projection_from_pending_effect(_effect), do: nil
+
   defp projection_payload(nil) do
-    %{status: "unknown", revision: nil, updated_at: nil, synced_at: nil, retry_at: nil, error: nil, stale: true}
+    %{status: "unknown", revision: nil, updated_at: nil, synced_at: nil, retry_at: nil, error: nil, stale: false}
   end
 
   defp projection_payload(projection) when is_map(projection) do
-    status = projection_status(Map.get(projection, :status))
-    updated_at = iso8601(Map.get(projection, :updated_at))
+    status = projection_status(field_value(projection, :status))
+    updated_at = projection_timestamp(field_value(projection, :updated_at))
 
     %{
       status: status,
-      revision: integer_or_nil(Map.get(projection, :revision)),
+      revision: integer_or_nil(field_value(projection, :revision)),
       updated_at: updated_at,
-      synced_at: iso8601(Map.get(projection, :synced_at)),
-      retry_at: iso8601(Map.get(projection, :retry_at)),
-      error: safe_text(Map.get(projection, :error)),
+      synced_at: projection_timestamp(field_value(projection, :synced_at)),
+      retry_at: projection_timestamp(field_value(projection, :retry_at)),
+      error: safe_text(field_value(projection, :error)),
       stale: projection_stale?(status, updated_at)
     }
   end
 
-  defp projection_payload(_projection), do: projection_payload(nil)
-
   defp projection_status(status) do
     case status |> text_value() |> to_string() |> String.downcase() do
       "synced" -> "synced"
+      "reconciled" -> "synced"
       "pending" -> "pending"
+      "retry_pending" -> "pending"
       "failed" -> "failed"
       _ -> "unknown"
     end
   end
 
+  defp projection_stale?("unknown", _updated_at), do: false
+
   defp projection_stale?(status, updated_at) do
     status != "synced" or is_nil(updated_at) or stale_timestamp?(updated_at)
   end
+
+  defp projection_timestamp(%DateTime{} = timestamp), do: iso8601(timestamp)
+
+  defp projection_timestamp(timestamp) when is_binary(timestamp) do
+    case DateTime.from_iso8601(timestamp) do
+      {:ok, parsed, _offset} -> iso8601(parsed)
+      _ -> nil
+    end
+  end
+
+  defp projection_timestamp(_timestamp), do: nil
 
   defp stale_timestamp?(updated_at) do
     case DateTime.from_iso8601(updated_at) do
@@ -353,11 +402,57 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp safe_worker(assignment) do
     %{
-      id: text_value(Map.get(assignment, :worker_id)),
-      active: Map.get(assignment, :worker_active),
-      activity: text_value(Map.get(assignment, :worker_activity))
+      id: text_value(field_value(assignment, :worker_id)),
+      host: text_value(field_value(assignment, :worker_host)),
+      active: field_value(assignment, :worker_active) == true,
+      activity: safe_text(field_value(assignment, :worker_activity))
     }
   end
+
+  defp assignment_route(assignment) do
+    route = field_value(assignment, :route) || %{}
+    turn_model = text_value(field_value(assignment, :turn_model))
+
+    if field_value(assignment, :worker_active) == true and not is_nil(turn_model) do
+      %{model: turn_model, effort: text_value(field_value(assignment, :turn_effort)), source: "running"}
+    else
+      %{model: text_value(field_value(route, :model)), effort: text_value(field_value(route, :effort)), source: "configured"}
+    end
+  end
+
+  defp safe_last_report(nil), do: %{kind: nil, summary: nil, evidence: []}
+
+  defp safe_last_report(report) when is_map(report) do
+    %{
+      kind: safe_report_text(field_value(report, :kind)),
+      summary: safe_report_text(field_value(report, :summary)),
+      evidence: safe_report_evidence(field_value(report, :evidence))
+    }
+  end
+
+  defp safe_last_report(_report), do: %{kind: nil, summary: nil, evidence: []}
+
+  defp safe_report_evidence(evidence) when is_list(evidence) do
+    evidence
+    |> Enum.map(&safe_report_evidence_item/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp safe_report_evidence(_evidence), do: []
+
+  defp safe_report_text(value) when is_binary(value), do: safe_text(value)
+  defp safe_report_text(value) when is_atom(value), do: safe_text(value)
+  defp safe_report_text(value) when is_integer(value), do: safe_text(value)
+  defp safe_report_text(value) when is_float(value), do: safe_text(value)
+  defp safe_report_text(value) when is_boolean(value), do: safe_text(value)
+  defp safe_report_text(_value), do: nil
+
+  defp safe_report_evidence_item(value) when is_binary(value), do: safe_text(value)
+  defp safe_report_evidence_item(value) when is_atom(value), do: safe_text(value)
+  defp safe_report_evidence_item(value) when is_integer(value), do: safe_text(value)
+  defp safe_report_evidence_item(value) when is_float(value), do: safe_text(value)
+  defp safe_report_evidence_item(value) when is_boolean(value), do: safe_text(value)
+  defp safe_report_evidence_item(_value), do: nil
 
   defp safe_thread(assignment) do
     %{
@@ -380,29 +475,43 @@ defmodule SymphonyElixirWeb.Presenter do
   defp workspace_value(_workspace, _key), do: nil
 
   defp managed_counts(assignments) do
-    values = Map.values(assignments)
+    values = assignments |> Map.values() |> Enum.filter(&nonterminal_assignment?/1)
 
     %{
-      running: Enum.count(values, &(Map.get(&1, :phase) == "active")),
-      queued: Enum.count(values, &(Map.get(&1, :phase) in ["bound", "ready", "queued"])),
-      review: Enum.count(values, &(Map.get(&1, :phase) == "review")),
-      waiting: Enum.count(values, &(Map.get(&1, :phase) in ["waiting", "rework"])),
+      running: Enum.count(values, &worker_active?/1),
+      queued: Enum.count(values, &(phase_name(field_value(&1, :phase)) in ["bound", "ready"])),
+      review: Enum.count(values, &(phase_name(field_value(&1, :phase)) in ["review", "review_pending"])),
+      waiting: Enum.count(values, &(phase_name(field_value(&1, :phase)) == "waiting")),
       blocked: Enum.count(values, &blocked_assignment?/1)
     }
   end
 
+  defp nonterminal_assignment?(assignment) do
+    phase_name(field_value(assignment, :phase)) not in ["accepted", "cancelled"]
+  end
+
+  defp worker_active?(assignment), do: field_value(assignment, :worker_active) == true or get_in(assignment, [:worker, :active]) == true
+
   defp blocked_assignment?(assignment) do
-    Map.get(assignment, :dispatch_paused) == true or
-      get_in(assignment, [:projection, :status]) in ["failed", "unknown"] or
-      get_in(assignment, [:ownership, :status]) == "needs_claim" or
-      String.downcase(Map.get(assignment, :status, "")) in ["blocked", "failed", "error"]
+    nonterminal_assignment?(assignment) and
+      (phase_name(field_value(assignment, :phase)) == "waiting" or
+         not is_nil(safe_text(field_value(assignment, :blocked_reason))) or
+         field_value(assignment, :dispatch_paused) == true or
+         get_in(assignment, [:projection, :status]) == "failed" or
+         not owned_assignment?(assignment))
+  end
+
+  defp owned_assignment?(assignment) do
+    text_value(field_value(field_value(assignment, :ownership) || %{}, :status)) == "owned"
   end
 
   defp projection_summary(assignments) do
-    values = Map.values(assignments)
+    values = assignments |> Map.values() |> Enum.filter(&nonterminal_assignment?/1)
     errors = projection_errors(values)
     stale = Enum.any?(values, &get_in(&1, [:projection, :stale]))
-    status = projection_summary_status(errors, stale, values)
+    pending = Enum.any?(values, &(get_in(&1, [:projection, :status]) == "pending"))
+    unknown = Enum.any?(values, &(get_in(&1, [:projection, :status]) == "unknown"))
+    status = projection_summary_status(errors, stale, pending, unknown)
 
     %{status: status, stale: stale, errors: errors}
   end
@@ -415,12 +524,11 @@ defmodule SymphonyElixirWeb.Presenter do
     end)
   end
 
-  defp projection_summary_status(errors, _stale, _assignments) when errors != [], do: "failed"
-  defp projection_summary_status(_errors, true, _assignments), do: "stale"
-
-  defp projection_summary_status(_errors, false, assignments) do
-    if Enum.any?(assignments, &(get_in(&1, [:projection, :status]) == "pending")), do: "pending", else: "synced"
-  end
+  defp projection_summary_status(errors, _stale, _pending, _unknown) when errors != [], do: "failed"
+  defp projection_summary_status(_errors, true, _pending, _unknown), do: "stale"
+  defp projection_summary_status(_errors, false, true, _unknown), do: "pending"
+  defp projection_summary_status(_errors, false, false, true), do: "unknown"
+  defp projection_summary_status(_errors, false, false, false), do: "synced"
 
   defp handoff_history(events) when is_list(events) do
     events
@@ -477,6 +585,12 @@ defmodule SymphonyElixirWeb.Presenter do
       phase -> String.downcase(phase)
     end
   end
+
+  defp field_value(map, key) when is_map(map) do
+    Map.get(map, key, Map.get(map, Atom.to_string(key)))
+  end
+
+  defp field_value(_map, _key), do: nil
 
   defp text_value(nil), do: nil
 

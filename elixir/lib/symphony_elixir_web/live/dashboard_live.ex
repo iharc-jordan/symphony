@@ -1,12 +1,14 @@
 defmodule SymphonyElixirWeb.DashboardLive do
   @moduledoc """
-  Live observability dashboard for Symphony.
+  Read-only, live ownership map and separate assignment history.
   """
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
+
   @runtime_tick_ms 1_000
+  @terminal_phases ["accepted", "cancelled"]
 
   @impl true
   def mount(_params, _session, socket) do
@@ -14,6 +16,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
       socket
       |> assign(:payload, load_payload())
       |> assign(:now, DateTime.utc_now())
+      |> assign(:view, "live")
+      |> assign(:display_mode, "map")
+      |> assign(:query, "")
+      |> assign(:selected_pm, nil)
+      |> assign(:selected_task_id, nil)
+      |> refresh_view()
 
     if connected?(socket) do
       :ok = ObservabilityPubSub.subscribe()
@@ -34,693 +42,498 @@ defmodule SymphonyElixirWeb.DashboardLive do
     {:noreply,
      socket
      |> assign(:payload, load_payload())
-     |> assign(:now, DateTime.utc_now())}
+     |> assign(:now, DateTime.utc_now())
+     |> refresh_view()}
   end
+
+  @impl true
+  def handle_event("show_view", %{"view" => view}, socket) when view in ["live", "history", "runtime"] do
+    {:noreply,
+     socket
+     |> assign(:view, view)
+     |> assign(:query, "")
+     |> assign(:selected_pm, nil)
+     |> assign(:selected_task_id, nil)
+     |> refresh_view()}
+  end
+
+  def handle_event("set_layout", %{"layout" => layout}, socket) when layout in ["map", "list"] do
+    {:noreply, assign(socket, :display_mode, layout)}
+  end
+
+  def handle_event("select_pm", %{"id" => id}, socket) do
+    {:noreply,
+     socket
+     |> assign(:selected_pm, id)
+     |> assign(:selected_task_id, nil)
+     |> refresh_view()}
+  end
+
+  def handle_event("select_task", %{"id" => id}, socket) do
+    {:noreply, socket |> assign(:selected_task_id, id) |> refresh_view()}
+  end
+
+  def handle_event("show_pm", _params, socket) do
+    {:noreply, assign(socket, :selected_task_id, nil) |> refresh_view()}
+  end
+
+  def handle_event("search", %{"query" => query}, socket) do
+    {:noreply, socket |> assign(:query, String.slice(query, 0, 200)) |> refresh_view()}
+  end
+
+  def handle_event(_event, _params, socket), do: {:noreply, socket}
 
   @impl true
   def render(assigns) do
     ~H"""
-    <section class="dashboard-shell">
-      <header class="hero-card">
-        <div class="hero-grid">
-          <div>
-            <p class="eyebrow">
-              Symphony Observability
-            </p>
-            <h1 class="hero-title">
-              Operations Dashboard
-            </h1>
-            <p class="hero-copy">
-              Current state, retry pressure, token usage, and orchestration health for the active Symphony runtime.
-            </p>
-          </div>
-
-          <div class="status-stack">
-            <span class="status-badge status-badge-live">
-              <span class="status-badge-dot"></span>
-              Live
-            </span>
-            <span class="status-badge status-badge-offline">
-              <span class="status-badge-dot"></span>
-              Offline
-            </span>
-          </div>
+    <div class="dashboard-shell">
+      <header class="app-header">
+        <a class="brand" href="/" aria-label="Symphony home">
+          <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M8 16h9m0 0 7-8m-7 8 7 8"/><circle cx="7" cy="16" r="4"/><circle cx="25" cy="7" r="3"/><circle cx="25" cy="25" r="3"/></svg>
+          <span>Symphony</span>
+        </a>
+        <span class="app-description">Your orchestration workspace</span>
+        <div class="connection-status" aria-live="polite">
+          <span class="status-badge-live"><i></i>Live updates</span>
+          <span class="status-badge-offline"><i></i>Disconnected</span>
         </div>
       </header>
 
+      <div class="page-heading">
+        <div>
+          <h1>{view_title(@view)}</h1>
+          <p>{view_description(@view)}</p>
+        </div>
+        <span class="updated-at">Updated {updated_time(@payload)}</span>
+      </div>
+
+      <nav class="workspace-tabs" aria-label="Workspace views">
+        <button type="button" phx-click="show_view" phx-value-view="live" aria-current={if @view == "live", do: "page"} class={if @view == "live", do: "is-current"}>
+          <.small_icon name="map" />Live work<span>{@open_count}</span>
+        </button>
+        <button type="button" phx-click="show_view" phx-value-view="history" aria-current={if @view == "history", do: "page"} class={if @view == "history", do: "is-current"}>
+          <.small_icon name="history" />History<span>{@history_count}</span>
+        </button>
+        <button type="button" phx-click="show_view" phx-value-view="runtime" aria-current={if @view == "runtime", do: "page"} class={if @view == "runtime", do: "is-current"}>
+          <.small_icon name="activity" />Runtime
+        </button>
+      </nav>
+
       <%= if @payload[:error] do %>
-        <section class="error-card">
-          <h2 class="error-title">
-            Snapshot unavailable
-          </h2>
-          <p class="error-copy">
-            <strong><%= @payload.error.code %>:</strong> <%= @payload.error.message %>
-          </p>
+        <section class="snapshot-error" role="status">
+          <h2>Snapshot unavailable</h2>
+          <p>{@payload.error.message}</p>
+          <code>{@payload.error.code}</code>
         </section>
       <% else %>
-        <section class="metric-grid">
-          <article class="metric-card">
-            <p class="metric-label">Running</p>
-            <p class="metric-value numeric"><%= @payload.counts.running %></p>
-            <p class="metric-detail">Active issue sessions in the current runtime.</p>
-          </article>
+        <%= if @view == "runtime" or is_nil(@payload[:managed]) do %>
+          <.runtime_panel payload={@payload} now={@now} />
+        <% else %>
+          <div :if={@payload.managed.dispatch_paused} class="dispatch-notice">
+            <.small_icon name="pause" /><strong>New dispatch is paused.</strong>
+            <span>Existing worker activity is shown below.</span>
+          </div>
 
-          <article class="metric-card">
-            <p class="metric-label">Retrying</p>
-            <p class="metric-value numeric"><%= @payload.counts.retrying %></p>
-            <p class="metric-detail">Issues waiting for the next retry window.</p>
-          </article>
+          <div :if={@view == "live"} class="work-summary" aria-label="Current work counts">
+            <span><i class="state-dot state-running"></i><strong>{@work_counts.running}</strong> running</span>
+            <span><i class="state-dot state-review"></i><strong>{@work_counts.review}</strong> need review</span>
+            <span><i class="state-dot state-waiting"></i><strong>{@work_counts.waiting}</strong> waiting</span>
+            <span><i class="state-dot state-ready"></i><strong>{@work_counts.queued}</strong> queued</span>
+          </div>
 
-          <article class="metric-card">
-            <p class="metric-label">Blocked</p>
-            <p class="metric-value numeric"><%= @payload.counts.blocked %></p>
-            <p class="metric-detail">Issues paused for operator input or approval.</p>
-          </article>
-
-          <article class="metric-card">
-            <p class="metric-label">Total tokens</p>
-            <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
-            <p class="metric-detail numeric">
-              In <%= format_int(@payload.codex_totals.input_tokens) %> / Out <%= format_int(@payload.codex_totals.output_tokens) %>
-            </p>
-          </article>
-
-          <article class="metric-card">
-            <p class="metric-label">Runtime</p>
-            <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
-            <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
-          </article>
-        </section>
-
-
-        <%= if @payload[:managed] do %>
-          <section class="section-card managed-summary">
-            <div class="section-header">
-              <div>
-                <h2 class="section-title">Managed operations</h2>
-                <p class="section-copy">Project ownership and worker state from the managed control plane.</p>
+          <div class="workspace">
+            <aside class="manager-sidebar" aria-label="Project managers">
+              <div class="sidebar-heading"><h2>Project managers</h2><span>{length(@groups)}</span></div>
+              <p class="sidebar-caption">{if @view == "live", do: "Owners of current work", else: "Owners of historical work"}</p>
+              <nav class="manager-list" aria-label="Choose a project manager">
+                <button :for={group <- @groups} type="button" phx-click="select_pm" phx-value-id={group.id} aria-pressed={@selected_pm == group.id} class={["manager-option", @selected_pm == group.id && "is-selected"]}>
+                  <span class={["manager-avatar", group.id == "__unassigned__" && "unassigned-avatar"]}>{if group.id == "__unassigned__", do: "?", else: "PM"}</span>
+                  <span class="manager-option-copy">
+                    <strong>{group.name}</strong>
+                    <span>{length(group.tasks)} {if @view == "live", do: "open", else: "past"} {plural(length(group.tasks), "task")}</span>
+                  </span>
+                  <span :if={group.running > 0} class="manager-running" title={"#{group.running} running workers"}>{group.running}</span>
+                </button>
+              </nav>
+              <p :if={@groups == []} class="sidebar-empty">No matching work.</p>
+              <div class="sidebar-note">
+                <.small_icon name="link" />
+                <p>Connections show responsibility. A moving connection means the worker is running.</p>
               </div>
-              <span class={managed_status_class(@payload.managed.status)}>
-                <%= humanize_status(@payload.managed.status) %>
-              </span>
-            </div>
+            </aside>
 
-            <p class={managed_dispatch_class(@payload.managed.dispatch_paused)}>
-              Dispatch: <strong><%= if @payload.managed.dispatch_paused, do: "paused", else: "enabled" %></strong>
-            </p>
-
-            <div class="managed-count-grid">
-              <%= for {label, key} <- [{"Running", :running}, {"Queued", :queued}, {"Review", :review}, {"Waiting", :waiting}, {"Blocked", :blocked}] do %>
-                <article class="managed-count-card">
-                  <p class="metric-label"><%= label %></p>
-                  <p class="metric-value numeric"><%= @payload.managed.counts[key] %></p>
-                </article>
-              <% end %>
-            </div>
-
-            <%= if @payload.managed.projection.stale or @payload.managed.projection.errors != [] do %>
-              <div class="projection-alert">
-                <strong>Projection health: <%= humanize_status(@payload.managed.projection.status) %></strong>
-                <%= if @payload.managed.projection.stale do %>
-                  <span>Some managed state is stale.</span>
-                <% end %>
-                <%= for error <- @payload.managed.projection.errors do %>
-                  <span><%= error.assignment_id %>: <%= error.error %></span>
-                <% end %>
-              </div>
-            <% end %>
-          </section>
-
-          <section class="section-card">
-            <div class="section-header">
-              <div>
-                <h2 class="section-title">Projects and repositories</h2>
-                <p class="section-copy">Bound project identities and their allowed repositories.</p>
-              </div>
-            </div>
-
-            <%= if map_size(@payload.managed.projects) == 0 do %>
-              <p class="empty-state">No managed projects are bound.</p>
-            <% else %>
-              <div class="managed-project-grid">
-                <article :for={{project_id, project} <- managed_entries(@payload.managed.projects)} class="managed-project-card">
-                  <h3><%= project_id %></h3>
-                  <p class="muted">
-                    Project #<%= Map.get(project, :project_number) || "n/a" %>
-                    <%= if Map.get(project, :revision) do %> · revision <%= Map.get(project, :revision) %><% end %>
-                  </p>
-                  <p><strong>Repositories</strong></p>
-                  <p class="mono"><%= join_values(project.repositories) %></p>
-                </article>
-              </div>
-            <% end %>
-          </section>
-
-          <section class="section-card">
-            <div class="section-header">
-              <div>
-                <h2 class="section-title">Managed assignments</h2>
-                <p class="section-copy">Who owns each task, where it is in the workflow, and whether its provider projection is current.</p>
-              </div>
-            </div>
-
-            <%= if map_size(@payload.managed.assignments) == 0 do %>
-              <p class="empty-state">No managed assignments are enrolled.</p>
-            <% else %>
-              <div class="table-wrap">
-                <table class="data-table managed-assignment-table">
-                  <thead>
-                    <tr>
-                      <th>Task</th>
-                      <th>Project / repository</th>
-                      <th>Responsible PM</th>
-                      <th>Work status</th>
-                      <th>Worker</th>
-                      <th>Projection</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr :for={{_assignment_id, assignment} <- managed_entries(@payload.managed.assignments)}>
-                      <td>
-                        <div class="issue-stack">
-                          <%= if Map.get(assignment, :issue_url) do %>
-                            <a class="issue-id" href={assignment.issue_url}><%= task_label(assignment) %></a>
-                          <% else %>
-                            <span class="issue-id"><%= task_label(assignment) %></span>
-                          <% end %>
-                          <span class="muted mono"><%= assignment.assignment_id %></span>
-                        </div>
-                      </td>
-                      <td>
-                        <span><%= Map.get(assignment, :project_id) || "n/a" %></span>
-                        <span class="muted"><%= Map.get(assignment, :repository) || "repository unavailable" %></span>
-                      </td>
-                      <td>
-                        <span class={owner_class(assignment)}><%= owner_label(assignment) %></span>
-                        <%= if ownership_status_visible?(assignment) do %>
-                          <span class="muted"><%= humanize_status(assignment.ownership.status) %></span>
-                        <% end %>
-                      </td>
-                      <td><span class={managed_status_class(assignment.status)}><%= humanize_status(assignment.status) %></span></td>
-                      <td>
-                        <span class="mono"><%= worker_label(assignment) %></span>
-                        <%= if assignment.worker.activity do %>
-                          <span class="muted"><%= assignment.worker.activity %></span>
-                        <% end %>
-                      </td>
-                      <td>
-                        <span class={projection_status_class(assignment.projection)}>
-                          <%= projection_label(assignment.projection) %>
-                        </span>
-                        <%= if assignment.projection.error do %>
-                          <span class="muted"><%= assignment.projection.error %></span>
-                        <% end %>
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            <% end %>
-          </section>
-
-          <%= if map_size(@payload.managed.principals) > 0 do %>
-            <section class="section-card">
-              <div class="section-header">
-                <div>
-                  <h2 class="section-title">Responsible PMs</h2>
-                  <p class="section-copy">Principal identities available to own managed tasks.</p>
+            <section class="work-area" aria-label={view_title(@view)}>
+              <div class="work-toolbar">
+                <div class="work-toolbar-heading">
+                  <h2>{if @selected_group, do: @selected_group.name, else: empty_heading(@view, @query)}</h2>
+                  <p :if={@selected_group}>{length(@selected_group.tasks)} {plural(length(@selected_group.tasks), "assignment")} · {if @view == "live", do: "current work", else: "completed or cancelled"}</p>
                 </div>
+                <form phx-change="search" phx-submit="search" role="search" class="work-search">
+                  <label class="sr-only" for="work-query">Find a task or PM</label>
+                  <.small_icon name="search" /><input id="work-query" type="search" name="query" value={@query} placeholder="Find a task or PM" phx-debounce="200" />
+                </form>
               </div>
-              <div class="managed-principal-grid">
-                <article :for={{principal_id, principal} <- managed_entries(@payload.managed.principals)} class="managed-principal-card">
-                  <strong><%= principal.display_name %></strong>
-                  <span class="muted mono"><%= principal_id %></span>
-                  <span class="muted">Task link unavailable</span>
-                </article>
-              </div>
-            </section>
-          <% end %>
 
-          <%= if @payload.managed.handoffs != [] do %>
-            <section class="section-card">
-              <div class="section-header">
-                <div>
-                  <h2 class="section-title">Handoff history</h2>
-                  <p class="section-copy">Recent ownership transfers and operator takeovers recorded by managed state.</p>
-                </div>
-              </div>
-              <div class="handoff-list">
-                <article :for={handoff <- @payload.managed.handoffs} class="handoff-entry">
-                  <div>
-                    <strong><%= humanize_status(handoff.operation) %></strong>
-                    <span class="muted mono"><%= handoff.at || "time unavailable" %></span>
+              <%= if @selected_group do %>
+                <div :if={@view == "live"} class="map-options">
+                  <div class="layout-switch" aria-label="Display">
+                    <button type="button" phx-click="set_layout" phx-value-layout="map" aria-pressed={@display_mode == "map"}><.small_icon name="map" />Map</button>
+                    <button type="button" phx-click="set_layout" phx-value-layout="list" aria-pressed={@display_mode == "list"}><.small_icon name="list" />List</button>
                   </div>
-                  <p>
-                    <span class="mono"><%= handoff.source_id || "source unavailable" %></span>
-                    <span aria-hidden="true"> → </span>
-                    <span class="mono"><%= handoff.destination_id || "destination unavailable" %></span>
-                  </p>
-                  <p class="muted"><%= handoff_reason(handoff) %></p>
-                  <p class="muted">
-                    <%= handoff_scope(handoff) %> · <%= handoff_outcome(handoff) %>
-                  </p>
-                </article>
-              </div>
-            </section>
-          <% end %>
-        <% end %>
+                  <span>Select a node to see its details</span>
+                </div>
 
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Rate limits</h2>
-              <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
-            </div>
-          </div>
-
-          <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
-        </section>
-
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Running sessions</h2>
-              <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
-            </div>
-          </div>
-
-          <%= if @payload.running == [] do %>
-            <p class="empty-state">No active sessions.</p>
-          <% else %>
-            <div class="table-wrap">
-              <table class="data-table data-table-running">
-                <colgroup>
-                  <col style="width: 12rem;" />
-                  <col style="width: 8rem;" />
-                  <col style="width: 7.5rem;" />
-                  <col style="width: 8.5rem;" />
-                  <col />
-                  <col style="width: 10rem;" />
-                </colgroup>
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>State</th>
-                    <th>Session</th>
-                    <th>Runtime / turns</th>
-                    <th>Codex update</th>
-                    <th>Tokens</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.running}>
-                    <td>
-                      <div class="issue-stack">
-                        <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                      </div>
-                    </td>
-                    <td>
-                      <span class={state_badge_class(entry.state)}>
-                        <%= entry.state %>
-                      </span>
-                    </td>
-                    <td>
-                      <div class="session-stack">
-                        <%= if entry.session_id do %>
-                          <button
-                            type="button"
-                            class="subtle-button"
-                            data-label="Copy ID"
-                            data-copy={entry.session_id}
-                            onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
-                          >
-                            Copy ID
+                <div class={["work-content", @selected_task && "has-selection"]}>
+                  <div class="work-visual">
+                    <%= if @view == "live" and @display_mode == "map" do %>
+                      <div class="map-viewport" tabindex="0" aria-label="PM and assignment ownership map">
+                        <div class="mind-map" style={"height: #{@map_height}px"} id="ownership-map">
+                          <svg class="map-connections" viewBox={"0 0 820 #{@map_height}"} preserveAspectRatio="none" aria-hidden="true">
+                            <path :for={{task, index} <- Enum.with_index(@selected_group.tasks)} d={connection_path(index, @map_height)} class={["map-connection", task.worker.active == true && "connection-running", "connection-#{task.phase}"]} />
+                            <circle cx="295" cy={div(@map_height, 2)} r="4" class="connection-origin" />
+                          </svg>
+                          <button type="button" phx-click="show_pm" class={["mind-node pm-node", is_nil(@selected_task) && "node-selected"]} style={"top: #{div(@map_height, 2) - 76}px"} aria-pressed={is_nil(@selected_task)}>
+                            <span class="node-role"><span class="pm-symbol">{if @selected_group.id == "__unassigned__", do: "?", else: "PM"}</span>{if @selected_group.id == "__unassigned__", do: "Ownership needed", else: "Project manager"}</span>
+                            <strong class="pm-node-title">{@selected_group.name}</strong>
+                            <span class="pm-node-count">{length(@selected_group.tasks)} open {plural(length(@selected_group.tasks), "assignment")}</span>
+                            <span class="node-connector"></span>
                           </button>
-                        <% else %>
-                          <span class="muted">n/a</span>
-                        <% end %>
+                          <div class="map-tasks">
+                            <button :for={{task, index} <- Enum.with_index(@selected_group.tasks)} type="button" phx-click="select_task" phx-value-id={task.assignment_id} data-assignment-id={task.assignment_id} aria-pressed={@selected_task_id == task.assignment_id} class={["mind-node task-node", "task-#{task.phase}", task.worker.active == true && "worker-running", @selected_task_id == task.assignment_id && "node-selected"]} style={"top: #{task_top(index)}px"}>
+                              <span class="task-node-top"><span>{issue_label(task)}</span><span class={["task-state", "state-#{task.phase}"]}><i class={["state-dot", task.worker.active == true && "is-running"]}></i>{phase_label(task.phase)}</span></span>
+                              <strong class="task-node-title">{task_label(task)}</strong>
+                              <span class="task-node-meta">{route_label(task)}<span :if={task.worker.active == true} class="worker-label">Worker running</span></span>
+                              <span class="task-node-activity">{task_activity(task, @payload)}</span>
+                            </button>
+                          </div>
+                        </div>
                       </div>
-                    </td>
-                    <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
-                    <td>
-                      <div class="detail-stack">
-                        <span
-                          class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "n/a")}
-                        ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
-                        <span class="muted event-meta">
-                          <%= entry.last_event || "n/a" %>
-                          <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
-                          <% end %>
-                        </span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="token-stack numeric">
-                        <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
-                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
-                      </div>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          <% end %>
-        </section>
-
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Blocked sessions</h2>
-              <p class="section-copy">Issues paused because Codex requested operator input or approval.</p>
-            </div>
-          </div>
-
-          <%= if @payload.blocked == [] do %>
-            <p class="empty-state">No blocked sessions.</p>
-          <% else %>
-            <div class="table-wrap">
-              <table class="data-table" style="min-width: 760px;">
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>State</th>
-                    <th>Session</th>
-                    <th>Blocked at</th>
-                    <th>Last update</th>
-                    <th>Error</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.blocked}>
-                    <td>
-                      <div class="issue-stack">
-                        <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                      </div>
-                    </td>
-                    <td>
-                      <span class={state_badge_class(entry.state || "Blocked")}>
-                        <%= entry.state || "Blocked" %>
-                      </span>
-                    </td>
-                    <td>
-                      <%= if entry.session_id do %>
-                        <button
-                          type="button"
-                          class="subtle-button"
-                          data-label="Copy ID"
-                          data-copy={entry.session_id}
-                          onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
-                        >
-                          Copy ID
+                      <div class="map-legend"><span><i class="legend-line"></i>Owns this task</span><span><i class="state-dot state-running"></i>Running worker</span><span><i class="state-dot state-review"></i>PM review</span><span><i class="state-dot state-waiting"></i>Waiting</span></div>
+                    <% else %>
+                      <div class="assignment-list" id={if @view == "history", do: "history-list", else: "live-list"}>
+                        <button :for={task <- @selected_group.tasks} type="button" phx-click="select_task" phx-value-id={task.assignment_id} aria-pressed={@selected_task_id == task.assignment_id} data-assignment-id={task.assignment_id} class={["assignment-row", @selected_task_id == task.assignment_id && "is-selected"]}>
+                          <span class={["row-state-mark", "state-#{task.phase}"]}></span>
+                          <span class="assignment-row-copy"><strong>{task_label(task)}</strong><span>{task[:repository] || "Repository unavailable"} · {issue_label(task)}</span></span>
+                          <span class={["task-state", "state-#{task.phase}"]}>{phase_label(task.phase)}</span>
+                          <span class="row-chevron" aria-hidden="true">›</span>
                         </button>
-                      <% else %>
-                        <span class="muted">n/a</span>
+                      </div>
+                    <% end %>
+                  </div>
+                  <aside class="detail-panel" aria-label="Selection details" aria-live="polite">
+                    <%= if @selected_task do %>
+                      <div class="detail-heading"><span>Assignment details</span><button type="button" phx-click="show_pm" aria-label="Close assignment details">×</button></div>
+                      <span class={["task-state", "state-#{@selected_task.phase}"]}>{phase_label(@selected_task.phase)}</span>
+                      <h3>{@selected_task |> task_label()}</h3>
+                      <dl class="detail-facts">
+                        <div><dt>Responsible PM</dt><dd>{@selected_group.name}</dd></div>
+                        <div><dt>Worker</dt><dd>{if @selected_task.worker.active == true, do: "Running", else: "Not running"}</dd></div>
+                        <div :if={@selected_task.worker.host}><dt>Worker host</dt><dd>{@selected_task.worker.host}</dd></div>
+                        <div><dt>{if @selected_task.route[:source] == "running", do: "Running model & effort", else: "Configured model & effort"}</dt><dd>{route_label(@selected_task)}</dd></div>
+                        <div><dt>Repository</dt><dd>{@selected_task[:repository] || "Not recorded"}</dd></div>
+                      </dl>
+                      <p :if={@selected_task[:blocked_reason]} class="waiting-reason"><strong>Waiting reason</strong>{@selected_task.blocked_reason}</p>
+                      <p :if={@selected_task.projection.status == "failed"} class="waiting-reason"><strong>Project update failed</strong>{@selected_task.projection.error}</p>
+                      <p :if={@selected_task[:stop_pending] == true} class="detail-note">Process reconciliation is pending.</p>
+                      <%= if get_in(@selected_task, [:last_report, :summary]) do %>
+                        <section class="report-preview"><h4>Latest report</h4><p>{@selected_task.last_report[:summary]}</p>
+                          <details :if={@selected_task.last_report[:evidence] not in [nil, []]}><summary>Evidence</summary><ul><li :for={item <- @selected_task.last_report.evidence}>{item}</li></ul></details>
+                        </section>
                       <% end %>
-                    </td>
-                    <td class="mono"><%= entry.blocked_at || "n/a" %></td>
-                    <td>
-                      <div class="detail-stack">
-                        <span
-                          class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "n/a")}
-                        ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
-                        <span class="muted event-meta">
-                          <%= entry.last_event || "n/a" %>
-                          <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
-                          <% end %>
-                        </span>
+                      <.issue_identifier identifier={issue_label(@selected_task)} url={@selected_task[:issue_url]} />
+                      <details class="technical-details"><summary>Task identifiers</summary><dl>
+                        <div><dt>Assignment</dt><dd><code>{@selected_task.assignment_id}</code></dd></div>
+                        <div :if={@selected_task.thread.id}><dt>Worker task</dt><dd><code>{@selected_task.thread.id}</code><.copy_id value={@selected_task.thread.id} /></dd></div>
+                      </dl></details>
+                    <% else %>
+                      <div class="detail-heading"><span>{if @view == "live", do: "Ownership overview", else: "History overview"}</span></div>
+                      <span class="detail-pm-avatar">{if @selected_group.id == "__unassigned__", do: "?", else: "PM"}</span>
+                      <h3>{@selected_group.name}</h3>
+                      <p class="detail-copy">{owner_description(@selected_group, @view)}</p>
+                      <div class="owner-breakdown">
+                        <div :for={{phase, count} <- phase_breakdown(@selected_group.tasks)}><span><i class={["state-dot", "state-#{phase}"]}></i>{phase_label(phase)}</span><strong>{count}</strong></div>
                       </div>
-                    </td>
-                    <td><%= entry.error || "n/a" %></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          <% end %>
-        </section>
-
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Retry queue</h2>
-              <p class="section-copy">Issues waiting for the next retry window.</p>
-            </div>
+                      <p class="detail-note">PM identity shows ownership, not whether its Codex task is currently running.</p>
+                      <details :if={@selected_group.id != "__unassigned__"} class="technical-details"><summary>PM task identifier</summary><code>{@selected_group.id}</code><.copy_id value={@selected_group.id} /></details>
+                    <% end %>
+                  </aside>
+                </div>
+              <% else %>
+                <div class="workspace-empty">
+                  <.small_icon name={if @view == "history", do: "history", else: "map"} />
+                  <h3>{empty_heading(@view, @query)}</h3>
+                  <p>{empty_description(@view, @query)}</p>
+                </div>
+              <% end %>
+            </section>
           </div>
+        <% end %>
+      <% end %>
+    </div>
+    """
+  end
 
-          <%= if @payload.retrying == [] do %>
-            <p class="empty-state">No issues are currently backing off.</p>
-          <% else %>
-            <div class="table-wrap">
-              <table class="data-table" style="min-width: 680px;">
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>Attempt</th>
-                    <th>Due at</th>
-                    <th>Error</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.retrying}>
-                    <td>
-                      <div class="issue-stack">
-                        <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                      </div>
-                    </td>
-                    <td><%= entry.attempt %></td>
-                    <td class="mono"><%= entry.due_at || "n/a" %></td>
-                    <td><%= entry.error || "n/a" %></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          <% end %>
-        </section>
+  attr(:payload, :map, required: true)
+  attr(:now, :any, required: true)
+
+  defp runtime_panel(assigns) do
+    ~H"""
+    <section class="runtime-panel">
+      <div class="runtime-heading"><h2>Runtime details</h2><p>Session activity and service diagnostics.</p></div>
+      <section class="runtime-section"><h3>Running sessions <span>{length(@payload.running)}</span></h3>
+        <p :if={@payload.running == []} class="empty-copy">No workers are running.</p>
+        <article :for={entry <- @payload.running} class="session-row">
+          <div><.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} /><span>{entry.state}</span></div>
+          <p class="session-message">{entry.last_message || to_string(entry.last_event || "No update yet")}</p>
+          <div class="session-meta"><span>Runtime {format_runtime(entry.started_at, @now)} · {entry.turn_count} turns</span><span>Codex update {entry.last_event_at || "unavailable"}</span><.copy_id :if={entry.session_id} value={entry.session_id} /></div>
+        </article>
+      </section>
+      <section class="runtime-section"><h3>Blocked sessions <span>{length(@payload.blocked)}</span></h3>
+        <p :if={@payload.blocked == []} class="empty-copy">No blocked sessions.</p>
+        <article :for={entry <- @payload.blocked} class="session-row">
+          <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+          <p>{entry.last_message || to_string(entry.last_event || "")}</p><p class="waiting-reason">{entry.error}</p>
+        </article>
+      </section>
+      <section class="runtime-section"><h3>Retry queue <span>{length(@payload.retrying)}</span></h3>
+        <p :if={@payload.retrying == []} class="empty-copy">No retries queued.</p>
+        <article :for={entry <- @payload.retrying} class="session-row">
+          <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} /><p>Attempt {entry.attempt} · {entry.due_at || "Time unavailable"}</p><p>{entry.error}</p>
+        </article>
+      </section>
+      <details class="runtime-section"><summary>Rate limits</summary><pre>{inspect(@payload.rate_limits, pretty: true)}</pre></details>
+      <%= if @payload[:managed] do %>
+        <details class="runtime-section"><summary>Projects and repositories</summary>
+          <article :for={{id, project} <- Enum.sort(@payload.managed.projects)} class="session-row"><strong>Project {project[:project_number] || id}</strong><p>{Enum.join(project.repositories, ", ")}</p><code>{id}</code></article>
+        </details>
+        <details :if={@payload.managed.handoffs != []} class="runtime-section"><summary>Ownership transfer history</summary>
+          <article :for={event <- @payload.managed.handoffs} class="session-row"><strong>{humanize(event.operation)}</strong><p>{event[:source_id] || "—"} → {event[:destination_id] || "—"}</p><p>{event[:reason]}</p></article>
+        </details>
       <% end %>
     </section>
     """
   end
 
-  defp managed_entries(map) when is_map(map), do: Enum.sort_by(map, fn {id, _entry} -> to_string(id) end)
-  defp managed_entries(_map), do: []
+  attr(:name, :string, required: true)
 
-  defp humanize_status(nil), do: "Unavailable"
-
-  defp humanize_status(status) do
-    status
-    |> to_string()
-    |> String.replace("_", " ")
-    |> String.split()
-    |> Enum.map_join(" ", &String.capitalize/1)
-  end
-
-  defp managed_status_class(status) do
-    normalized = status |> to_string() |> String.downcase()
-    base = "state-badge"
-
-    cond do
-      normalized in ["available", "synced", "active", "owned", "enabled"] -> "#{base} state-badge-active"
-      normalized in ["failed", "blocked", "error", "stale", "unknown", "unassigned"] -> "#{base} state-badge-danger"
-      true -> "#{base} state-badge-warning"
-    end
-  end
-
-  defp managed_dispatch_class(true), do: "managed-dispatch managed-dispatch-paused"
-  defp managed_dispatch_class(false), do: "managed-dispatch managed-dispatch-enabled"
-
-  defp projection_status_class(%{status: "synced", stale: false}), do: "state-badge state-badge-active"
-  defp projection_status_class(%{status: "failed"}), do: "state-badge state-badge-danger"
-  defp projection_status_class(%{status: status}) when status in ["pending", "stale"], do: "state-badge state-badge-warning"
-  defp projection_status_class(_projection), do: "state-badge state-badge-danger"
-
-  defp projection_label(%{status: status, stale: true}) when status == "synced", do: "Stale"
-  defp projection_label(%{status: status}), do: humanize_status(status)
-  defp projection_label(_projection), do: "Unknown"
-
-  defp owner_class(assignment) do
-    if assignment.ownership.status == "unassigned", do: "managed-owner managed-owner-missing", else: "managed-owner"
-  end
-
-  defp owner_label(assignment) do
-    cond do
-      assignment.ownership.status == "needs_claim" -> "Operator claim required"
-      assignment.ownership.display_name -> assignment.ownership.display_name
-      assignment.ownership.pm_id -> assignment.ownership.pm_id
-      assignment.phase == "review" -> "Review owner unavailable"
-      true -> "No PM owner"
-    end
-  end
-
-  defp ownership_status_visible?(assignment) do
-    assignment.ownership.status != "needs_claim"
-  end
-
-  defp task_label(assignment) do
-    Map.get(assignment, :title) || assignment.task.id || repository_issue_label(assignment)
-  end
-
-  defp repository_issue_label(%{repository: repository, issue_number: number})
-       when is_binary(repository) and is_integer(number) do
-    "#{repository} ##{number}"
-  end
-
-  defp repository_issue_label(assignment) do
-    assignment.assignment_id
-  end
-
-  defp worker_label(assignment) do
-    cond do
-      assignment.worker.id && assignment.worker.active == true -> assignment.worker.id <> " (active)"
-      assignment.worker.id && assignment.worker.active == false -> assignment.worker.id <> " (down)"
-      assignment.thread.id -> assignment.thread.id
-      assignment.task.id -> assignment.task.id
-      true -> "not running"
-    end
-  end
-
-  defp handoff_reason(handoff) do
-    cond do
-      handoff.reason -> handoff.reason
-      handoff.assignment_id -> "Assignment " <> handoff.assignment_id
-      handoff.assignment_ids != [] -> "Assignments " <> Enum.join(handoff.assignment_ids, ", ")
-      true -> "Assignment details unavailable"
-    end
-  end
-
-  defp handoff_scope(%{assignment_ids: ids}) when is_list(ids) and ids != [] do
-    "Assignments " <> Enum.join(ids, ", ")
-  end
-
-  defp handoff_scope(%{assignment_id: id}) when is_binary(id), do: "Assignment " <> id
-  defp handoff_scope(_handoff), do: "Assignment scope unavailable"
-
-  defp handoff_outcome(%{status: status}) when is_binary(status) and status != "" do
-    "Outcome: " <> humanize_status(status)
-  end
-
-  defp handoff_outcome(_handoff), do: "Outcome unavailable"
-
-  defp join_values(values) when is_list(values) and values != [], do: Enum.join(values, ", ")
-  defp join_values(_values), do: "None recorded"
-
-  defp load_payload do
-    Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
-  end
-
-  defp orchestrator do
-    Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator
-  end
-
-  defp snapshot_timeout_ms do
-    Endpoint.config(:snapshot_timeout_ms) || 15_000
+  defp small_icon(assigns) do
+    ~H"""
+    <svg class="small-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <%= case @name do %>
+        <% "map" -> %><rect x="2" y="9" width="6" height="6" rx="1.5"/><rect x="16" y="2" width="6" height="6" rx="1.5"/><rect x="16" y="16" width="6" height="6" rx="1.5"/><path d="M8 12h4V5h4M12 12v7h4"/>
+        <% "history" -> %><path d="M3 11a9 9 0 1 1 2 7M3 4v7h7M12 7v5l3 2"/>
+        <% "activity" -> %><path d="M2 12h5l3-8 4 16 3-8h5"/>
+        <% "search" -> %><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/>
+        <% "pause" -> %><path d="M9 5v14M15 5v14"/>
+        <% "list" -> %><path d="M8 5h13M8 12h13M8 19h13M3 5h.01M3 12h.01M3 19h.01"/>
+        <% _ -> %><path d="m10 13 4-4m-6 6-2 2a4 4 0 0 1-6-6l5-5a4 4 0 0 1 6 0m-1 12 5-5a4 4 0 0 0-6-6" transform="translate(3 1)"/>
+      <% end %>
+    </svg>
+    """
   end
 
   attr(:identifier, :string, required: true)
-  attr(:url, :string, default: nil)
+  attr(:url, :any, default: nil)
 
   defp issue_identifier(assigns) do
     assigns = assign(assigns, :href, external_issue_url(assigns.url))
 
     ~H"""
     <%= if @href do %>
-      <a
-        class="issue-id issue-id-link"
-        href={@href}
-        target="_blank"
-        rel="noopener noreferrer"
-        aria-label={"Open #{@identifier} in the issue tracker"}
-      ><%= @identifier %></a>
+      <a class="issue-link" href={@href} target="_blank" rel="noopener noreferrer" aria-label={"Open #{@identifier} in the issue tracker"}>{@identifier}<span aria-hidden="true"> ↗</span></a>
     <% else %>
-      <span class="issue-id"><%= @identifier %></span>
+      <span class="issue-link">{@identifier}</span>
     <% end %>
     """
   end
 
+  attr(:value, :string, required: true)
+
+  defp copy_id(assigns) do
+    ~H"""
+    <button type="button" class="copy-button" data-copy={@value} onclick="navigator.clipboard.writeText(this.dataset.copy).then(() => { this.textContent = 'Copied'; setTimeout(() => { this.textContent = 'Copy ID' }, 1200); })">Copy ID</button>
+    """
+  end
+
+  defp refresh_view(socket) do
+    tasks = socket.assigns.payload |> get_in([:managed, :assignments]) |> assignment_values()
+    {history, current} = Enum.split_with(tasks, &(&1.phase in @terminal_phases))
+    source = if socket.assigns.view == "history", do: history, else: current
+    groups = source |> filter_tasks(socket.assigns.query) |> ownership_groups(socket.assigns.view)
+    group = Enum.find(groups, &(&1.id == socket.assigns.selected_pm)) || List.first(groups)
+    selected = if group, do: Enum.find(group.tasks, &(&1.assignment_id == socket.assigns.selected_task_id))
+
+    socket
+    |> assign(:groups, groups)
+    |> assign(:selected_group, group)
+    |> assign(:selected_pm, group && group.id)
+    |> assign(:selected_task, selected)
+    |> assign(:selected_task_id, selected && selected.assignment_id)
+    |> assign(:open_count, length(current))
+    |> assign(:history_count, length(history))
+    |> assign(:work_counts, work_counts(current))
+    |> assign(:map_height, map_height(group))
+  end
+
+  defp assignment_values(values) when is_map(values), do: Map.values(values)
+  defp assignment_values(_values), do: []
+
+  defp filter_tasks(tasks, query) do
+    query = query |> String.trim() |> String.downcase()
+    Enum.filter(tasks, &(search_text(&1) |> String.contains?(query)))
+  end
+
+  defp search_text(task) do
+    [task[:title], task[:repository], task[:assignment_id], get_in(task, [:ownership, :display_name])]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" ")
+    |> String.downcase()
+  end
+
+  defp ownership_groups(tasks, view) do
+    tasks
+    |> Enum.group_by(&owner_id/1)
+    |> Enum.map(fn {id, values} ->
+      %{
+        id: id,
+        name: group_name(id, values, view),
+        tasks: Enum.sort_by(values, &task_sort/1),
+        running: Enum.count(values, &(&1.worker.active == true))
+      }
+    end)
+    |> Enum.sort_by(&{&1.id == "__unassigned__", String.downcase(&1.name)})
+  end
+
+  defp owner_id(%{ownership: %{status: "owned", pm_id: id}}) when is_binary(id), do: id
+  defp owner_id(_task), do: "__unassigned__"
+
+  defp group_name("__unassigned__", _tasks, "history"), do: "Earlier unassigned work"
+  defp group_name("__unassigned__", _tasks, _view), do: "Needs a project manager"
+
+  defp group_name(id, tasks, _view) do
+    Enum.find_value(tasks, &get_in(&1, [:ownership, :display_name])) || "PM #{String.slice(id, 0, 8)}"
+  end
+
+  defp task_sort(task), do: {phase_order(task.phase), String.downcase(task_label(task)), task.assignment_id}
+  defp phase_order("waiting"), do: 0
+  defp phase_order("review"), do: 1
+  defp phase_order("review_pending"), do: 1
+  defp phase_order("active"), do: 2
+  defp phase_order("ready"), do: 3
+  defp phase_order(_phase), do: 4
+
+  defp work_counts(tasks) do
+    %{
+      running: Enum.count(tasks, &(&1.worker.active == true)),
+      review: Enum.count(tasks, &(&1.phase in ["review", "review_pending"])),
+      waiting: Enum.count(tasks, &(&1.phase in ["waiting", "blocked", "failed"])),
+      queued: Enum.count(tasks, &(&1.phase in ["ready", "bound", "queued"]))
+    }
+  end
+
+  defp map_height(nil), do: 400
+  defp map_height(group), do: max(length(group.tasks) * 176 + 28, 400)
+  defp task_top(index), do: index * 176 + 26
+
+  defp connection_path(index, height) do
+    middle = div(height, 2)
+    target = task_top(index) + 76
+    "M 295 #{middle} C 367 #{middle}, 371 #{target}, 443 #{target}"
+  end
+
+  defp phase_breakdown(tasks) do
+    tasks |> Enum.frequencies_by(& &1.phase) |> Enum.sort_by(fn {phase, _count} -> phase_order(phase) end)
+  end
+
+  defp phase_label("ready"), do: "Queued"
+  defp phase_label("bound"), do: "Queued"
+  defp phase_label("review"), do: "Needs review"
+  defp phase_label("review_pending"), do: "Accepting"
+  defp phase_label("active"), do: "Active"
+  defp phase_label(phase), do: humanize(phase)
+
+  defp humanize(value), do: value |> to_string() |> String.replace("_", " ") |> String.capitalize()
+  defp plural(1, word), do: word
+  defp plural(_number, word), do: word <> "s"
+  defp task_label(task), do: task[:title] || issue_label(task)
+  defp issue_label(%{issue_number: number}) when is_integer(number), do: "Issue ##{number}"
+  defp issue_label(task), do: "Task #{String.slice(task.assignment_id, 0, 10)}"
+
+  defp route_label(task) do
+    route = task[:route] || %{}
+    model = route[:model] || "Model not recorded"
+    short = model |> String.replace("gpt-5.6-", "") |> String.replace("gpt-", "") |> String.capitalize()
+    if route[:effort], do: "#{short} · #{route.effort}", else: short
+  end
+
+  defp task_activity(%{worker: %{active: true}} = task, payload) do
+    case Enum.find(payload.running, &(&1.issue_id == task.assignment_id)) do
+      nil -> task.worker.activity || "Worker is running"
+      active -> display_activity(active.last_message)
+    end
+  end
+
+  defp task_activity(%{phase: phase}, _payload) when phase in ["review", "review_pending"], do: "With the PM for review"
+  defp task_activity(%{phase: "waiting"} = task, _payload), do: task[:blocked_reason] || "Waiting for the next action"
+  defp task_activity(%{phase: phase}, _payload) when phase in ["ready", "queued", "bound"], do: "Waiting to be dispatched"
+  defp task_activity(_task, _payload), do: "Worker is not running"
+
+  defp display_activity(nil), do: "Worker is running"
+
+  defp display_activity(message) do
+    message
+    |> String.replace(~r/ \((?:rs_|msg_|call_|exec_)[^)]+\)/, "")
+    |> String.replace(~r/^item (?:started|completed): /, "")
+    |> String.capitalize()
+  end
+
+  defp owner_description(%{id: "__unassigned__"}, "live"), do: "These open assignments need an owner before work can proceed."
+  defp owner_description(_group, "history"), do: "This work has ended. It is kept here for reference and is excluded from the live map."
+  defp owner_description(group, _view), do: "#{group.name} owns the assignments connected in this map. Select one to inspect its state and latest report."
+
+  defp view_title("history"), do: "Work history"
+  defp view_title("runtime"), do: "Runtime"
+  defp view_title(_view), do: "Live work"
+  defp view_description("history"), do: "Completed and cancelled assignments, separate from current work."
+  defp view_description("runtime"), do: "A closer look at workers and service health."
+  defp view_description(_view), do: "See who owns the work, what is running, and what needs attention."
+
+  defp empty_heading(_view, query) when query != "", do: "No matching tasks"
+  defp empty_heading("history", _query), do: "No past work yet"
+  defp empty_heading(_view, _query), do: "No open assignments"
+  defp empty_description(_view, query) when query != "", do: "Try a task title, repository, or PM name."
+  defp empty_description("history", _query), do: "Completed and cancelled assignments will appear here."
+  defp empty_description(_view, _query), do: "Completed work is in History. New assignments will appear here when they are enrolled."
+
+  defp updated_time(%{generated_at: value}) when is_binary(value), do: String.slice(value, 11, 8) <> " UTC"
+  defp updated_time(_payload), do: "unavailable"
+
+  defp format_runtime(started_at, now) do
+    seconds = elapsed_seconds(started_at, now)
+    "#{div(seconds, 60)}m #{rem(seconds, 60)}s"
+  end
+
+  defp elapsed_seconds(value, now) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, started_at, _offset} -> max(DateTime.diff(now, started_at, :second), 0)
+      _ -> 0
+    end
+  end
+
+  defp elapsed_seconds(_value, _now), do: 0
+
   defp external_issue_url(url) when is_binary(url) do
-    url = String.trim(url)
-
-    case URI.parse(url) do
-      %URI{scheme: scheme, host: host}
-      when scheme in ["http", "https"] and is_binary(host) and host != "" ->
-        url
-
-      _ ->
-        nil
+    case URI.parse(String.trim(url)) do
+      %URI{scheme: scheme, host: host} when scheme in ["http", "https"] and is_binary(host) and host != "" -> url
+      _ -> nil
     end
   end
 
   defp external_issue_url(_url), do: nil
 
-  defp completed_runtime_seconds(payload) do
-    payload.codex_totals.seconds_running || 0
+  defp load_payload do
+    Presenter.state_payload(Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator, Endpoint.config(:snapshot_timeout_ms) || 15_000)
   end
 
-  defp total_runtime_seconds(payload, now) do
-    completed_runtime_seconds(payload) +
-      Enum.reduce(payload.running, 0, fn entry, total ->
-        total + runtime_seconds_from_started_at(entry.started_at, now)
-      end)
-  end
-
-  defp format_runtime_and_turns(started_at, turn_count, now) when is_integer(turn_count) and turn_count > 0 do
-    "#{format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))} / #{turn_count}"
-  end
-
-  defp format_runtime_and_turns(started_at, _turn_count, now),
-    do: format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))
-
-  defp format_runtime_seconds(seconds) when is_number(seconds) do
-    whole_seconds = max(trunc(seconds), 0)
-    mins = div(whole_seconds, 60)
-    secs = rem(whole_seconds, 60)
-    "#{mins}m #{secs}s"
-  end
-
-  defp runtime_seconds_from_started_at(%DateTime{} = started_at, %DateTime{} = now) do
-    DateTime.diff(now, started_at, :second)
-  end
-
-  defp runtime_seconds_from_started_at(started_at, %DateTime{} = now) when is_binary(started_at) do
-    case DateTime.from_iso8601(started_at) do
-      {:ok, parsed, _offset} -> runtime_seconds_from_started_at(parsed, now)
-      _ -> 0
-    end
-  end
-
-  defp runtime_seconds_from_started_at(_started_at, _now), do: 0
-
-  defp format_int(value) when is_integer(value) do
-    value
-    |> Integer.to_string()
-    |> String.reverse()
-    |> String.replace(~r/.{3}(?=.)/, "\\0,")
-    |> String.reverse()
-  end
-
-  defp format_int(_value), do: "n/a"
-
-  defp state_badge_class(state) do
-    base = "state-badge"
-    normalized = state |> to_string() |> String.downcase()
-
-    cond do
-      String.contains?(normalized, ["progress", "running", "active"]) -> "#{base} state-badge-active"
-      String.contains?(normalized, ["blocked", "error", "failed"]) -> "#{base} state-badge-danger"
-      String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
-      true -> base
-    end
-  end
-
-  defp schedule_runtime_tick do
-    Process.send_after(self(), :runtime_tick, @runtime_tick_ms)
-  end
-
-  defp pretty_value(nil), do: "n/a"
-  defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
+  defp schedule_runtime_tick, do: Process.send_after(self(), :runtime_tick, @runtime_tick_ms)
 end

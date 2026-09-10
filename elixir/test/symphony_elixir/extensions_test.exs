@@ -503,7 +503,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     {:ok, view, html} = live(build_conn(), "/")
-    assert html =~ "Operations Dashboard"
+    assert html =~ "Live work"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "MT-BLOCKED"
@@ -514,8 +514,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "rendered"
     assert html =~ "turn blocked: waiting for user input"
     assert html =~ "Runtime"
-    assert html =~ "Live"
-    assert html =~ "Offline"
+    assert html =~ "Live updates"
+    assert html =~ "Disconnected"
+    assert html =~ "Runtime details"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
     refute html =~ "data-runtime-clock="
@@ -569,7 +570,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute render(view) =~ "javascript:alert"
   end
 
-  test "managed dashboard shows ownership, projects, worker counts, handoffs, and projection health" do
+  test "managed dashboard separates live work from history and preserves ownership selection" do
     orchestrator_name = Module.concat(__MODULE__, :ManagedDashboardOrchestrator)
     now = DateTime.utc_now()
     stale = DateTime.add(now, -600, :second)
@@ -585,7 +586,8 @@ defmodule SymphonyElixir.ExtensionsTest do
       },
       principals: %{
         "pm-one" => %{display_name: "PM One", task_uuid: "task-pm-one"},
-        "pm-two" => %{display_name: "PM Two", task_uuid: "task-pm-two"}
+        "pm-two" => %{display_name: "PM Two", task_uuid: "task-pm-two"},
+        "pm-history" => %{display_name: "History PM", task_uuid: "task-pm-history"}
       },
       assignments: %{
         "assign-active" => %{
@@ -602,16 +604,28 @@ defmodule SymphonyElixir.ExtensionsTest do
           worker_activity: "running tests",
           projection: %{status: :synced, revision: 2, updated_at: now, synced_at: now}
         },
+        "assign-active-idle" => %{
+          assignment_id: "assign-active-idle",
+          project_id: "project-alpha",
+          repository: "org/repo-alpha",
+          issue_number: 12,
+          title: "Phase active but idle",
+          phase: :active,
+          status: "active",
+          ownership: %{pm_id: "pm-one", status: :owned, ownership_revision: 5},
+          worker_active: false,
+          route: %{model: "gpt-5.6-luna", effort: "xhigh"}
+        },
         "assign-queued" => %{
           assignment_id: "assign-queued",
           project_id: "project-beta",
           repository: "org/repo-beta",
           issue_number: 22,
-          title: "Queue beta",
+          title: "Stale owner task",
           task_uuid: "task-beta",
           phase: :ready,
           status: "queued",
-          ownership: %{status: :needs_claim},
+          ownership: %{pm_id: "pm-two", status: :needs_claim},
           projection: %{status: :pending, revision: 1, updated_at: stale, retry_at: now}
         },
         "assign-review" => %{
@@ -622,7 +636,32 @@ defmodule SymphonyElixir.ExtensionsTest do
           title: "Review alpha",
           phase: :review,
           status: "review",
+          ownership: %{pm_id: "pm-one", status: :owned},
           projection: %{status: :failed, revision: 5, updated_at: now, error: "provider projection failed"}
+        },
+        "assign-accepted" => %{
+          assignment_id: "assign-accepted",
+          project_id: "project-alpha",
+          repository: "org/repo-alpha",
+          issue_number: 44,
+          title: "Finished history",
+          phase: :accepted,
+          status: "accepted",
+          stop_pending: true,
+          ownership: %{pm_id: "pm-history", status: :owned},
+          worker_active: true
+        },
+        "assign-cancelled" => %{
+          assignment_id: "assign-cancelled",
+          project_id: "project-beta",
+          repository: "org/repo-beta",
+          issue_number: 55,
+          title: "Cancelled history",
+          phase: :cancelled,
+          status: "cancelled",
+          stop_pending: true,
+          ownership: %{status: :unassigned},
+          worker_active: false
         }
       },
       events: [
@@ -649,7 +688,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       ]
     }
 
-    {:ok, _pid} =
+    {:ok, orchestrator_pid} =
       StaticOrchestrator.start_link(
         name: orchestrator_name,
         snapshot: static_snapshot(),
@@ -658,28 +697,149 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
-    {:ok, _view, html} = live(build_conn(), "/")
-    assert html =~ "Managed operations"
-    assert html =~ "project-alpha"
-    assert html =~ "project-beta"
-    assert html =~ "org/repo-alpha"
-    assert html =~ "org/repo-beta"
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Live work"
     assert html =~ "PM One"
-    assert html =~ "PM Two"
-    assert html =~ "Operator claim required"
-    assert html =~ "Review owner unavailable"
-    assert html =~ "worker-alpha (active)"
-    assert html =~ "running tests"
-    assert html =~ "Projection health"
-    assert html =~ "provider projection failed"
-    assert html =~ "Handoff history"
-    assert html =~ "Operator Takeover"
-    assert html =~ "Assignments assign-active"
-    assert html =~ "Outcome: Complete"
+    assert html =~ "Build alpha"
+    assert html =~ "Phase active but idle"
+    assert html =~ "Needs a project manager"
+    refute html =~ "Finished history"
+    refute html =~ "Cancelled history"
+    refute html =~ "History PM"
+    refute html =~ "Ownership transfer history"
+    assert html =~ ~s(title="1 running workers")
+    refute html =~ ~s(title="2 running workers")
+    assert has_element?(view, ~s([data-assignment-id="assign-active"].worker-running))
+    refute has_element?(view, ~s([data-assignment-id="assign-active-idle"].worker-running))
+    assert html =~ "PM identity shows ownership, not whether its Codex task is currently running."
+
+    view
+    |> element("button.manager-option", "Needs a project manager")
+    |> render_click()
+
+    html = render(view)
+    assert html =~ "Stale owner task"
+    refute html =~ "PM Two"
+
+    view
+    |> element("button.manager-option", "PM One")
+    |> render_click()
+
+    assert has_element?(view, "#ownership-map")
+    assert has_element?(view, ~s(button[phx-value-layout="map"]))
+    assert has_element?(view, ~s(button[phx-value-layout="list"]))
+
+    view
+    |> element(~s(button[phx-value-layout="list"]))
+    |> render_click()
+
+    assert has_element?(view, "#live-list")
+    refute has_element?(view, "#ownership-map")
+
+    view
+    |> element(~s(button[phx-value-layout="map"]))
+    |> render_click()
+
+    view
+    |> element(~s(button[data-assignment-id="assign-active"]))
+    |> render_click()
+
+    html = render(view)
+    assert html =~ "Assignment details"
+    assert html =~ "Build alpha"
     assert html =~ ~s(href="https://github.com/org/repo-alpha/issues/11")
-    assert html =~ "pm-one"
-    assert html =~ "pm-two"
-    refute html =~ "/workspaces/"
+    assert html =~ ~s(target="_blank")
+    refute html =~ "javascript:"
+
+    view
+    |> element(~s(button[data-assignment-id="assign-review"]))
+    |> render_click()
+
+    assert has_element?(view, ~s(button[data-assignment-id="assign-review"][aria-pressed]))
+
+    reviewed_state =
+      managed_state
+      |> put_in([:assignments, "assign-active", :phase], :review)
+      |> put_in([:assignments, "assign-active", :status], "review")
+
+    :sys.replace_state(orchestrator_pid, fn state ->
+      Keyword.put(state, :managed_state, {:ok, reviewed_state})
+    end)
+
+    StatusDashboard.notify_update()
+
+    assert_eventually(fn ->
+      has_element?(view, ~s([data-assignment-id="assign-active"])) and
+        has_element?(view, ~s(button[data-assignment-id="assign-review"][aria-pressed]))
+    end)
+
+    accepted_state =
+      reviewed_state
+      |> put_in([:assignments, "assign-active", :phase], :accepted)
+      |> put_in([:assignments, "assign-active", :status], "accepted")
+      |> put_in([:assignments, "assign-active", :stop_pending], true)
+
+    :sys.replace_state(orchestrator_pid, fn state ->
+      Keyword.put(state, :managed_state, {:ok, accepted_state})
+    end)
+
+    StatusDashboard.notify_update()
+
+    assert_eventually(fn ->
+      not has_element?(view, ~s([data-assignment-id="assign-active"])) and
+        has_element?(view, ~s(button[data-assignment-id="assign-review"][aria-pressed]))
+    end)
+
+    view
+    |> element(~s(button[phx-value-view="history"]))
+    |> render_click()
+
+    html = render(view)
+    assert html =~ "Work history"
+    assert html =~ "History PM"
+    assert html =~ "Finished history"
+    assert html =~ "PM One"
+    assert html =~ "Earlier unassigned work"
+    assert has_element?(view, "#history-list")
+
+    view
+    |> element("button.manager-option", "PM One")
+    |> render_click()
+
+    assert render(view) =~ "Build alpha"
+
+    view
+    |> element("button.manager-option", "Earlier unassigned work")
+    |> render_click()
+
+    assert render(view) =~ "Cancelled history"
+
+    view
+    |> element(~s(button[phx-value-view="runtime"]))
+    |> render_click()
+
+    html = render(view)
+    assert html =~ "Runtime details"
+    assert html =~ "Projects and repositories"
+    assert html =~ "Project 4"
+    assert html =~ "org/repo-alpha"
+    assert html =~ "Ownership transfer history"
+    assert html =~ "Handoff"
+    assert html =~ "pm-one → pm-two"
+    assert html =~ "operator → pm-one"
+    assert html =~ "capacity"
+
+    view
+    |> element(~s(button[phx-value-view="live"]))
+    |> render_click()
+
+    view
+    |> form("form.work-search")
+    |> render_change(%{"query" => "idle"})
+
+    html = render(view)
+    assert html =~ "Phase active but idle"
+    refute html =~ "Build alpha"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
