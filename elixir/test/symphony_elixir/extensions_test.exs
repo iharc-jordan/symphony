@@ -630,6 +630,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           cursor: 12,
           at: now,
           operation: :handoff,
+          status: :complete,
           source_pm_id: "pm-one",
           destination_pm_id: "pm-two",
           assignment_ids: ["assign-active"],
@@ -639,6 +640,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           cursor: 11,
           at: now,
           operation: :operator_takeover,
+          status: :complete,
           source_pm_id: "operator",
           destination_pm_id: "pm-one",
           assignment_id: "assign-review",
@@ -672,6 +674,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "provider projection failed"
     assert html =~ "Handoff history"
     assert html =~ "Operator Takeover"
+    assert html =~ "Assignments assign-active"
+    assert html =~ "Outcome: Complete"
     assert html =~ "pm-one"
     assert html =~ "pm-two"
     refute html =~ "/workspaces/"

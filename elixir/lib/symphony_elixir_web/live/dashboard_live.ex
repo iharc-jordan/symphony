@@ -213,9 +213,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </td>
                       <td>
                         <span class={owner_class(assignment)}><%= owner_label(assignment) %></span>
-                        <span class="muted"><%= humanize_status(assignment.ownership.status) %></span>
-                        <%= if assignment.operator_reconciliation_required do %>
-                          <span class="muted">Operator reconciliation required</span>
+                        <%= if ownership_status_visible?(assignment) do %>
+                          <span class="muted"><%= humanize_status(assignment.ownership.status) %></span>
                         <% end %>
                       </td>
                       <td><span class={managed_status_class(assignment.status)}><%= humanize_status(assignment.status) %></span></td>
@@ -278,6 +277,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <span class="mono"><%= handoff.destination_id || "destination unavailable" %></span>
                   </p>
                   <p class="muted"><%= handoff_reason(handoff) %></p>
+                  <p class="muted">
+                    <%= handoff_scope(handoff) %> · <%= handoff_outcome(handoff) %>
+                  </p>
                 </article>
               </div>
             </section>
@@ -552,6 +554,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
     end
   end
 
+  defp ownership_status_visible?(assignment) do
+    assignment.ownership.status not in ["needs_claim", "needs_operator_reconciliation"]
+  end
+
   defp task_label(assignment) do
     Map.get(assignment, :title) || assignment.task.id || assignment.assignment_id
   end
@@ -574,6 +580,19 @@ defmodule SymphonyElixirWeb.DashboardLive do
       true -> "Assignment details unavailable"
     end
   end
+
+  defp handoff_scope(%{assignment_ids: ids}) when is_list(ids) and ids != [] do
+    "Assignments " <> Enum.join(ids, ", ")
+  end
+
+  defp handoff_scope(%{assignment_id: id}) when is_binary(id), do: "Assignment " <> id
+  defp handoff_scope(_handoff), do: "Assignment scope unavailable"
+
+  defp handoff_outcome(%{status: status}) when is_binary(status) and status != "" do
+    "Outcome: " <> humanize_status(status)
+  end
+
+  defp handoff_outcome(_handoff), do: "Outcome unavailable"
 
   defp join_values(values) when is_list(values) and values != [], do: Enum.join(values, ", ")
   defp join_values(_values), do: "None recorded"

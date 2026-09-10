@@ -433,6 +433,7 @@ defmodule SymphonyElixirWeb.Presenter do
       cursor: Map.get(event, :cursor),
       at: iso8601(Map.get(event, :at)),
       operation: text_value(Map.get(event, :operation)),
+      status: text_value(Map.get(event, :status)),
       source_id: text_value(Map.get(event, :source_pm_id)),
       destination_id: text_value(Map.get(event, :destination_pm_id)),
       assignment_id: text_value(Map.get(event, :assignment_id)),
