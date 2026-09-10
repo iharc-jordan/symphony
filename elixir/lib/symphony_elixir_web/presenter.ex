@@ -161,8 +161,7 @@ defmodule SymphonyElixirWeb.Presenter do
             display_name: display_name || principal_id,
             role: text_value(value(principal, :role)),
             task_id: task_id || principal_id,
-            title: text_value(value(principal, :title)),
-            codex_link: verified_codex_link(principal)
+            title: text_value(value(principal, :title))
           }
         )
       else
@@ -231,7 +230,7 @@ defmodule SymphonyElixirWeb.Presenter do
       repository: text_value(value(assignment, :repository)),
       issue_number: value(assignment, :issue_number),
       title: title,
-      task: %{id: task_id, title: title, codex_link: verified_codex_link(assignment)},
+      task: %{id: task_id, title: title},
       phase: phase,
       status: status,
       board_state: text_value(value(assignment, :board_state)),
@@ -303,8 +302,7 @@ defmodule SymphonyElixirWeb.Presenter do
           kind: text_value(value(report, :kind) || value(report, :type)),
           status: text_value(value(report, :status)),
           updated_at: iso8601(value(report, :updated_at)),
-          count: value(report, :count),
-          url: safe_external_url(value(report, :url))
+          count: value(report, :count)
         })
       else
         %{status: "available"}
@@ -343,10 +341,11 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp safe_worker(assignment) do
     worker = value(assignment, :worker) || %{}
+    active = if is_nil(value(assignment, :worker_active)), do: value(worker, :active), else: value(assignment, :worker_active)
 
     %{
       id: text_value(value(assignment, :worker_id) || value(assignment, :agent_id) || value(worker, :id) || value(worker, :worker_id)),
-      active: value(assignment, :worker_active) || value(worker, :active),
+      active: active,
       activity: text_value(value(assignment, :worker_activity) || value(assignment, :activity) || value(worker, :activity))
     }
   end
@@ -356,8 +355,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
     %{
       id: text_value(value(assignment, :thread_id) || value(assignment, :session_id) || value(assignment, :task_uuid) || value(thread, :id) || value(thread, :thread_id)),
-      title: text_value(value(assignment, :title) || value(assignment, :task_title) || value(thread, :title)),
-      codex_link: verified_codex_link(assignment)
+      title: text_value(value(assignment, :title) || value(assignment, :task_title) || value(thread, :title))
     }
   end
 
@@ -439,33 +437,6 @@ defmodule SymphonyElixirWeb.Presenter do
   defp safe_id_list(ids) when is_list(ids), do: ids |> Enum.map(&text_value/1) |> Enum.reject(&is_nil/1)
   defp safe_id_list(id), do: if(text_value(id), do: [text_value(id)], else: [])
 
-  defp verified_codex_link(map) when is_map(map) do
-    thread = value(map, :thread) || %{}
-
-    verified? =
-      value(map, :codex_link_verified) == true or
-        value(map, :task_link_verified) == true or
-        value(map, :codex_url_verified) == true or
-        value(thread, :codex_link_verified) == true or
-        value(thread, :task_link_verified) == true
-
-    link =
-      value(map, :codex_link) ||
-        value(map, :task_link) ||
-        value(map, :codex_url) ||
-        value(map, :task_url) ||
-        value(thread, :codex_link) ||
-        value(thread, :task_link)
-
-    if verified? and is_binary(link) and String.trim(link) =~ ~r/^codex:\/\/threads\/[^\/\s]+$/ do
-      String.trim(link)
-    else
-      nil
-    end
-  end
-
-  defp verified_codex_link(_map), do: nil
-
   defp safe_repositories(repositories) when is_list(repositories) do
     repositories |> Enum.map(&text_value/1) |> Enum.reject(&is_nil/1) |> Enum.uniq()
   end
@@ -486,18 +457,6 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp safe_status_options(_options), do: %{}
-
-  defp safe_external_url(url) when is_binary(url) do
-    case URI.parse(String.trim(url)) do
-      %URI{scheme: scheme, host: host} when scheme in ["http", "https"] and is_binary(host) and host != "" ->
-        String.trim(url)
-
-      _ ->
-        nil
-    end
-  end
-
-  defp safe_external_url(_url), do: nil
 
   defp integer_or_zero(value) when is_integer(value), do: value
   defp integer_or_zero(_value), do: 0

@@ -584,7 +584,7 @@ defmodule SymphonyElixir.ExtensionsTest do
         "project-beta" => %{project_id: "project-beta", project_number: 8, repositories: ["org/repo-beta"], revision: 3}
       },
       principals: %{
-        "pm-one" => %{display_name: "PM One", task_uuid: "task-pm-one", codex_link: "codex://threads/task-pm-one", codex_link_verified: true},
+        "pm-one" => %{display_name: "PM One", task_uuid: "task-pm-one"},
         "pm-two" => %{display_name: "PM Two", task_uuid: "task-pm-two"}
       },
       assignments: %{
@@ -658,8 +658,6 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Operator Takeover"
     assert html =~ "pm-one"
     assert html =~ "pm-two"
-    assert html =~ ~s(href="codex://threads/task-pm-one")
-    refute html =~ "codex://threads/task-beta"
     refute html =~ "/workspaces/"
   end
 

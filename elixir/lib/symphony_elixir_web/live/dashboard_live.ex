@@ -203,11 +203,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <tr :for={{_assignment_id, assignment} <- managed_entries(@payload.managed.assignments)}>
                       <td>
                         <div class="issue-stack">
-                          <%= if assignment.task.codex_link do %>
-                            <a class="issue-id issue-id-link" href={assignment.task.codex_link}><%= task_label(assignment) %></a>
-                          <% else %>
-                            <span class="issue-id"><%= task_label(assignment) %></span>
-                          <% end %>
+                          <span class="issue-id"><%= task_label(assignment) %></span>
                           <span class="muted mono"><%= assignment.assignment_id %></span>
                         </div>
                       </td>
@@ -256,11 +252,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <article :for={{principal_id, principal} <- managed_entries(@payload.managed.principals)} class="managed-principal-card">
                   <strong><%= principal.display_name %></strong>
                   <span class="muted mono"><%= principal_id %></span>
-                  <%= if principal.codex_link do %>
-                    <a class="issue-link" href={principal.codex_link}>Open task</a>
-                  <% else %>
-                    <span class="muted">Task link unavailable</span>
-                  <% end %>
+                  <span class="muted">Task link unavailable</span>
                 </article>
               </div>
             </section>
