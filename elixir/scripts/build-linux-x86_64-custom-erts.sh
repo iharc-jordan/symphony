@@ -25,4 +25,9 @@ fi
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 export BURRITO_TARGET=linux_x86_64
 export MIX_ENV=prod
-exec mise exec zig@0.15.2 -- mix release symphony --overwrite
+
+# Reusing a release directory preserves older application versions, which Burrito
+# would embed alongside the current payload. Stage this build in an empty path.
+release_path="$(mktemp -d "${TMPDIR:-/tmp}/symphony-release.XXXXXX")"
+trap 'rm -rf -- "$release_path"' EXIT
+mise exec zig@0.15.2 -- mix release symphony --path "$release_path"
