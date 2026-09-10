@@ -3,7 +3,68 @@ defmodule SymphonyElixir.ManagedRulesTest do
 
   alias SymphonyElixir.Managed.Rules
 
-  defp envelope(id, operation, args), do: %{request_id: id, operation: operation, args: args}
+  @operator %{principal_id: "operator", role: :operator, project_scope: :all}
+  @pm %{principal_id: "pm", role: :pm, project_scope: :all}
+
+  defp envelope(id, operation, args) do
+    args =
+      case operation do
+        operation when operation in [:revise, :interrupt, :cancel, :review] ->
+          args
+          |> Map.put_new(:project_id, "PVT_kwDO")
+          |> Map.put_new(:expected_ownership_revision, 1)
+
+        operation when operation in [:pause, :resume] ->
+          if is_map(args) and Map.has_key?(args, :assignments) do
+            args
+            |> Map.put_new(:project_id, "PVT_kwDO")
+            |> Map.update!(:assignments, fn assignments ->
+              Enum.map(assignments, fn fence ->
+                fence
+                |> Map.put_new(:expected_revision, 1)
+                |> Map.put_new(:expected_ownership_revision, 1)
+              end)
+            end)
+          else
+            args
+          end
+
+        _ ->
+          args
+      end
+
+    %{request_id: id, operation: operation, args: args}
+  end
+
+  defp principal_for(:bind_project, _args), do: @operator
+  defp principal_for(:operator_takeover, _args), do: @operator
+  defp principal_for(:register_pm, _args), do: @pm
+
+  defp principal_for(:pause, args) when is_map(args) do
+    if Map.has_key?(args, :assignments) or Map.has_key?(args, "assignments"), do: @pm, else: @operator
+  end
+
+  defp principal_for(:resume, args) when is_map(args) do
+    if Map.has_key?(args, :assignments) or Map.has_key?(args, "assignments"), do: @pm, else: @operator
+  end
+
+  defp principal_for("pause", _args), do: @operator
+  defp principal_for("resume", _args), do: @operator
+  defp principal_for(_operation, _args), do: @pm
+
+  defp apply_request(state, request, context \\ %{}) do
+    operation = Map.get(request, :operation, Map.get(request, "operation"))
+    args = Map.get(request, :args, Map.get(request, "args", %{}))
+    context = Map.put_new(context, :principal, principal_for(operation, args))
+    Rules.apply(state, request, context)
+  end
+
+  defp prepare_request(state, request, context \\ %{}) do
+    operation = Map.get(request, :operation, Map.get(request, "operation"))
+    args = Map.get(request, :args, Map.get(request, "args", %{}))
+    context = Map.put_new(context, :principal, principal_for(operation, args))
+    Rules.prepare_review(state, request, context)
+  end
 
   defp binding_args(expected_revision \\ 0) do
     %{
@@ -33,7 +94,11 @@ defmodule SymphonyElixir.ManagedRulesTest do
       issue_number: Keyword.get(opts, :issue_number, 12),
       base_commit: "abc123",
       board_state: "READY",
-      resources: Keyword.get(opts, :resources, ["repo:acme/example"]),
+      project_id: "PVT_kwDO",
+      resources:
+        Keyword.get(opts, :resources, [
+          %{kind: :repository, authority: "github", identity: "acme/example", access: :write}
+        ]),
       dependencies: Keyword.get(opts, :dependencies, []),
       route: Keyword.get(opts, :route, %{model: "gpt-5.6-luna", effort: "xhigh"})
     }
@@ -47,7 +112,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
 
   defp bound_state do
     {:ok, state, _response} =
-      Rules.apply(Rules.new(), envelope("bind-1", :bind_project, binding_args()))
+      apply_request(Rules.new(), envelope("bind-1", :bind_project, binding_args()))
 
     state
   end
@@ -56,7 +121,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
     state = bound_state()
 
     {:ok, state, _response} =
-      Rules.apply(state, envelope("enroll-" <> id, :enroll, enrollment_args(id, 1, opts)))
+      apply_request(state, envelope("enroll-" <> id, :enroll, enrollment_args(id, 1, opts)))
 
     state
   end
@@ -85,11 +150,11 @@ defmodule SymphonyElixir.ManagedRulesTest do
         reason: "needs changes"
       })
 
-    assert {:ok, intent} = Rules.prepare_review(state, rework)
+    assert {:ok, intent} = prepare_request(state, rework)
     assert intent.disposition == :rework
     refute intent.requires_effects
 
-    assert {:ok, reworked, rework_response} = Rules.apply(state, rework)
+    assert {:ok, reworked, rework_response} = apply_request(state, rework)
     assert rework_response.phase == :ready
     assert reworked.assignments["issue-1"].phase == :ready
     assert reworked.assignments["issue-1"].board_state == :ready
@@ -102,7 +167,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
         reason: "waiting on dependency"
       })
 
-    assert {:ok, blocked_state, blocked_response} = Rules.apply(state, blocked)
+    assert {:ok, blocked_state, blocked_response} = apply_request(state, blocked)
     assert blocked_response.phase == :waiting
     assert blocked_state.assignments["issue-1"].phase == :waiting
     assert blocked_state.assignments["issue-1"].board_state == :waiting
@@ -112,22 +177,22 @@ defmodule SymphonyElixir.ManagedRulesTest do
     state = bound_state()
     request = envelope("same-id", :enroll, enrollment_args("issue-1", 1))
 
-    assert {:ok, next_state, response} = Rules.apply(state, request)
-    assert {:duplicate, duplicate_response} = Rules.apply(next_state, request)
+    assert {:ok, next_state, response} = apply_request(state, request)
+    assert {:duplicate, duplicate_response} = apply_request(next_state, request)
     assert Map.put(response, :duplicate, true) == Map.put(duplicate_response, :duplicate, true)
 
     changed = envelope("same-id", :enroll, enrollment_args("issue-2", 2))
-    assert {:error, :request_id_conflict, %{request_id: "same-id"}} = Rules.apply(next_state, changed)
+    assert {:error, :request_id_conflict, %{request_id: "same-id"}} = apply_request(next_state, changed)
   end
 
   test "enrollment enforces repository, identity, and exclusive resources" do
     state = enrolled_state("issue-1")
 
     assert {:error, :duplicate_underlying_identity, %{assignment_id: "issue-1"}} =
-             Rules.apply(state, envelope("enroll-2", :enroll, enrollment_args("issue-2", 2)))
+             apply_request(state, envelope("enroll-2", :enroll, enrollment_args("issue-2", 2)))
 
     assert {:error, :resource_conflict, %{assignment_id: "issue-1"}} =
-             Rules.apply(
+             apply_request(
                state,
                envelope("enroll-3", :enroll, enrollment_args("issue-3", 2, issue_number: 13))
              )
@@ -137,7 +202,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
     state = bound_state()
 
     assert {:error, :requirements_fingerprint_required, %{}} =
-             Rules.apply(
+             apply_request(
                state,
                envelope(
                  "enroll-requirements-without-fingerprint",
@@ -153,7 +218,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
         requirements_revision: 4
       )
 
-    assert {:ok, next_state, _} = Rules.apply(state, envelope("enroll-with-fingerprint", :enroll, args))
+    assert {:ok, next_state, _} = apply_request(state, envelope("enroll-with-fingerprint", :enroll, args))
     assignment = next_state.assignments["issue-1"]
     refute Map.has_key?(assignment, :requirements)
     assert assignment.requirements_fingerprint == "sha256:body"
@@ -175,7 +240,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
     args = %{assignment_id: "issue-1", expected_revision: 2, disposition: "accepted", evidence: ["test log"]}
 
     assert {:error, :provider_state_not_review, %{}} =
-             Rules.apply(state, envelope("review-no-proof", :review, Map.put(args, :provider_state, "review")))
+             apply_request(state, envelope("review-no-proof", :review, Map.put(args, :provider_state, "review")))
 
     context = %{
       provider_state: :review,
@@ -183,7 +248,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
       external_effects: %{status: :ok, issue_close: :ok}
     }
 
-    assert {:ok, accepted, response} = Rules.apply(state, envelope("review-ok", :review, args), context)
+    assert {:ok, accepted, response} = apply_request(state, envelope("review-ok", :review, args), context)
     assert accepted.assignments["issue-1"].phase == :accepted
     assert accepted.assignments["issue-1"].revision == 3
     assert response.issue_close == :ok
@@ -204,10 +269,10 @@ defmodule SymphonyElixir.ManagedRulesTest do
         changes: %{route: %{model: "gpt-5.6-terra", effort: "max"}, escalation_reason: "fixture escalation"}
       })
 
-    assert {:error, :active_assignment_stop_required, %{}} = Rules.apply(state, request)
+    assert {:error, :active_assignment_stop_required, %{}} = apply_request(state, request)
 
     assert {:ok, revised, _} =
-             Rules.apply(state, request, %{stop_reconciled: true})
+             apply_request(state, request, %{stop_reconciled: true})
 
     assert revised.assignments["issue-1"].phase == :ready
     assert revised.assignments["issue-1"].revision == 3
@@ -228,7 +293,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
       })
 
     assert {:error, :invalid_argument, %{argument: :changes, fields: [:stop_pending]}} =
-             Rules.apply(state, request)
+             apply_request(state, request)
 
     body_request =
       envelope("revise-requirements", :revise, %{
@@ -241,7 +306,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
         }
       })
 
-    assert {:ok, revised, _response} = Rules.apply(state, body_request)
+    assert {:ok, revised, _response} = apply_request(state, body_request)
     refute Map.has_key?(revised.assignments["issue-1"], :requirements)
     assert revised.assignments["issue-1"].requirements_fingerprint == "sha256:body"
   end
@@ -253,14 +318,14 @@ defmodule SymphonyElixir.ManagedRulesTest do
       |> put_in([:assignments, "issue-1", :stop_pending], true)
 
     assert {:error, :resource_conflict, %{assignment_id: "issue-1"}} =
-             Rules.apply(
+             apply_request(
                state,
                envelope("enroll-2", :enroll, enrollment_args("issue-2", 2, issue_number: 13))
              )
   end
 
   test "public rule APIs reject malformed requests and cover lifecycle guards" do
-    assert Rules.version() == 1
+    assert Rules.version() == 2
     assert :bind_project in Rules.allowed_operations()
     assert Rules.phase(123) == :unknown
     assert Rules.validate_route(%{model: "gpt-5.6-luna", effort: "xhigh"}) == :ok
@@ -294,15 +359,15 @@ defmodule SymphonyElixir.ManagedRulesTest do
     assert {:error, :expected_revision_required, %{}} = Rules.expected_revision(Rules.new(), %{}, :global)
 
     assert {:error, :invalid_envelope, %{}} =
-             Rules.apply(Rules.new(), %{request_id: "bad", operation: :pause, args: %{}, extra: true})
+             apply_request(Rules.new(), %{request_id: "bad", operation: :pause, args: %{}, extra: true})
 
     assert {:error, :unsupported_operation, %{operation: 12}} =
-             Rules.apply(Rules.new(), envelope("bad-operation", 12, %{}))
+             apply_request(Rules.new(), envelope("bad-operation", 12, %{}))
 
     assert {:error, :unsupported_operation, %{operation: "wat"}} =
-             Rules.apply(Rules.new(), envelope("bad-string-operation", "wat", %{}))
+             apply_request(Rules.new(), envelope("bad-string-operation", "wat", %{}))
 
-    assert {:error, :args_must_be_map, %{}} = Rules.apply(Rules.new(), %{request_id: "bad-args", operation: :pause, args: nil})
+    assert {:error, :args_must_be_map, %{}} = apply_request(Rules.new(), %{request_id: "bad-args", operation: :pause, args: nil})
 
     normalized_args = %{
       "expected_revision" => 0,
@@ -348,56 +413,56 @@ defmodule SymphonyElixir.ManagedRulesTest do
       "issue_body" => "private"
     }
 
-    assert {:ok, _, _} = Rules.apply(Rules.new(), envelope("normalized", :pause, normalized_args))
+    assert {:ok, _, _} = apply_request(Rules.new(), envelope("normalized", :pause, normalized_args))
   end
 
   test "binding, enrollment, revision, dependency, and review error branches are explicit" do
     state = bound_state()
 
     assert {:ok, _, _} =
-             Rules.apply(state, envelope("bind-same", :bind_project, binding_args(1)))
+             apply_request(state, envelope("bind-same", :bind_project, binding_args(1)))
 
     different_binding = put_in(binding_args(1), [:project, :project_id], "PVT_other")
 
     assert {:ok, _, _} =
-             Rules.apply(state, envelope("bind-other", :bind_project, different_binding))
+             apply_request(state, envelope("bind-other", :bind_project, different_binding))
 
     invalid_repositories = put_in(binding_args(), [:project, :repositories], [])
 
     assert {:error, :repository_allowlist_required, %{}} =
-             Rules.apply(Rules.new(), envelope("bind-no-repositories", :bind_project, invalid_repositories))
+             apply_request(Rules.new(), envelope("bind-no-repositories", :bind_project, invalid_repositories))
 
     enrolled = enrolled_state("issue-1")
 
     conflict_binding = put_in(binding_args(2), [:project, :project_id], "PVT_other")
 
     assert {:error, :binding_in_use, %{assignment_id: "issue-1"}} =
-             Rules.apply(enrolled, envelope("bind-conflict", :bind_project, conflict_binding))
+             apply_request(enrolled, envelope("bind-conflict", :bind_project, conflict_binding))
 
     cancelled = put_in(enrolled, [:assignments, "issue-1", :phase], :cancelled)
 
     cancel_terminal = %{assignment_id: "issue-1", expected_revision: 1, reason: "done"}
 
     assert {:error, :already_terminal, %{phase: :cancelled}} =
-             Rules.apply(cancelled, envelope("cancel-terminal", :cancel, cancel_terminal))
+             apply_request(cancelled, envelope("cancel-terminal", :cancel, cancel_terminal))
 
     assert {:error, :project_not_bound, %{}} =
-             Rules.apply(Rules.new(), envelope("enroll-unbound", :enroll, enrollment_args("issue-1", 0)))
+             apply_request(Rules.new(), envelope("enroll-unbound", :enroll, enrollment_args("issue-1", 0)))
 
     malformed_binding = Rules.new(binding: %{})
 
     assert {:error, :project_not_bound, %{}} =
-             Rules.apply(malformed_binding, envelope("enroll-malformed-binding", :enroll, enrollment_args("issue-1", 0)))
+             apply_request(malformed_binding, envelope("enroll-malformed-binding", :enroll, enrollment_args("issue-1", 0)))
 
     invalid_number = put_in(binding_args(), [:project, :project_number], "bad")
 
     assert {:error, :invalid_argument, %{argument: :project_number}} =
-             Rules.apply(Rules.new(), envelope("bind-invalid-number", :bind_project, invalid_number))
+             apply_request(Rules.new(), envelope("bind-invalid-number", :bind_project, invalid_number))
 
     missing_revision = %{assignment_id: "missing", expected_revision: 0, changes: %{}}
 
     assert {:error, :assignment_not_found, %{assignment_id: "missing"}} =
-             Rules.apply(enrolled, envelope("revise-missing", :revise, missing_revision))
+             apply_request(enrolled, envelope("revise-missing", :revise, missing_revision))
 
     waiting =
       enrolled
@@ -408,33 +473,33 @@ defmodule SymphonyElixir.ManagedRulesTest do
     base_revision = %{assignment_id: "issue-1", expected_revision: 2}
 
     assert {:error, :changes_must_be_map, %{}} =
-             Rules.apply(waiting, envelope("revise-nonmap", :revise, Map.merge(base_revision, %{changes: "bad"})))
+             apply_request(waiting, envelope("revise-nonmap", :revise, Map.merge(base_revision, %{changes: "bad"})))
 
     assert {:error, :invalid_argument, %{argument: :requirements}} =
-             Rules.apply(waiting, envelope("revise-bad-requirements", :revise, Map.merge(base_revision, %{changes: %{requirements: "bad"}})))
+             apply_request(waiting, envelope("revise-bad-requirements", :revise, Map.merge(base_revision, %{changes: %{requirements: "bad"}})))
 
     assert {:error, :invalid_argument, %{argument: :resources}} =
-             Rules.apply(waiting, envelope("revise-bad-resources", :revise, Map.merge(base_revision, %{changes: %{resources: :bad}})))
+             apply_request(waiting, envelope("revise-bad-resources", :revise, Map.merge(base_revision, %{changes: %{resources: :bad}})))
 
     assert {:error, :invalid_argument, %{argument: :requirements_revision}} =
-             Rules.apply(waiting, envelope("revise-bad-revision", :revise, Map.merge(base_revision, %{changes: %{requirements_revision: "bad"}})))
+             apply_request(waiting, envelope("revise-bad-revision", :revise, Map.merge(base_revision, %{changes: %{requirements_revision: "bad"}})))
 
-    assert {:ok, _, _} = Rules.apply(waiting, envelope("revise-base-commit", :revise, Map.merge(base_revision, %{changes: %{base_commit: "new-base"}})))
+    assert {:ok, _, _} = apply_request(waiting, envelope("revise-base-commit", :revise, Map.merge(base_revision, %{changes: %{base_commit: "new-base"}})))
 
     assert {:error, :invalid_argument, %{argument: :requirements_revision}} =
-             Rules.apply(state, envelope("enroll-bad-requirements-revision", :enroll, enrollment_args("bad-revision", 1) |> Map.put(:requirements_revision, -1)))
+             apply_request(state, envelope("enroll-bad-requirements-revision", :enroll, enrollment_args("bad-revision", 1) |> Map.put(:requirements_revision, -1)))
 
     active = put_in(enrolled, [:assignments, "issue-1", :phase], :active)
     active = put_in(active, [:assignments, "issue-1", :board_state], :active)
 
     assert {:ok, interrupted, interrupt_response} =
-             Rules.apply(active, envelope("interrupt-active", :interrupt, %{assignment_id: "issue-1", expected_revision: 1, reason: "pause"}))
+             apply_request(active, envelope("interrupt-active", :interrupt, %{assignment_id: "issue-1", expected_revision: 1, reason: "pause"}))
 
     assert interrupted.assignments["issue-1"].phase == :waiting
     assert interrupt_response.phase == :waiting
 
     assert {:ok, cancelled_state, cancel_response} =
-             Rules.apply(enrolled, envelope("cancel-ready", :cancel, %{assignment_id: "issue-1", expected_revision: 1, reason: "stop"}))
+             apply_request(enrolled, envelope("cancel-ready", :cancel, %{assignment_id: "issue-1", expected_revision: 1, reason: "stop"}))
 
     assert cancelled_state.assignments["issue-1"].phase == :cancelled
     assert cancel_response.phase == :cancelled
@@ -449,67 +514,75 @@ defmodule SymphonyElixir.ManagedRulesTest do
 
     review_args = %{assignment_id: "dependent", expected_revision: 2, disposition: "accepted", evidence: ["proof"]}
     proof = %{provider_state: :review, reconciled: true, external_effects: %{status: :ok, issue_close: :ok}}
-    assert {:error, :dependency_not_accepted, %{dependencies: ["missing"]}} = Rules.apply(dependent, envelope("dependent-review", :review, review_args), proof)
+    assert {:error, :dependency_not_accepted, %{dependencies: ["missing"]}} = apply_request(dependent, envelope("dependent-review", :review, review_args), proof)
 
     assert {:error, :external_effects_unreconciled, %{}} =
-             Rules.apply(dependent |> put_in([:assignments, "dependent", :dependencies], []), envelope("review-no-effects", :review, review_args), %{provider_state: :review})
+             apply_request(dependent |> put_in([:assignments, "dependent", :dependencies], []), envelope("review-no-effects", :review, review_args), %{provider_state: :review})
 
     assert {:error, :evidence_required, %{}} =
-             Rules.apply(dependent |> put_in([:assignments, "dependent", :dependencies], []), envelope("review-no-evidence", :review, Map.put(review_args, :evidence, [])), proof)
+             apply_request(dependent |> put_in([:assignments, "dependent", :dependencies], []), envelope("review-no-evidence", :review, Map.put(review_args, :evidence, [])), proof)
 
-    assert {:error, :invalid_disposition, %{disposition: :unknown}} = Rules.apply(dependent, envelope("review-invalid", :review, Map.merge(review_args, %{disposition: "mystery", reason: "bad"})))
+    assert {:error, :invalid_disposition, %{disposition: :unknown}} = apply_request(dependent, envelope("review-invalid", :review, Map.merge(review_args, %{disposition: "mystery", reason: "bad"})))
 
     assert {:error, :invalid_disposition, %{disposition: :unknown}} =
-             Rules.prepare_review(dependent, envelope("review-invalid-prepare", :review, Map.merge(review_args, %{disposition: "mystery", reason: "bad"})))
+             prepare_request(dependent, envelope("review-invalid-prepare", :review, Map.merge(review_args, %{disposition: "mystery", reason: "bad"})))
 
     review_state = put_in(dependent, [:assignments, "dependent", :dependencies], [])
     review_state = put_in(review_state, [:assignments, "dependent", :revision], 2)
     review_request = envelope("review-prepare", :review, Map.merge(review_args, %{disposition: "accepted"}))
-    assert {:ok, _review_intent} = Rules.prepare_review(review_state, review_request)
+    assert {:ok, _review_intent} = prepare_request(review_state, review_request)
 
     duplicate_review =
-      put_in(review_state, [:requests, "review-prepare"], %{canonical: Rules.canonical_input(review_request), response: %{}})
+      put_in(review_state, [:requests, "review-prepare"], %{canonical: Rules.canonical_input(review_request), response: %{}, principal_id: @pm.principal_id})
 
-    assert {:duplicate, %{}} = Rules.prepare_review(duplicate_review, review_request)
+    assert {:duplicate, %{}} = prepare_request(duplicate_review, review_request)
 
     conflict_review = put_in(review_state, [:requests, "review-prepare"], %{canonical: <<0>>, response: %{}})
-    assert {:error, :request_id_conflict, %{request_id: "review-prepare"}} = Rules.prepare_review(conflict_review, review_request)
+    assert {:error, :request_id_conflict, %{request_id: "review-prepare"}} = prepare_request(conflict_review, review_request)
 
-    assert {:error, :invalid_envelope, %{}} = Rules.prepare_review(Rules.new(), %{request_id: "bad", operation: :review, args: %{}, extra: true})
+    assert {:error, :invalid_envelope, %{}} = prepare_request(Rules.new(), %{request_id: "bad", operation: :review, args: %{}, extra: true})
   end
 
   test "binding and enrollment accept list/native identity inputs and enforce caps" do
     list_binding = put_in(binding_args(), [:project, :status_options], [%{name: "READY", id: "ready"}])
-    assert {:ok, list_bound, _} = Rules.apply(Rules.new(), envelope("bind-list", :bind_project, list_binding))
+    assert {:ok, list_bound, _} = apply_request(Rules.new(), envelope("bind-list", :bind_project, list_binding))
 
     native_args = enrollment_args("native-issue", 1) |> Map.merge(%{issue_id: "node-issue", repository_id: "node-repo", turn_limit: 99})
-    assert {:ok, native_state, _} = Rules.apply(list_bound, envelope("enroll-native", :enroll, native_args))
+    assert {:ok, native_state, _} = apply_request(list_bound, envelope("enroll-native", :enroll, native_args))
     assert native_state.assignments["native-issue"].underlying_issue_id == "node-issue"
     assert native_state.assignments["native-issue"].turn_limit == 20
 
-    alias_args = enrollment_args("alias-issue", 2) |> Map.merge(%{issue_node_id: "node-issue-2", repository_node_id: "node-repo-2", issue_number: 98, resources: ["repo:alias"]})
-    assert {:ok, alias_state, _} = Rules.apply(native_state, envelope("enroll-native-aliases", :enroll, alias_args))
+    alias_args =
+      enrollment_args("alias-issue", 2)
+      |> Map.merge(%{
+        issue_node_id: "node-issue-2",
+        repository_node_id: "node-repo-2",
+        issue_number: 98,
+        resources: [%{kind: :repository, authority: "github", identity: "acme/alias", access: :write}]
+      })
+
+    assert {:ok, alias_state, _} = apply_request(native_state, envelope("enroll-native-aliases", :enroll, alias_args))
     assert alias_state.assignments["alias-issue"].native_issue_id == "node-issue-2"
     assert alias_state.assignments["alias-issue"].native_repository_id == "node-repo-2"
 
     duplicate_native = enrollment_args("native-issue-2", 2) |> Map.merge(%{native_issue_id: "node-issue", native_repository_id: "node-repo", issue_number: 99})
 
     assert {:error, :duplicate_underlying_identity, %{assignment_id: "native-issue"}} =
-             Rules.apply(native_state, envelope("enroll-native-duplicate", :enroll, duplicate_native))
+             apply_request(native_state, envelope("enroll-native-duplicate", :enroll, duplicate_native))
 
     invalid_list_binding = put_in(binding_args(), [:project, :status_options], [1])
-    assert {:error, :status_options_required, %{}} = Rules.apply(Rules.new(), envelope("bind-invalid-list", :bind_project, invalid_list_binding))
+    assert {:error, :status_options_required, %{}} = apply_request(Rules.new(), envelope("bind-invalid-list", :bind_project, invalid_list_binding))
 
-    invalid_project = %{project: :bad, expected_revision: 0}
-    assert {:error, :invalid_argument, %{argument: :project_id}} = Rules.apply(Rules.new(), envelope("bind-invalid-project", :bind_project, invalid_project))
+    invalid_project = %{project: %{project_id: 12}, expected_revision: 0}
+    assert {:error, :invalid_argument, %{argument: :project_id}} = apply_request(Rules.new(), envelope("bind-invalid-project", :bind_project, invalid_project))
 
     invalid_enroll = enrollment_args("bad-resources", 1) |> Map.put(:resources, :bad)
-    assert {:error, :invalid_argument, %{argument: :resources}} = Rules.apply(list_bound, envelope("enroll-invalid-resources", :enroll, invalid_enroll))
+    assert {:error, :invalid_argument, %{argument: :resources}} = apply_request(list_bound, envelope("enroll-invalid-resources", :enroll, invalid_enroll))
 
     invalid_phase = enrollment_args("bad-phase", 1) |> Map.put(:board_state, "ACTIVE")
-    assert {:error, :invalid_phase, %{}} = Rules.apply(list_bound, envelope("enroll-invalid-phase", :enroll, invalid_phase))
+    assert {:error, :invalid_phase, %{}} = apply_request(list_bound, envelope("enroll-invalid-phase", :enroll, invalid_phase))
 
-    assert {:ok, _string_operation_state, _} = Rules.apply(Rules.new(), envelope("string-operation", "pause", %{"expected_revision" => 0}))
+    assert {:ok, _string_operation_state, _} = apply_request(Rules.new(), envelope("string-operation", "pause", %{"expected_revision" => 0}))
   end
 
   test "route revisions start a new session while preserving workspace and allowance" do
@@ -533,7 +606,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
 
     for route <- [%{model: "gpt-5.6-luna", effort: "max"}, %{model: "gpt-5.6-terra", effort: "xhigh"}] do
       args = %{assignment_id: "issue-1", expected_revision: 1, changes: %{route: route, escalation_reason: "Diagnosis requires additional reasoning"}}
-      assert {:ok, revised, _} = Rules.apply(state, envelope("change-route", :revise, args), %{stop_reconciled: true})
+      assert {:ok, revised, _} = apply_request(state, envelope("change-route", :revise, args), %{stop_reconciled: true})
       assignment = revised.assignments["issue-1"]
       assert assignment.route == route
       assert assignment.revision == 2
@@ -546,7 +619,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
     end
 
     same_route = %{assignment_id: "issue-1", expected_revision: 1, changes: %{route: %{model: "gpt-5.6-luna", effort: "xhigh"}}}
-    assert {:ok, same, _} = Rules.apply(state, envelope("same-route", :revise, same_route), %{stop_reconciled: true})
+    assert {:ok, same, _} = apply_request(state, envelope("same-route", :revise, same_route), %{stop_reconciled: true})
     assert same.assignments["issue-1"].thread_id == "old-thread"
     assert same.assignments["issue-1"].resume_ready
   end
@@ -554,7 +627,7 @@ defmodule SymphonyElixir.ManagedRulesTest do
   test "request history remains bounded after many valid operations" do
     state =
       Enum.reduce(1..101, Rules.new(), fn index, state ->
-        assert {:ok, next_state, _response} = Rules.apply(state, envelope("pause-#{index}", :pause, %{expected_revision: index - 1}))
+        assert {:ok, next_state, _response} = apply_request(state, envelope("pause-#{index}", :pause, %{expected_revision: index - 1}))
         next_state
       end)
 

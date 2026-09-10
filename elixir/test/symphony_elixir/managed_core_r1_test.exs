@@ -39,19 +39,46 @@ defmodule SymphonyElixir.ManagedCoreR1Test do
 
   test "old PM controls are fenced after an atomic handoff" do
     {:ok, state, _} = Rules.apply(bound(), envelope("enroll", :enroll, enrollment("a", 1)), %{principal: @pm_a})
-    {:ok, state, _} = Rules.apply(state, envelope("register", :register_pm, %{expected_revision: 2, display_name: "B"}), %{principal: @pm_b})
+
+    {:ok, state, _} =
+      Rules.apply(state, envelope("register", :register_pm, %{display_name: "B"}), %{principal: @pm_b})
 
     handoff = %{
       project_id: "project-1",
+      destination_pm_id: "pm-b",
       assignments: [%{assignment_id: "a", expected_revision: 1, expected_ownership_revision: 1}],
       reason: "coverage"
     }
 
-    {:ok, state, _} = Rules.apply(state, envelope("handoff", :handoff, handoff), Map.merge(%{principal: @pm_a}, %{target_principal_id: "pm-b"}))
+    {:ok, state, _} = Rules.apply(state, envelope("handoff", :handoff, handoff), %{principal: @pm_a})
     assert state.assignments["a"].ownership.pm_id == "pm-b"
 
     stale = %{project_id: "project-1", assignment_id: "a", expected_revision: 1, expected_ownership_revision: 1, reason: "stale"}
     assert {:error, :ownership_conflict, _} = Rules.apply(state, envelope("stale", :cancel, stale), %{principal: @pm_a})
+  end
+
+  test "review preparation keeps internal principal context out of the persisted wire request" do
+    {:ok, state, _} = Rules.apply(bound(), envelope("enroll-review", :enroll, enrollment("review", 1)), %{principal: @pm_a})
+
+    state =
+      state
+      |> put_in([:assignments, "review", :phase], :review)
+      |> put_in([:assignments, "review", :board_state], :review)
+      |> put_in([:assignments, "review", :revision], 2)
+
+    request =
+      envelope("prepare-review", :review, %{
+        project_id: "project-1",
+        assignment_id: "review",
+        expected_revision: 2,
+        expected_ownership_revision: 1,
+        disposition: "rework",
+        reason: "needs changes"
+      })
+
+    assert {:ok, intent} = Rules.prepare_review(state, request, %{principal: @pm_a})
+    assert intent.request == request
+    refute Map.has_key?(intent.request, :principal)
   end
 
   test "operator takeover is explicit for migrated needs-claim work" do
@@ -100,6 +127,69 @@ defmodule SymphonyElixir.ManagedCoreR1Test do
     assert "legacy-review" in migrated.migration.reconciliation_required
   end
 
+  test "migration rejects unsupported schema versions and journal identity mismatches" do
+    assert {:error, :managed_journal_schema_mismatch, %{}} = Migration.migrate(%{version: 0})
+    assert {:error, :managed_journal_schema_mismatch, %{}} = Migration.migrate(%{version: 3})
+
+    mismatched =
+      %{
+        version: 1,
+        binding: %{project_id: "project-1", project_number: 1, status_field_id: "status", status_options: %{"READY" => "ready"}, repositories: ["acme/repo"]},
+        assignments: %{"journal-a" => Map.put(enrollment("embedded", 0), :assignment_id, "embedded")},
+        requests: %{},
+        review_intents: %{},
+        effect_intents: %{}
+      }
+
+    assert {:error, :assignment_identity_mismatch, %{assignment_id: "journal-a"}} = Migration.migrate(mismatched)
+  end
+
+  test "migration marks nonterminal legacy resources for operator reconciliation" do
+    old =
+      %{
+        version: 1,
+        binding: %{project_id: "project-1", project_number: 1, status_field_id: "status", status_options: %{"READY" => "ready"}, repositories: ["acme/repo"]},
+        assignments: %{"a" => Map.put(enrollment("a", 0), :resources, ["repo:acme/repo"])},
+        requests: %{},
+        review_intents: %{},
+        effect_intents: %{}
+      }
+
+    assert {:ok, migrated} = Migration.migrate(old)
+    assert migrated.assignments["a"].operator_reconciliation_required
+    assert migrated.assignments["a"].resources == [%{kind: :other, authority: "legacy", identity: "repo:acme/repo", access: :write}]
+  end
+
+  test "operator takeover rejects duplicate canonical issues retained by migration" do
+    duplicate_a = enrollment("a", 0)
+    duplicate_b = enrollment("b", 0)
+
+    old =
+      %{
+        version: 1,
+        binding: %{project_id: "project-1", project_number: 1, status_field_id: "status", status_options: %{"READY" => "ready"}, repositories: ["acme/repo"]},
+        assignments: %{"a" => duplicate_a, "b" => duplicate_b},
+        principals: %{"pm-b" => %{principal_id: "pm-b", role: :pm}},
+        requests: %{},
+        review_intents: %{},
+        effect_intents: %{}
+      }
+
+    assert {:ok, migrated} = Migration.migrate(old)
+    assert migrated.migration.conflicts == ["b"]
+
+    request =
+      envelope("takeover-duplicate", :operator_takeover, %{
+        project_id: "project-1",
+        destination_pm_id: "pm-b",
+        assignments: [%{assignment_id: "a", expected_revision: 1, expected_ownership_revision: 0}],
+        reason: "reconcile duplicate"
+      })
+
+    assert {:error, :duplicate_underlying_identity, %{assignment_id: "a"}} =
+             Rules.apply(migrated, request, %{principal: @operator})
+  end
+
   test "resource aliases normalize to one writable repository" do
     assert {:ok, a} = Resources.normalize(%{kind: :repository, authority: "GitHub", identity: "https://github.com/acme/repo.git", access: :write})
     assert {:ok, b} = Resources.normalize(%{kind: "repo", authority: "github", identity: "acme/repo", access: :read})
@@ -119,6 +209,36 @@ defmodule SymphonyElixir.ManagedCoreR1Test do
     assert {:ok, repository} = Resources.normalize(%{kind: :repository, authority: "github", identity: "acme/repo", access: :write})
     assert {:ok, path} = Resources.normalize(%{kind: :path, authority: "github", identity: "acme/./repo/../repo", access: :read})
     assert Resources.conflicts?(repository, path)
+  end
+
+  test "GitHub resource authorities and paths canonicalize safely" do
+    assert {:ok, repository} =
+             Resources.normalize(%{
+               kind: :repository,
+               authority: "https://github.com/",
+               identity: "Acme/Repo.git",
+               access: :write
+             })
+
+    assert repository.authority == "github.com"
+    assert repository.identity == "acme/repo"
+
+    assert {:ok, path} =
+             Resources.normalize(%{
+               kind: :path,
+               authority: "GitHub",
+               identity: "Acme/Repo/src/./Feature/../File.TXT",
+               access: :read
+             })
+
+    assert path.authority == "github.com"
+    assert path.identity == "acme/repo/src/File.TXT"
+
+    assert {:error, :resource_path_invalid, %{}} =
+             Resources.normalize(%{kind: :path, authority: "github", identity: "../repo", access: :read})
+
+    assert {:error, :resource_path_invalid, %{}} =
+             Resources.normalize(%{kind: :path, authority: "github", identity: "src", access: :read})
   end
 
   test "trusted source identity enriches enrollment without changing request canonical" do
