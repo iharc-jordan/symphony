@@ -6,8 +6,10 @@ defmodule SymphonyElixir.Managed.Rules do
   the returned state and persists it through the managed journal.
   """
 
-  @version 1
-  @operations ~w(bind_project enroll revise pause resume interrupt cancel review)a
+  alias SymphonyElixir.Managed.{Ownership, Resources}
+
+  @version 2
+  @operations ~w(bind_project register_pm enroll claim handoff operator_takeover revise pause resume interrupt cancel review)a
   @terminal_phases [:accepted, :cancelled]
   @active_phases [:ready, :active, :waiting, :review]
   @allowed_routes %{
@@ -36,8 +38,11 @@ defmodule SymphonyElixir.Managed.Rules do
       paused: Keyword.get(opts, :paused, false),
       disabled: Keyword.get(opts, :disabled, false),
       binding: Keyword.get(opts, :binding),
+      projects: Keyword.get(opts, :projects, projects_from_binding(Keyword.get(opts, :binding))),
+      principals: Keyword.get(opts, :principals, %{}),
       assignments: Keyword.get(opts, :assignments, %{}),
       requests: Keyword.get(opts, :requests, %{}),
+      handoff_intents: Keyword.get(opts, :handoff_intents, %{}),
       events: Keyword.get(opts, :events, []),
       external_reconciliations: Keyword.get(opts, :external_reconciliations, %{}),
       review_intents: Keyword.get(opts, :review_intents, %{}),
@@ -53,6 +58,26 @@ defmodule SymphonyElixir.Managed.Rules do
       usage_limit_tokens: Keyword.get(opts, :usage_limit_tokens)
     }
   end
+
+  @spec authorize(state(), envelope(), map()) :: :ok | {:error, atom(), map()}
+  def authorize(state, envelope, principal_context) when is_map(state) and is_map(envelope) and is_map(principal_context) do
+    with {:ok, normalized} <- normalize_envelope(envelope),
+         :ok <- validate_request_id(normalized.request_id),
+         {:ok, operation} <- normalize_operation(normalized.operation),
+         {:ok, args} <- normalize_args(normalized.args),
+         {:ok, principal} <- principal_context(principal_context),
+         :ok <- authorize_operation(state, operation, args, principal) do
+      _ = normalized
+      _ = args
+      _ = operation
+      _ = principal
+      :ok
+    else
+      {:error, code, details} -> {:error, code, details}
+    end
+  end
+
+  def authorize(_state, _envelope, _principal_context), do: {:error, :principal_required, %{}}
 
   @spec snapshot(state()) :: map()
   def snapshot(state) when is_map(state) do
@@ -77,13 +102,19 @@ defmodule SymphonyElixir.Managed.Rules do
     with {:ok, normalized} <- normalize_envelope(envelope),
          :ok <- validate_request_id(normalized.request_id),
          {:ok, operation} <- normalize_operation(normalized.operation),
-         {:ok, args} <- normalize_args(normalized.args) do
-      normalized = %{normalized | operation: operation, args: args}
+         {:ok, args} <- normalize_args(normalized.args),
+         {:ok, principal} <- principal_context(context),
+         :ok <- authorize_operation(state, operation, args, principal) do
+      normalized = normalized |> Map.merge(%{operation: operation, args: args}) |> Map.put(:principal, principal)
       canonical = canonical_input(normalized)
 
       case Map.get(state.requests, normalized.request_id) do
-        %{canonical: ^canonical, response: response} ->
-          {:duplicate, response}
+        %{canonical: ^canonical, response: response} = record ->
+          if request_principal_allowed?(record, principal) do
+            {:duplicate, response}
+          else
+            {:error, :request_principal_conflict, %{request_id: normalized.request_id}}
+          end
 
         %{canonical: _other} ->
           {:error, :request_id_conflict, %{request_id: normalized.request_id}}
@@ -100,16 +131,24 @@ defmodule SymphonyElixir.Managed.Rules do
   @spec prepare_review(state(), envelope()) ::
           {:ok, map()} | {:duplicate, map()} | {:error, atom(), map()}
   def prepare_review(state, envelope) when is_map(state) and is_map(envelope) do
+    prepare_review(state, envelope, %{})
+  end
+
+  @spec prepare_review(state(), envelope(), map()) ::
+          {:ok, map()} | {:duplicate, map()} | {:error, atom(), map()}
+  def prepare_review(state, envelope, context) when is_map(state) and is_map(envelope) and is_map(context) do
     with {:ok, normalized} <- normalize_envelope(envelope),
          :ok <- validate_request_id(normalized.request_id),
          {:ok, :review} <- normalize_operation(normalized.operation),
-         {:ok, args} <- normalize_args(normalized.args) do
-      normalized = %{normalized | operation: :review, args: args}
+         {:ok, args} <- normalize_args(normalized.args),
+         {:ok, principal} <- principal_context(context),
+         :ok <- authorize_operation(state, :review, args, principal) do
+      normalized = normalized |> Map.merge(%{operation: :review, args: args}) |> Map.put(:principal, principal)
       canonical = canonical_input(normalized)
 
       case Map.get(state.requests, normalized.request_id) do
-        %{canonical: ^canonical, response: response} ->
-          {:duplicate, response}
+        %{canonical: ^canonical, response: response} = record ->
+          if request_principal_allowed?(record, principal), do: {:duplicate, response}, else: {:error, :request_principal_conflict, %{request_id: normalized.request_id}}
 
         %{canonical: _other} ->
           {:error, :request_id_conflict, %{request_id: normalized.request_id}}
@@ -234,23 +273,182 @@ defmodule SymphonyElixir.Managed.Rules do
   def phase(value) when is_binary(value), do: Map.get(@phase_aliases, value |> String.trim() |> String.downcase(), :unknown)
   def phase(_value), do: :unknown
 
+  defp principal_context(context) when is_map(context) and map_size(context) == 0, do: {:error, :principal_required, %{}}
+
+  defp principal_context(context) when is_map(context) do
+    cond do
+      Map.has_key?(context, :principal_context) or Map.has_key?(context, "principal_context") ->
+        Ownership.principal(Map.get(context, :principal_context, Map.get(context, "principal_context")))
+
+      Map.has_key?(context, :principal) or Map.has_key?(context, "principal") or Map.has_key?(context, :principal_id) or Map.has_key?(context, "principal_id") ->
+        Ownership.principal(context)
+
+      true ->
+        {:error, :principal_required, %{}}
+    end
+  end
+
+  defp principal_context(_context), do: {:error, :principal_required, %{}}
+
+  defp authorize_operation(state, operation, args, principal) do
+    cond do
+      operation == :bind_project and principal.role != :operator -> {:error, :operator_required, %{operation: operation}}
+      operation == :bind_project -> :ok
+      operation == :operator_takeover and principal.role != :operator -> {:error, :operator_required, %{operation: operation}}
+      operation == :operator_takeover -> :ok
+      operation == :register_pm -> :ok
+      operation == :enroll -> authorize_enrollment(state, args, principal)
+      operation == :claim -> authorize_claim(state, args, principal)
+      operation == :handoff -> authorize_handoff(state, args, principal)
+      operation in [:pause, :resume] -> authorize_pause_resume(state, args, principal)
+      operation in [:revise, :interrupt, :cancel, :review] -> authorize_assignment_operation(state, args, principal)
+      true -> {:error, :unsupported_operation, %{operation: operation}}
+    end
+  end
+
+  defp authorize_enrollment(state, args, principal) do
+    project_id = text_value(args, :project_id)
+
+    with :ok <- require_project_id(project_id),
+         :ok <- Ownership.authorize_project(principal, project_id),
+         {:ok, _binding} <- fetch_project_binding(state, project_id) do
+      :ok
+    end
+  end
+
+  defp authorize_claim(state, args, principal) do
+    assignment_id = text_value(args, :assignment_id)
+    project_id = text_value(args, :project_id)
+
+    with :ok <- require_pm(principal),
+         :ok <- require_project_id(project_id),
+         :ok <- Ownership.authorize_project(principal, project_id),
+         {:ok, assignment} <- fetch_assignment(state, assignment_id),
+         :ok <- Ownership.authorize_project(principal, text_value(assignment, :project_id) || project_id),
+         :ok <- assignment_project_matches(assignment, project_id) do
+      if Ownership.ownership(assignment).status == :unassigned, do: :ok, else: {:error, :operator_takeover_required, %{assignment_id: assignment_id}}
+    end
+  end
+
+  defp authorize_handoff(state, args, principal) do
+    project_id = text_value(args, :project_id)
+
+    with :ok <- require_project_id(project_id),
+         :ok <- Ownership.authorize_project(principal, project_id),
+         {:ok, assignment_ids} <- assignment_fence_ids(args),
+         :ok <- authorize_assignment_scope(state, assignment_ids, project_id, principal) do
+      :ok
+    end
+  end
+
+  defp authorize_pause_resume(state, args, principal) do
+    scope = text_value(args, :scope) || if(Map.has_key?(args, :assignments), do: "assignments", else: "service")
+
+    case String.downcase(scope) do
+      "service" when principal.role == :operator ->
+        :ok
+
+      "service" ->
+        {:error, :operator_required, %{scope: :service}}
+
+      "assignments" ->
+        project_id = text_value(args, :project_id)
+
+        with :ok <- require_project_id(project_id),
+             :ok <- Ownership.authorize_project(principal, project_id),
+             {:ok, assignment_ids} <- assignment_fence_ids(args),
+             :ok <- authorize_assignment_scope(state, assignment_ids, project_id, principal) do
+          :ok
+        end
+
+      _ ->
+        {:error, :invalid_scope, %{scope: scope}}
+    end
+  end
+
+  defp authorize_assignment_operation(state, args, principal) do
+    assignment_id = text_value(args, :assignment_id)
+    project_id = text_value(args, :project_id)
+
+    with {:ok, assignment} <- fetch_assignment(state, assignment_id),
+         :ok <- require_project_id(project_id),
+         :ok <- Ownership.authorize_assignment(principal, assignment, project_id || text_value(assignment, :project_id)) do
+      Ownership.expected_ownership_revision(assignment, args)
+    end
+  end
+
+  defp authorize_assignment_scope(state, ids, project_id, principal) do
+    Enum.reduce_while(ids, :ok, fn id, :ok ->
+      case fetch_assignment(state, id) do
+        {:ok, assignment} ->
+          case Ownership.authorize_assignment(principal, assignment, project_id) do
+            :ok -> {:cont, :ok}
+            error -> {:halt, error}
+          end
+
+        error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp require_pm(%{role: :pm}), do: :ok
+  defp require_pm(_principal), do: {:error, :pm_required, %{}}
+
+  defp require_project_id(nil), do: {:error, :project_required, %{}}
+  defp require_project_id(""), do: {:error, :project_required, %{}}
+  defp require_project_id(_project_id), do: :ok
+
+  defp assignment_fence_ids(args) when is_map(args) do
+    assignments = Map.get(args, :assignments, Map.get(args, "assignments"))
+
+    cond do
+      not is_list(assignments) or assignments == [] ->
+        {:error, :invalid_argument, %{argument: :assignments}}
+
+      true ->
+        Enum.reduce_while(assignments, {:ok, []}, fn fence, {:ok, ids} ->
+          id = text_value(fence, :assignment_id)
+
+          cond do
+            not is_map(fence) or is_nil(id) ->
+              {:halt, {:error, :invalid_argument, %{argument: :assignments}}}
+
+            id in ids ->
+              {:halt, {:error, :duplicate_assignment, %{assignment_id: id}}}
+
+            true ->
+              {:cont, {:ok, ids ++ [id]}}
+          end
+        end)
+    end
+  end
+
+  defp assignment_fence_ids(_args), do: {:error, :invalid_argument, %{argument: :assignments}}
+
   defp apply_new(state, %{operation: :bind_project, args: args} = request, canonical, _context),
     do: apply_binding(state, request, canonical, args)
 
-  defp apply_new(state, %{operation: :enroll, args: args} = request, canonical, _context),
-    do: apply_enrollment(state, request, canonical, args)
+  defp apply_new(state, %{operation: :register_pm, args: args} = request, canonical, context),
+    do: apply_register_pm(state, request, canonical, args, context)
+
+  defp apply_new(state, %{operation: :enroll, args: args} = request, canonical, context),
+    do: apply_enrollment(state, request, canonical, args, context)
+
+  defp apply_new(state, %{operation: :claim, args: args} = request, canonical, context),
+    do: apply_claim(state, request, canonical, args, context)
+
+  defp apply_new(state, %{operation: operation, args: args} = request, canonical, context)
+       when operation in [:handoff, :operator_takeover] do
+    apply_handoff(state, request, canonical, args, context, operation)
+  end
 
   defp apply_new(state, %{operation: :revise, args: args} = request, canonical, context),
     do: apply_revision(state, request, canonical, args, context)
 
   defp apply_new(state, %{operation: operation, args: args} = request, canonical, _context)
        when operation in [:pause, :resume] do
-    with :ok <- expected_revision(state, args, :global) do
-      paused = operation == :pause
-      disabled = if paused, do: Map.get(args, :disable, false) == true, else: false
-      response = %{operation: operation, revision: state.control_revision + 1, paused: paused, disabled: disabled}
-      commit(state, request, canonical, response, %{paused: paused, disabled: disabled})
-    end
+    apply_pause_resume(state, request, canonical, args, operation)
   end
 
   defp apply_new(state, %{operation: operation, args: args} = request, canonical, context)
@@ -279,25 +477,270 @@ defmodule SymphonyElixir.Managed.Rules do
     end
   end
 
+  defp apply_register_pm(state, request, canonical, args, _context) do
+    principal = request.principal
+    display_name = text_value(args, :display_name)
+
+    with :ok <- expected_revision(state, args, :global),
+         :ok <- require_pm(principal) do
+      metadata = %{principal_id: principal.principal_id, role: :pm} |> maybe_put(:display_name, display_name)
+      principals = Map.put(Map.get(state, :principals, %{}), principal.principal_id, metadata)
+      response = %{operation: :register_pm, principal_id: principal.principal_id, registered: true}
+      commit(state, request, canonical, response, %{principals: principals})
+    end
+  end
+
+  defp apply_claim(state, request, canonical, args, _context) do
+    assignment_id = text_value(args, :assignment_id)
+    principal = request.principal
+
+    with :ok <- present(assignment_id, :assignment_id),
+         {:ok, assignment} <- fetch_assignment(state, assignment_id),
+         :ok <- expected_revision(state, args, {:assignment, assignment_id}),
+         :ok <- Ownership.expected_ownership_revision(assignment, args),
+         {:ok, claimed} <- Ownership.claim(assignment, principal) do
+      assignments = Map.put(state.assignments, assignment_id, claimed)
+      principals = maybe_register_principal(state, principal)
+      response = %{operation: :claim, assignment_id: assignment_id, revision: claimed.revision, ownership_revision: claimed.ownership.ownership_revision, phase: claimed.phase}
+      commit(state, request, canonical, response, %{assignments: assignments, principals: principals})
+    end
+  end
+
+  defp apply_handoff(state, request, canonical, args, context, operation) do
+    project_id = text_value(args, :project_id)
+    target = target_principal(state, args, context)
+    source = request.principal
+
+    with {:ok, assignment_ids} <- assignment_fence_ids(args),
+         {:ok, target} <- target,
+         :ok <- target_is_distinct(source, target),
+         :ok <- exact_resource_scope(state, assignment_ids),
+         {:ok, updated} <- transfer_assignments(state, assignment_ids, project_id, args, target, operation),
+         :ok <- no_uncertain_effects(state, assignment_ids, context) do
+      handoff_id = text_value(args, :handoff_id) || request.request_id
+
+      intent = %{
+        request_id: request.request_id,
+        handoff_id: handoff_id,
+        assignment_ids: assignment_ids,
+        project_id: project_id,
+        source_principal_id: source.principal_id,
+        target_principal_id: target.principal_id,
+        reason: text_value(args, :reason),
+        status: :complete
+      }
+
+      handoffs = Map.put(Map.get(state, :handoff_intents, %{}), request.request_id, intent)
+      effect_intents = invalidate_owner_intents(Map.get(state, :effect_intents, %{}), assignment_ids, source.principal_id)
+      review_intents = invalidate_owner_intents(Map.get(state, :review_intents, %{}), assignment_ids, source.principal_id)
+
+      response = %{
+        operation: operation,
+        handoff_id: handoff_id,
+        assignment_ids: assignment_ids,
+        source_pm_id: source.principal_id,
+        destination_pm_id: target.principal_id,
+        target_principal_id: target.principal_id,
+        reason: text_value(args, :reason),
+        status: :complete
+      }
+
+      commit(state, request, canonical, response, %{assignments: updated, handoff_intents: handoffs, effect_intents: effect_intents, review_intents: review_intents})
+    end
+  end
+
+  defp transfer_assignments(state, ids, project_id, args, target, operation) do
+    Enum.reduce_while(ids, {:ok, state.assignments}, fn id, {:ok, assignments} ->
+      case Map.fetch(assignments, id) do
+        {:ok, assignment} ->
+          with :ok <- assignment_project_matches(assignment, project_id),
+               :ok <- expected_revision_for(state, args, id, assignment),
+               :ok <- expected_ownership_revision_for(args, id, assignment),
+               {:ok, changed} <- transfer_one(assignment, target, operation, args) do
+            {:cont, {:ok, Map.put(assignments, id, changed)}}
+          else
+            {:error, code, details} -> {:halt, {:error, code, Map.put(details, :assignment_id, id)}}
+          end
+
+        :error ->
+          {:halt, {:error, :assignment_not_found, %{assignment_id: id}}}
+      end
+    end)
+  end
+
+  defp transfer_one(assignment, target, :handoff, args) do
+    case Ownership.transfer(assignment, target, text_value(args, :handoff_id)) do
+      {:ok, changed} -> {:ok, changed}
+      error -> error
+    end
+  end
+
+  defp transfer_one(assignment, target, :operator_takeover, args) do
+    case Ownership.takeover(assignment, target, text_value(args, :handoff_id)) do
+      {:ok, changed} -> {:ok, changed}
+      error -> error
+    end
+  end
+
+  defp target_principal(state, args, context) do
+    target_context = Map.get(context, :target_principal, Map.get(context, "target_principal"))
+    target_id = Map.get(context, :target_principal_id, Map.get(context, "target_principal_id", text_value(args, :target_principal_id)))
+
+    with {:ok, target} <- target_from_context_or_id(target_context, target_id),
+         true <- registered_pm?(state, target.principal_id) do
+      {:ok, target}
+    else
+      false -> {:error, :target_principal_not_registered, %{principal_id: target_id}}
+      {:error, code, details} -> {:error, code, details}
+      _ -> {:error, :target_principal_not_registered, %{principal_id: target_id}}
+    end
+  end
+
+  defp target_from_context_or_id(target, _target_id) when is_map(target) do
+    Ownership.principal(target)
+  end
+
+  defp target_from_context_or_id(_target, target_id) do
+    with :ok <- present(target_id, :target_principal_id) do
+      Ownership.principal(%{principal_id: target_id, role: :pm, project_scope: :all})
+    end
+  end
+
+  defp registered_pm?(state, principal_id) do
+    metadata = Map.get(Map.get(state, :principals, %{}), principal_id)
+    is_map(metadata) and Map.get(metadata, :role, Map.get(metadata, "role")) in [:pm, "pm"]
+  end
+
+  defp target_is_distinct(%{principal_id: source}, %{principal_id: source}), do: {:error, :target_principal_same_as_source, %{}}
+  defp target_is_distinct(_source, _target), do: :ok
+
+  defp exact_resource_scope(state, ids) do
+    if Enum.all?(ids, &is_map(Map.get(state.assignments, &1))) do
+      :ok
+    else
+      {:error, :assignment_not_found, %{}}
+    end
+  end
+
+  defp no_uncertain_effects(state, ids, context) do
+    pending = Map.get(state, :effect_intents, %{})
+
+    cond do
+      Map.get(context, :effects_reconciled) == true -> :ok
+      Enum.any?(ids, fn id -> get_in(state, [:assignments, id, :stop_pending]) == true end) -> {:error, :handoff_effect_pending, %{}}
+      Enum.any?(ids, fn id -> pending_intent?(pending, id) end) -> {:error, :handoff_effect_pending, %{}}
+      true -> :ok
+    end
+  end
+
+  defp pending_intent?(intents, id) when is_map(intents) do
+    Enum.any?(intents, fn {_request_id, intent} -> is_map(intent) and text_value(intent, :assignment_id) == id and Map.get(intent, :status, Map.get(intent, "status")) in [:pending, "pending"] end)
+  end
+
+  defp pending_intent?(_intents, _id), do: false
+
+  defp invalidate_owner_intents(intents, assignment_ids, source_principal_id) when is_map(intents) do
+    Map.new(intents, fn {request_id, intent} ->
+      stale? =
+        is_map(intent) and
+          text_value(intent, :assignment_id) in assignment_ids and
+          owner_intent?(intent, source_principal_id) and
+          Map.get(intent, :status, Map.get(intent, "status")) in [:pending, "pending"]
+
+      value =
+        if stale? do
+          intent |> Map.put(:status, :stale_owner) |> Map.put(:stale_owner_id, source_principal_id)
+        else
+          intent
+        end
+
+      {request_id, value}
+    end)
+  end
+
+  defp invalidate_owner_intents(intents, _assignment_ids, _source_principal_id), do: intents
+
+  defp owner_intent?(intent, source_principal_id) do
+    principal = Map.get(intent, :principal_context, Map.get(intent, "principal_context", %{}))
+
+    text_value(principal, :principal_id) == source_principal_id or
+      is_integer(Map.get(intent, :ownership_revision, Map.get(intent, "ownership_revision")))
+  end
+
+  defp apply_pause_resume(state, request, canonical, args, operation) do
+    scope = text_value(args, :scope) || if(Map.has_key?(args, :assignments), do: "assignments", else: "service")
+
+    case String.downcase(scope) do
+      "service" ->
+        with :ok <- expected_revision(state, args, :global) do
+          paused = operation == :pause
+          disabled = if paused, do: Map.get(args, :disable, false) == true, else: false
+          response = %{operation: operation, revision: state.control_revision + 1, paused: paused, disabled: disabled, scope: :service}
+          commit(state, request, canonical, response, %{paused: paused, disabled: disabled})
+        end
+
+      "assignments" ->
+        project_id = text_value(args, :project_id)
+
+        with {:ok, ids} <- assignment_fence_ids(args),
+             {:ok, assignments} <- pause_assignments(state, ids, project_id, args, operation) do
+          response = %{operation: operation, scope: :assignments, project_id: project_id, assignment_ids: ids, revision: state.control_revision + 1}
+          commit(state, request, canonical, response, %{assignments: assignments})
+        end
+
+      _ ->
+        {:error, :invalid_scope, %{scope: scope}}
+    end
+  end
+
+  defp pause_assignments(state, ids, project_id, args, operation) do
+    Enum.reduce_while(ids, {:ok, state.assignments}, fn id, {:ok, assignments} ->
+      case Map.fetch(assignments, id) do
+        {:ok, assignment} ->
+          with :ok <- assignment_project_matches(assignment, project_id),
+               :ok <- expected_revision_for(state, args, id, assignment),
+               :ok <- expected_ownership_revision_for(args, id, assignment),
+               :ok <- if(operation == :pause or operation == :resume, do: :ok, else: {:error, :invalid_operation, %{}}) do
+            changed = Map.put(assignment, :dispatch_paused, operation == :pause)
+            {:cont, {:ok, Map.put(assignments, id, changed)}}
+          else
+            {:error, code, details} -> {:halt, {:error, code, Map.put(details, :assignment_id, id)}}
+          end
+
+        :error ->
+          {:halt, {:error, :assignment_not_found, %{assignment_id: id}}}
+      end
+    end)
+  end
+
   defp apply_binding(state, request, canonical, args) do
     with :ok <- expected_revision(state, args, :global),
          {:ok, binding} <- binding_from_args(args),
          :ok <- binding_rebind_allowed?(state, binding) do
-      response = %{operation: :bind_project, binding: binding, revision: state.control_revision + 1}
-      commit(state, request, canonical, response, %{binding: binding})
+      project = Map.merge(binding, %{revision: project_revision(state, binding.project_id) + 1, dispatch_paused: false})
+      response = %{operation: :bind_project, project: project, binding: binding, revision: state.control_revision + 1}
+      commit(state, request, canonical, response, %{binding: binding, projects: Map.put(Map.get(state, :projects, %{}), binding.project_id, project)})
     end
   end
 
   # A project binding is an authority boundary. Replacing it while any
   # assignment is still owned by the service could make the old worker mutate
   # a different project after restart.
-  defp binding_rebind_allowed?(%{binding: nil}, _binding), do: :ok
+  defp binding_rebind_allowed?(%{binding: nil} = state, binding) do
+    current = Map.get(Map.get(state, :projects, %{}), binding.project_id)
+
+    if is_nil(current) or current == binding, do: :ok, else: binding_rebind_conflict_for_project(state, binding.project_id)
+  end
 
   defp binding_rebind_allowed?(state, binding) do
-    if state.binding == binding do
-      :ok
-    else
-      binding_rebind_conflict(state)
+    current = Map.get(state, :projects, %{}) |> Map.get(binding.project_id)
+
+    cond do
+      Map.get(state, :binding) == binding -> :ok
+      current == binding -> :ok
+      is_nil(current) and is_map(Map.get(state, :binding)) -> binding_rebind_conflict(state)
+      is_nil(current) -> :ok
+      true -> binding_rebind_conflict_for_project(state, binding.project_id)
     end
   end
 
@@ -313,25 +756,45 @@ defmodule SymphonyElixir.Managed.Rules do
     end
   end
 
-  defp apply_enrollment(state, request, canonical, args) do
+  defp binding_rebind_conflict_for_project(state, project_id) do
+    case Enum.find(state.assignments, fn {_id, assignment} ->
+           is_map(assignment) and text_value(assignment, :project_id) == project_id and phase(assignment[:phase]) not in @terminal_phases
+         end) do
+      nil -> :ok
+      {assignment_id, assignment} -> {:error, :binding_in_use, %{assignment_id: assignment_id, phase: phase(assignment[:phase])}}
+    end
+  end
+
+  defp apply_enrollment(state, request, canonical, args, context) do
+    principal = Map.get(request, :principal)
+    project_id = text_value(args, :project_id)
+
     with :ok <- expected_revision(state, args, :global),
-         :ok <- binding_present(state),
-         {:ok, assignment} <- assignment_from_args(args),
-         :ok <- repository_in_binding(state.binding, assignment.repository),
+         {:ok, binding} <- fetch_project_binding(state, project_id),
+         {:ok, assignment} <- assignment_from_args(args, []),
+         assignment <- merge_source_identity(assignment, context),
+         :ok <- repository_in_binding(binding, assignment.repository),
          :ok <- duplicate_identity_free?(state, assignment),
          :ok <- resources_free?(state, assignment.resources) do
-      assignment = Map.put(assignment, :revision, 1)
+      assignment =
+        assignment
+        |> Map.put(:project_id, project_id)
+        |> Map.put(:revision, 1)
+        |> maybe_assign_owner(principal)
+
       assignments = Map.put(state.assignments, assignment.assignment_id, assignment)
+      principals = maybe_register_principal(state, principal)
 
       response = %{
         operation: :enroll,
         assignment_id: assignment.assignment_id,
         revision: 1,
         phase: assignment.phase,
+        project_id: project_id,
         control_revision: state.control_revision + 1
       }
 
-      commit(state, request, canonical, response, %{assignments: assignments})
+      commit(state, request, canonical, response, %{assignments: assignments, principals: principals})
     end
   end
 
@@ -421,11 +884,14 @@ defmodule SymphonyElixir.Managed.Rules do
     project = Map.get(args, :project, args)
     project_id = text_value(project, :project_id)
     status_field_id = text_value(project, :status_field_id)
+    projection_field_value = Map.get(project, :projection_field_id, Map.get(project, "projection_field_id"))
+    projection_field_id = text_value(project, :projection_field_id)
     project_number = number_value(project, :project_number)
 
     with :ok <- present(project_id, :project_id),
          :ok <- present(status_field_id, :status_field_id),
          :ok <- positive(project_number, :project_number),
+         :ok <- optional_text_value(projection_field_value, :projection_field_id),
          {:ok, options} <- status_options(project),
          {:ok, repositories} <- repository_allowlist(project) do
       {:ok,
@@ -435,7 +901,8 @@ defmodule SymphonyElixir.Managed.Rules do
          status_field_id: status_field_id,
          status_options: options,
          repositories: repositories
-       }}
+       }
+       |> maybe_put(:projection_field_id, projection_field_id)}
     end
   end
 
@@ -475,9 +942,10 @@ defmodule SymphonyElixir.Managed.Rules do
     end
   end
 
-  defp assignment_from_args(args) do
+  defp assignment_from_args(args, opts) do
     assignment_id = text_value(args, :assignment_id)
     repository = text_value(args, :repository)
+    provider = text_value(args, :provider) || "github"
     issue_number = number_value(args, :issue_number)
     base_commit = text_value(args, :base_commit)
 
@@ -510,12 +978,13 @@ defmodule SymphonyElixir.Managed.Rules do
          :ok <- phase_is(board_state, :ready),
          escalation_reason <- text_value(args, :escalation_reason),
          :ok <- validate_route(route, escalation_reason),
-         :ok <- list_of_binaries(resources, :resources),
+         {:ok, resources} <- assignment_resources(resources, opts),
          :ok <- list_of_binaries(dependencies, :dependencies),
          {:ok, requirements} <- requirement_metadata(args) do
       {:ok,
        %{
          assignment_id: assignment_id,
+         provider: provider,
          repository: repository,
          issue_number: issue_number,
          base_commit: base_commit,
@@ -539,11 +1008,142 @@ defmodule SymphonyElixir.Managed.Rules do
     end
   end
 
+  defp merge_source_identity(assignment, context) when is_map(assignment) and is_map(context) do
+    source = Map.get(context, :source_identity, Map.get(context, "source_identity", %{}))
+
+    if is_map(source) do
+      assignment
+      |> maybe_put_source_identity(:native_issue_id, source)
+      |> maybe_put_source_identity(:native_repository_id, source)
+      |> maybe_put_source_identity(:requirements_fingerprint, source)
+    else
+      assignment
+    end
+  end
+
+  defp merge_source_identity(assignment, _context), do: assignment
+
+  defp maybe_put_source_identity(assignment, key, source) do
+    value = Map.get(source, key, Map.get(source, Atom.to_string(key)))
+
+    if is_binary(value) and String.trim(value) != "" do
+      Map.put(assignment, key, String.trim(value))
+    else
+      assignment
+    end
+  end
+
   defp repository_in_binding(%{repositories: allowlist}, repository) when is_list(allowlist) do
     if repository in allowlist, do: :ok, else: {:error, :repository_not_allowlisted, %{repository: repository}}
   end
 
   defp repository_in_binding(_binding, _repository), do: {:error, :project_not_bound, %{}}
+
+  defp projects_from_binding(binding) when is_map(binding) do
+    case text_value(binding, :project_id) do
+      nil -> %{}
+      project_id -> %{project_id => Map.merge(binding, %{project_id: project_id, revision: 0, dispatch_paused: false})}
+    end
+  end
+
+  defp projects_from_binding(_binding), do: %{}
+
+  defp project_revision(state, project_id) do
+    get_in(state, [:projects, project_id, :revision]) || 0
+  end
+
+  defp fetch_project_binding(state, project_id) do
+    projects = Map.get(state, :projects, %{})
+
+    case Map.get(projects, project_id) do
+      binding when is_map(binding) ->
+        {:ok, binding}
+
+      nil ->
+        case Map.get(state, :binding) do
+          binding when is_map(binding) ->
+            if text_value(binding, :project_id) == project_id, do: {:ok, binding}, else: {:error, :project_not_bound, %{}}
+
+          _ ->
+            {:error, :project_not_bound, %{}}
+        end
+
+      _ ->
+        {:error, :project_not_bound, %{}}
+    end
+  end
+
+  defp assignment_project_matches(assignment, project_id) do
+    actual = text_value(assignment, :project_id)
+
+    if actual == project_id or (is_nil(actual) and project_id == text_value(Map.get(assignment, :binding, %{}), :project_id)) do
+      :ok
+    else
+      {:error, :assignment_project_mismatch, %{project_id: project_id, assignment_project_id: actual}}
+    end
+  end
+
+  defp maybe_assign_owner(assignment, %{role: :pm} = principal), do: Map.put(assignment, :ownership, Ownership.assigned(principal))
+  defp maybe_assign_owner(assignment, _principal), do: assignment
+
+  defp maybe_register_principal(state, %{role: :pm} = principal) do
+    metadata = %{principal_id: principal.principal_id, role: :pm}
+    Map.put_new(Map.get(state, :principals, %{}), principal.principal_id, metadata)
+  end
+
+  defp maybe_register_principal(state, _principal), do: Map.get(state, :principals, %{})
+
+  defp assignment_resources(resources, opts) do
+    case Resources.normalize_all(resources, allow_legacy: Keyword.get(opts, :allow_legacy_resources, false)) do
+      {:ok, normalized} -> {:ok, normalized}
+      {:error, _code, _details} -> {:error, :invalid_argument, %{argument: :resources}}
+    end
+  end
+
+  defp expected_revision_for(state, args, id, assignment) do
+    expected =
+      if Map.has_key?(args, :assignments) or Map.has_key?(args, "assignments"),
+        do: expected_value(args, :expected_revisions, id),
+        else: Map.get(args, :expected_revision, Map.get(args, "expected_revision"))
+
+    actual = get_in(state, [:assignments, id, :revision]) || Map.get(assignment, :revision)
+
+    cond do
+      not is_integer(expected) -> {:error, :expected_revision_required, %{assignment_id: id}}
+      expected != actual -> {:error, :stale_revision, %{assignment_id: id, expected: expected, actual: actual}}
+      true -> :ok
+    end
+  end
+
+  defp expected_ownership_revision_for(args, id, assignment) do
+    expected =
+      if Map.has_key?(args, :assignments) or Map.has_key?(args, "assignments"),
+        do: expected_value(args, :expected_ownership_revisions, id),
+        else: Map.get(args, :expected_ownership_revision, Map.get(args, "expected_ownership_revision"))
+
+    actual = Ownership.ownership(assignment).ownership_revision
+
+    cond do
+      not is_integer(expected) -> {:error, :expected_ownership_revision_required, %{assignment_id: id}}
+      expected != actual -> {:error, :stale_ownership_revision, %{assignment_id: id, expected: expected, actual: actual}}
+      true -> :ok
+    end
+  end
+
+  defp expected_value(args, key, id) do
+    expectations = Map.get(args, :assignments, Map.get(args, "assignments", []))
+
+    expectation =
+      if is_list(expectations) do
+        Enum.find(expectations, fn item -> is_map(item) and text_value(item, :assignment_id) == to_string(id) end)
+      end
+
+    case key do
+      :expected_revisions -> expectation && Map.get(expectation, :expected_revision, Map.get(expectation, "expected_revision"))
+      :expected_ownership_revisions -> expectation && Map.get(expectation, :expected_ownership_revision, Map.get(expectation, "expected_ownership_revision"))
+      _ -> nil
+    end
+  end
 
   defp revise_assignment(assignment, changes, route) do
     revised =
@@ -599,7 +1199,7 @@ defmodule SymphonyElixir.Managed.Rules do
     with :ok <- optional_requirements(requirement_body, fingerprint),
          :ok <- optional_text(base_commit, :base_commit),
          :ok <- optional_route(changes),
-         :ok <- optional_list_of_binaries(resources, :resources),
+         {:ok, normalized_resources} <- optional_resources(resources),
          :ok <- optional_list_of_binaries(dependencies, :dependencies),
          :ok <- optional_fingerprint(fingerprint),
          :ok <- optional_requirement_revision(requirement_revision) do
@@ -610,6 +1210,7 @@ defmodule SymphonyElixir.Managed.Rules do
         |> maybe_put(:requirements_fingerprint, fingerprint)
         |> maybe_put(:requirements_revision, requirement_revision)
         |> maybe_put(:escalation_reason, escalation_reason)
+        |> maybe_put(:resources, normalized_resources)
 
       {:ok, sanitized}
     end
@@ -621,6 +1222,10 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp optional_text(nil, _key), do: :ok
   defp optional_text(value, key), do: present(value, key)
+
+  defp optional_text_value(nil, _key), do: :ok
+  defp optional_text_value(value, key) when is_binary(value), do: present(String.trim(value), key)
+  defp optional_text_value(_value, key), do: {:error, :invalid_argument, %{argument: key}}
 
   defp optional_route(changes) do
     case Map.get(changes, :route) do
@@ -635,6 +1240,15 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp optional_list_of_binaries(nil, _key), do: :ok
   defp optional_list_of_binaries(value, key), do: list_of_binaries(value, key)
+
+  defp optional_resources(nil), do: {:ok, nil}
+
+  defp optional_resources(value) do
+    case Resources.normalize_all(value) do
+      {:ok, normalized} -> {:ok, normalized}
+      _ -> {:error, :invalid_argument, %{argument: :resources}}
+    end
+  end
 
   defp optional_fingerprint(nil), do: :ok
   defp optional_fingerprint(value), do: present(value, :requirements_fingerprint)
@@ -695,17 +1309,19 @@ defmodule SymphonyElixir.Managed.Rules do
 
     duplicate =
       Enum.find(state.assignments, fn {id, existing} ->
-        id != own_id and assignment_identity(existing) == identity and phase(existing[:phase]) not in @terminal_phases
+        id != own_id and assignment_identity(existing) == identity
       end)
 
     if is_nil(duplicate), do: :ok, else: {:error, :duplicate_underlying_identity, %{assignment_id: elem(duplicate, 0)}}
   end
 
   defp assignment_identity(assignment) when is_map(assignment) do
+    provider = text_value(assignment, :provider) || "github"
     native_issue_id = text_value(assignment, :native_issue_id) || text_value(assignment, :issue_id)
+    native_repository_id = text_value(assignment, :native_repository_id) || text_value(assignment, :repository_id) || text_value(assignment, :repository_node_id) || text_value(assignment, :repository)
 
     if native_issue_id do
-      "github:issue:" <> native_issue_id
+      provider <> ":issue:" <> (native_repository_id || "") <> ":" <> native_issue_id
     else
       repository = text_value(assignment, :repository) || ""
       issue_number = number_value(assignment, :issue_number) || 0
@@ -716,10 +1332,26 @@ defmodule SymphonyElixir.Managed.Rules do
   defp resources_free?(state, resources, own_id \\ nil) do
     conflicting =
       Enum.find(state.assignments, fn {id, existing} ->
-        id != own_id and resource_claiming?(existing) and Enum.any?(resources, &(&1 in (existing.resources || [])))
+        id != own_id and resource_claiming?(existing) and resources_conflict?(resources, Map.get(existing, :resources, []))
       end)
 
     if is_nil(conflicting), do: :ok, else: {:error, :resource_conflict, %{assignment_id: elem(conflicting, 0)}}
+  end
+
+  @spec resources_available?(state(), map()) :: boolean()
+  def resources_available?(state, assignment) when is_map(state) and is_map(assignment) do
+    resources_free?(state, Map.get(assignment, :resources, []), Map.get(assignment, :assignment_id)) == :ok
+  end
+
+  def resources_available?(_state, _assignment), do: false
+
+  defp resources_conflict?(resources, existing) do
+    with {:ok, left} <- Resources.normalize_all(resources, allow_legacy: true),
+         {:ok, right} <- Resources.normalize_all(existing, allow_legacy: true) do
+      Enum.any?(left, fn candidate -> Enum.any?(right, &Resources.conflicts?(candidate, &1)) end)
+    else
+      _ -> true
+    end
   end
 
   defp resource_claiming?(assignment) do
@@ -751,9 +1383,6 @@ defmodule SymphonyElixir.Managed.Rules do
     end
   end
 
-  defp binding_present(%{binding: binding}) when is_map(binding), do: :ok
-  defp binding_present(_state), do: {:error, :project_not_bound, %{}}
-
   defp commit(state, request, canonical, response, patch) do
     event_cursor = Map.get(state, :event_cursor, 0) + 1
     control_revision = Map.get(state, :control_revision, 0) + 1
@@ -769,15 +1398,32 @@ defmodule SymphonyElixir.Managed.Rules do
       control_revision: control_revision
     }
 
+    event = Map.merge(event, Map.take(response, [:source_pm_id, :destination_pm_id, :assignment_ids, :reason, :handoff_id, :status]))
+
     next_state =
       next_state
       |> Map.put(:control_revision, control_revision)
       |> Map.put(:event_cursor, event_cursor)
       |> Map.put(:events, [event | Enum.take(Map.get(state, :events, []), 99)])
-      |> put_in([:requests, request.request_id], %{canonical: canonical, response: response})
+      |> put_in([:requests, request.request_id], request_record(request, canonical, response))
       |> trim_requests()
 
     {:ok, next_state, response}
+  end
+
+  defp request_record(request, canonical, response) do
+    principal = Map.get(request, :principal)
+
+    %{canonical: canonical, response: response}
+    |> maybe_put(:principal_id, principal && principal.principal_id)
+    |> maybe_put(:capability_id, principal && principal.capability_id)
+  end
+
+  defp request_principal_allowed?(record, principal) do
+    case Map.get(record, :principal_id) do
+      nil -> principal.principal_id == "legacy"
+      value -> value == principal.principal_id
+    end
   end
 
   defp normalize_envelope(envelope) do
@@ -809,6 +1455,11 @@ defmodule SymphonyElixir.Managed.Rules do
   defp normalize_key("expected_revision"), do: :expected_revision
   defp normalize_key("request_id"), do: :request_id
   defp normalize_key("assignment_id"), do: :assignment_id
+  defp normalize_key("assignment_ids"), do: :assignment_ids
+  defp normalize_key("assignments"), do: :assignments
+  defp normalize_key("expected_ownership_revision"), do: :expected_ownership_revision
+  defp normalize_key("expected_revisions"), do: :expected_revisions
+  defp normalize_key("expected_ownership_revisions"), do: :expected_ownership_revisions
   defp normalize_key("project_id"), do: :project_id
   defp normalize_key("project_item_id"), do: :project_item_id
   defp normalize_key("native_project_item_id"), do: :native_project_item_id
@@ -819,10 +1470,12 @@ defmodule SymphonyElixir.Managed.Rules do
   defp normalize_key("repository_id"), do: :repository_id
   defp normalize_key("repository_node_id"), do: :repository_node_id
   defp normalize_key("status_field_id"), do: :status_field_id
+  defp normalize_key("projection_field_id"), do: :projection_field_id
   defp normalize_key("project_number"), do: :project_number
   defp normalize_key("status_options"), do: :status_options
   defp normalize_key("repositories"), do: :repositories
   defp normalize_key("repository"), do: :repository
+  defp normalize_key("provider"), do: :provider
   defp normalize_key("issue_number"), do: :issue_number
   defp normalize_key("base_commit"), do: :base_commit
   defp normalize_key("board_state"), do: :board_state
@@ -837,6 +1490,11 @@ defmodule SymphonyElixir.Managed.Rules do
   defp normalize_key("reason"), do: :reason
   defp normalize_key("disable"), do: :disable
   defp normalize_key("owner"), do: :owner
+  defp normalize_key("principal"), do: :principal
+  defp normalize_key("target_principal_id"), do: :target_principal_id
+  defp normalize_key("handoff_id"), do: :handoff_id
+  defp normalize_key("display_name"), do: :display_name
+  defp normalize_key("scope"), do: :scope
   defp normalize_key("project"), do: :project
   defp normalize_key("allowlisted_repositories"), do: :allowlisted_repositories
   defp normalize_key("model"), do: :model
@@ -909,7 +1567,7 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp drop_issue_content(map) when is_map(map) do
     map
-    |> Enum.reject(fn {key, _value} -> normalize_key(key) in [:requirements, :issue_body] end)
+    |> Enum.reject(fn {key, _value} -> normalize_key(key) in [:requirements, :issue_body, :principal] end)
     |> Enum.map(fn {key, value} -> {key, drop_issue_content(value)} end)
     |> Map.new()
   end
