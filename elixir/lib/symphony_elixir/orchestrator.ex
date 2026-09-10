@@ -2305,6 +2305,9 @@ defmodule SymphonyElixir.Orchestrator do
 
     case apply_managed_rules(state, intent.request, context) do
       {:ok, committed_data, committed_response} ->
+        # The retained stop flag belongs to the old attempt and must not stop its successor.
+        stop_pending = not context.stop_reconciled
+        committed_data = put_in(committed_data, [:assignments, intent.assignment_id, :stop_pending], stop_pending)
         persist_committed_managed_transition(state, intent, committed_data, committed_response)
 
       {:duplicate, committed_response} ->

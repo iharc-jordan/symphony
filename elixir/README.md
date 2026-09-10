@@ -467,3 +467,5 @@ you.
 ## License
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
+
+Managed transitions clear the retained stop flag only when the owned process has stopped and the provider transition commits. Failed provider reconciliation retains the prior stop state, so the successor cannot inherit a completed stop request.

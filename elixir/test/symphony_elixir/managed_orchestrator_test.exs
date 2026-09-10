@@ -928,7 +928,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       prepare_revision_assignment(pid, fingerprint, fingerprint)
 
       :sys.replace_state(pid, fn state ->
-        data = update_in(state.managed.data, [:assignments, "item-1"], &Map.merge(&1, %{phase: :review, board_state: :review}))
+        data = update_in(state.managed.data, [:assignments, "item-1"], &Map.merge(&1, %{phase: :review, board_state: :review, stop_pending: true}))
         %{state | managed: %{state.managed | data: data}}
       end)
 
@@ -943,6 +943,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       assert response.phase == @review_target
       state = :sys.get_state(pid).managed.data
       assert state.effect_intents["deferred-review"].status == :committed
+      assert state.assignments["item-1"].stop_pending == false
       assert state.assignments["item-1"].pending_effect.facts.provider_state == @review_target
       assert {:ok, %{duplicate: true}} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, request)
       refute_receive {:requirements_transition_target, _, _}, 100
@@ -954,7 +955,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     prepare_revision_assignment(pid, body_fingerprint("old"), body_fingerprint("changed"))
 
     :sys.replace_state(pid, fn state ->
-      data = update_in(state.managed.data, [:assignments, "item-1"], &Map.merge(&1, %{phase: :waiting, board_state: :waiting}))
+      data = update_in(state.managed.data, [:assignments, "item-1"], &Map.merge(&1, %{phase: :waiting, board_state: :waiting, stop_pending: true}))
       %{state | managed: %{state.managed | data: data}}
     end)
 
@@ -969,6 +970,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     assert state.assignments["item-1"].phase == :waiting
     assert state.assignments["item-1"].revision == 1
     assert state.effect_intents["failed-rework"].status == :pending
+    assert state.assignments["item-1"].stop_pending == true
   end
 
   test "fresh revise control verifies new requirements before committing locally" do
@@ -1009,7 +1011,9 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     state = :sys.get_state(pid)
 
     data =
-      put_in(state.managed.data, [:effect_intents, "revise-recovered-r2"], %{
+      state.managed.data
+      |> update_in([:assignments, "item-1"], &Map.merge(&1, %{phase: :active, board_state: :active, stop_pending: true}))
+      |> put_in([:effect_intents, "revise-recovered-r2"], %{
         request_id: "revise-recovered-r2",
         request: request,
         binding: state.managed.data.projects["PVT_test"],
@@ -1036,6 +1040,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     assert snapshot.assignments["item-1"].requirements_fingerprint == new_fingerprint
     assert snapshot.assignments["item-1"].requirements_revision == 2
     assert snapshot.assignments["item-1"].revision == 2
+    assert snapshot.assignments["item-1"].stop_pending == false
     assert :sys.get_state(pid).managed.data.effect_intents["revise-recovered-r2"].status == :committed
   end
 
