@@ -10,7 +10,17 @@ defmodule SymphonyElixir.ManagedCoreR1Test do
   defp envelope(id, operation, args), do: %{request_id: id, operation: operation, args: args}
 
   defp bound do
-    args = %{expected_revision: 0, project: %{project_id: "project-1", project_number: 1, status_field_id: "status", status_options: %{"READY" => "ready"}, repositories: ["acme/repo"]}}
+    args = %{
+      expected_revision: 0,
+      project: %{
+        project_id: "project-1",
+        project_number: 1,
+        status_field_id: "status",
+        status_options: %{"READY" => "ready"},
+        repositories: ["acme/repo"]
+      }
+    }
+
     {:ok, state, _} = Rules.apply(Rules.new(), envelope("bind", :bind_project, args), @operator)
     state
   end
@@ -31,14 +41,17 @@ defmodule SymphonyElixir.ManagedCoreR1Test do
   end
 
   test "a PM enrollment records the trusted principal and owns the assignment" do
-    {:ok, state, _} = Rules.apply(bound(), envelope("enroll", :enroll, enrollment("a", 1)), %{principal: @pm_a})
+    {:ok, state, _} =
+      Rules.apply(bound(), envelope("enroll", :enroll, enrollment("a", 1)), %{principal: @pm_a})
+
     assert state.assignments["a"].ownership.pm_id == "pm-a"
     assert state.assignments["a"].ownership.ownership_revision == 1
     assert state.principals["pm-a"].principal_id == "pm-a"
   end
 
   test "old PM controls are fenced after an atomic handoff" do
-    {:ok, state, _} = Rules.apply(bound(), envelope("enroll", :enroll, enrollment("a", 1)), %{principal: @pm_a})
+    {:ok, state, _} =
+      Rules.apply(bound(), envelope("enroll", :enroll, enrollment("a", 1)), %{principal: @pm_a})
 
     {:ok, state, _} =
       Rules.apply(state, envelope("register", :register_pm, %{display_name: "B"}), %{principal: @pm_b})
@@ -53,7 +66,14 @@ defmodule SymphonyElixir.ManagedCoreR1Test do
     {:ok, state, _} = Rules.apply(state, envelope("handoff", :handoff, handoff), %{principal: @pm_a})
     assert state.assignments["a"].ownership.pm_id == "pm-b"
 
-    stale = %{project_id: "project-1", assignment_id: "a", expected_revision: 1, expected_ownership_revision: 1, reason: "stale"}
+    stale = %{
+      project_id: "project-1",
+      assignment_id: "a",
+      expected_revision: 1,
+      expected_ownership_revision: 1,
+      reason: "stale"
+    }
+
     assert {:error, :ownership_conflict, _} = Rules.apply(state, envelope("stale", :cancel, stale), %{principal: @pm_a})
   end
 
@@ -84,7 +104,13 @@ defmodule SymphonyElixir.ManagedCoreR1Test do
   test "operator takeover is explicit for migrated needs-claim work" do
     old = %{
       version: 1,
-      binding: %{project_id: "project-1", project_number: 1, status_field_id: "status", status_options: %{"READY" => "ready"}, repositories: ["acme/repo"]},
+      binding: %{
+        project_id: "project-1",
+        project_number: 1,
+        status_field_id: "status",
+        status_options: %{"READY" => "ready"},
+        repositories: ["acme/repo"]
+      },
       assignments: %{"a" => Map.merge(enrollment("a", 0), %{revision: 4, owner: "display-only"})},
       requests: %{},
       review_intents: %{},
@@ -104,10 +130,31 @@ defmodule SymphonyElixir.ManagedCoreR1Test do
 
     old = %{
       version: 1,
-      binding: %{project_id: "project-1", project_number: 1, status_field_id: "status", status_options: %{"READY" => "ready"}, repositories: ["acme/repo"]},
-      assignments: %{"a" => Map.merge(enrollment("a", 0), %{revision: 4, phase: :review, board_state: :review})},
+      binding: %{
+        project_id: "project-1",
+        project_number: 1,
+        status_field_id: "status",
+        status_options: %{"READY" => "ready"},
+        repositories: ["acme/repo"]
+      },
+      assignments: %{
+        "a" =>
+          Map.merge(enrollment("a", 0), %{
+            revision: 4,
+            phase: :review,
+            board_state: :review
+          })
+      },
       requests: %{},
-      review_intents: %{"legacy-review" => %{request: request, canonical: canonical, assignment_id: "a", revision: 4, status: :pending}},
+      review_intents: %{
+        "legacy-review" => %{
+          request: request,
+          canonical: canonical,
+          assignment_id: "a",
+          revision: 4,
+          status: :pending
+        }
+      },
       effect_intents: %{}
     }
 
@@ -134,7 +181,13 @@ defmodule SymphonyElixir.ManagedCoreR1Test do
     mismatched =
       %{
         version: 1,
-        binding: %{project_id: "project-1", project_number: 1, status_field_id: "status", status_options: %{"READY" => "ready"}, repositories: ["acme/repo"]},
+        binding: %{
+          project_id: "project-1",
+          project_number: 1,
+          status_field_id: "status",
+          status_options: %{"READY" => "ready"},
+          repositories: ["acme/repo"]
+        },
         assignments: %{"journal-a" => Map.put(enrollment("embedded", 0), :assignment_id, "embedded")},
         requests: %{},
         review_intents: %{},
@@ -144,11 +197,42 @@ defmodule SymphonyElixir.ManagedCoreR1Test do
     assert {:error, :assignment_identity_mismatch, %{assignment_id: "journal-a"}} = Migration.migrate(mismatched)
   end
 
+  test "migration preserves timestamp structs in assignment state" do
+    timestamp = ~U[2026-01-02 03:04:05Z]
+
+    old =
+      %{
+        version: 1,
+        binding: %{
+          project_id: "project-1",
+          project_number: 1,
+          status_field_id: "status",
+          status_options: %{"READY" => "ready"},
+          repositories: ["acme/repo"]
+        },
+        assignments: %{
+          "a" => Map.put(enrollment("a", 0), :enrolled_at, timestamp)
+        },
+        requests: %{},
+        review_intents: %{},
+        effect_intents: %{}
+      }
+
+    assert {:ok, migrated} = Migration.migrate(old)
+    assert migrated.assignments["a"].enrolled_at == timestamp
+  end
+
   test "migration marks nonterminal legacy resources for operator reconciliation" do
     old =
       %{
         version: 1,
-        binding: %{project_id: "project-1", project_number: 1, status_field_id: "status", status_options: %{"READY" => "ready"}, repositories: ["acme/repo"]},
+        binding: %{
+          project_id: "project-1",
+          project_number: 1,
+          status_field_id: "status",
+          status_options: %{"READY" => "ready"},
+          repositories: ["acme/repo"]
+        },
         assignments: %{"a" => Map.put(enrollment("a", 0), :resources, ["repo:acme/repo"])},
         requests: %{},
         review_intents: %{},
@@ -167,7 +251,13 @@ defmodule SymphonyElixir.ManagedCoreR1Test do
     old =
       %{
         version: 1,
-        binding: %{project_id: "project-1", project_number: 1, status_field_id: "status", status_options: %{"READY" => "ready"}, repositories: ["acme/repo"]},
+        binding: %{
+          project_id: "project-1",
+          project_number: 1,
+          status_field_id: "status",
+          status_options: %{"READY" => "ready"},
+          repositories: ["acme/repo"]
+        },
         assignments: %{"a" => duplicate_a, "b" => duplicate_b},
         principals: %{"pm-b" => %{principal_id: "pm-b", role: :pm}},
         requests: %{},
@@ -262,8 +352,17 @@ defmodule SymphonyElixir.ManagedCoreR1Test do
   end
 
   test "assignment pause preserves worker revision" do
-    {:ok, state, _} = Rules.apply(bound(), envelope("enroll", :enroll, enrollment("a", 1)), %{principal: @pm_a})
-    args = %{scope: "assignments", project_id: "project-1", assignments: [%{assignment_id: "a", expected_revision: 1, expected_ownership_revision: 1}]}
+    {:ok, state, _} =
+      Rules.apply(bound(), envelope("enroll", :enroll, enrollment("a", 1)), %{principal: @pm_a})
+
+    args = %{
+      scope: "assignments",
+      project_id: "project-1",
+      assignments: [
+        %{assignment_id: "a", expected_revision: 1, expected_ownership_revision: 1}
+      ]
+    }
+
     {:ok, paused, _} = Rules.apply(state, envelope("pause", :pause, args), %{principal: @pm_a})
     assert paused.assignments["a"].dispatch_paused
     assert paused.assignments["a"].revision == 1

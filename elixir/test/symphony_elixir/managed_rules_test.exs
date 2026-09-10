@@ -7,33 +7,42 @@ defmodule SymphonyElixir.ManagedRulesTest do
   @pm %{principal_id: "pm", role: :pm, project_scope: :all}
 
   defp envelope(id, operation, args) do
-    args =
-      case operation do
-        operation when operation in [:revise, :interrupt, :cancel, :review] ->
-          args
-          |> Map.put_new(:project_id, "PVT_kwDO")
-          |> Map.put_new(:expected_ownership_revision, 1)
+    %{request_id: id, operation: operation, args: enrich_args(operation, args)}
+  end
 
-        operation when operation in [:pause, :resume] ->
-          if is_map(args) and Map.has_key?(args, :assignments) do
-            args
-            |> Map.put_new(:project_id, "PVT_kwDO")
-            |> Map.update!(:assignments, fn assignments ->
-              Enum.map(assignments, fn fence ->
-                fence
-                |> Map.put_new(:expected_revision, 1)
-                |> Map.put_new(:expected_ownership_revision, 1)
-              end)
-            end)
-          else
-            args
-          end
+  defp enrich_args(operation, args)
+       when operation in [:revise, :interrupt, :cancel, :review] and is_map(args) do
+    args
+    |> Map.put_new(:project_id, "PVT_kwDO")
+    |> Map.put_new(:expected_ownership_revision, 1)
+  end
 
-        _ ->
-          args
-      end
+  defp enrich_args(operation, args) when operation in [:pause, :resume] do
+    enrich_assignment_scope(args)
+  end
 
-    %{request_id: id, operation: operation, args: args}
+  defp enrich_args(_operation, args), do: args
+
+  defp enrich_assignment_scope(args) when is_map(args) do
+    if Map.has_key?(args, :assignments) or Map.has_key?(args, "assignments") do
+      args
+      |> Map.put_new(:project_id, "PVT_kwDO")
+      |> Map.update!(:assignments, &enrich_assignment_fences/1)
+    else
+      args
+    end
+  end
+
+  defp enrich_assignment_scope(args), do: args
+
+  defp enrich_assignment_fences(assignments) do
+    Enum.map(assignments, &enrich_assignment_fence/1)
+  end
+
+  defp enrich_assignment_fence(fence) do
+    fence
+    |> Map.put_new(:expected_revision, 1)
+    |> Map.put_new(:expected_ownership_revision, 1)
   end
 
   defp principal_for(:bind_project, _args), do: @operator
@@ -514,18 +523,43 @@ defmodule SymphonyElixir.ManagedRulesTest do
 
     review_args = %{assignment_id: "dependent", expected_revision: 2, disposition: "accepted", evidence: ["proof"]}
     proof = %{provider_state: :review, reconciled: true, external_effects: %{status: :ok, issue_close: :ok}}
-    assert {:error, :dependency_not_accepted, %{dependencies: ["missing"]}} = apply_request(dependent, envelope("dependent-review", :review, review_args), proof)
+
+    assert {:error, :dependency_not_accepted, %{dependencies: ["missing"]}} =
+             apply_request(dependent, envelope("dependent-review", :review, review_args), proof)
 
     assert {:error, :external_effects_unreconciled, %{}} =
-             apply_request(dependent |> put_in([:assignments, "dependent", :dependencies], []), envelope("review-no-effects", :review, review_args), %{provider_state: :review})
+             apply_request(
+               dependent |> put_in([:assignments, "dependent", :dependencies], []),
+               envelope("review-no-effects", :review, review_args),
+               %{provider_state: :review}
+             )
 
     assert {:error, :evidence_required, %{}} =
-             apply_request(dependent |> put_in([:assignments, "dependent", :dependencies], []), envelope("review-no-evidence", :review, Map.put(review_args, :evidence, [])), proof)
+             apply_request(
+               dependent |> put_in([:assignments, "dependent", :dependencies], []),
+               envelope("review-no-evidence", :review, Map.put(review_args, :evidence, [])),
+               proof
+             )
 
-    assert {:error, :invalid_disposition, %{disposition: :unknown}} = apply_request(dependent, envelope("review-invalid", :review, Map.merge(review_args, %{disposition: "mystery", reason: "bad"})))
+    invalid_review =
+      envelope(
+        "review-invalid",
+        :review,
+        Map.merge(review_args, %{disposition: "mystery", reason: "bad"})
+      )
 
     assert {:error, :invalid_disposition, %{disposition: :unknown}} =
-             prepare_request(dependent, envelope("review-invalid-prepare", :review, Map.merge(review_args, %{disposition: "mystery", reason: "bad"})))
+             apply_request(dependent, invalid_review)
+
+    invalid_prepare =
+      envelope(
+        "review-invalid-prepare",
+        :review,
+        Map.merge(review_args, %{disposition: "mystery", reason: "bad"})
+      )
+
+    assert {:error, :invalid_disposition, %{disposition: :unknown}} =
+             prepare_request(dependent, invalid_prepare)
 
     review_state = put_in(dependent, [:assignments, "dependent", :dependencies], [])
     review_state = put_in(review_state, [:assignments, "dependent", :revision], 2)
@@ -533,12 +567,22 @@ defmodule SymphonyElixir.ManagedRulesTest do
     assert {:ok, _review_intent} = prepare_request(review_state, review_request)
 
     duplicate_review =
-      put_in(review_state, [:requests, "review-prepare"], %{canonical: Rules.canonical_input(review_request), response: %{}, principal_id: @pm.principal_id})
+      put_in(
+        review_state,
+        [:requests, "review-prepare"],
+        %{
+          canonical: Rules.canonical_input(review_request),
+          response: %{},
+          principal_id: @pm.principal_id
+        }
+      )
 
     assert {:duplicate, %{}} = prepare_request(duplicate_review, review_request)
 
     conflict_review = put_in(review_state, [:requests, "review-prepare"], %{canonical: <<0>>, response: %{}})
-    assert {:error, :request_id_conflict, %{request_id: "review-prepare"}} = prepare_request(conflict_review, review_request)
+
+    assert {:error, :request_id_conflict, %{request_id: "review-prepare"}} =
+             prepare_request(conflict_review, review_request)
 
     assert {:error, :invalid_envelope, %{}} = prepare_request(Rules.new(), %{request_id: "bad", operation: :review, args: %{}, extra: true})
   end
@@ -547,7 +591,10 @@ defmodule SymphonyElixir.ManagedRulesTest do
     list_binding = put_in(binding_args(), [:project, :status_options], [%{name: "READY", id: "ready"}])
     assert {:ok, list_bound, _} = apply_request(Rules.new(), envelope("bind-list", :bind_project, list_binding))
 
-    native_args = enrollment_args("native-issue", 1) |> Map.merge(%{issue_id: "node-issue", repository_id: "node-repo", turn_limit: 99})
+    native_args =
+      enrollment_args("native-issue", 1)
+      |> Map.merge(%{issue_id: "node-issue", repository_id: "node-repo", turn_limit: 99})
+
     assert {:ok, native_state, _} = apply_request(list_bound, envelope("enroll-native", :enroll, native_args))
     assert native_state.assignments["native-issue"].underlying_issue_id == "node-issue"
     assert native_state.assignments["native-issue"].turn_limit == 20
@@ -565,22 +612,37 @@ defmodule SymphonyElixir.ManagedRulesTest do
     assert alias_state.assignments["alias-issue"].native_issue_id == "node-issue-2"
     assert alias_state.assignments["alias-issue"].native_repository_id == "node-repo-2"
 
-    duplicate_native = enrollment_args("native-issue-2", 2) |> Map.merge(%{native_issue_id: "node-issue", native_repository_id: "node-repo", issue_number: 99})
+    duplicate_native =
+      enrollment_args("native-issue-2", 2)
+      |> Map.merge(%{
+        native_issue_id: "node-issue",
+        native_repository_id: "node-repo",
+        issue_number: 99
+      })
 
     assert {:error, :duplicate_underlying_identity, %{assignment_id: "native-issue"}} =
              apply_request(native_state, envelope("enroll-native-duplicate", :enroll, duplicate_native))
 
     invalid_list_binding = put_in(binding_args(), [:project, :status_options], [1])
-    assert {:error, :status_options_required, %{}} = apply_request(Rules.new(), envelope("bind-invalid-list", :bind_project, invalid_list_binding))
+
+    assert {:error, :status_options_required, %{}} =
+             apply_request(Rules.new(), envelope("bind-invalid-list", :bind_project, invalid_list_binding))
 
     invalid_project = %{project: %{project_id: 12}, expected_revision: 0}
-    assert {:error, :invalid_argument, %{argument: :project_id}} = apply_request(Rules.new(), envelope("bind-invalid-project", :bind_project, invalid_project))
+
+    assert {:error, :invalid_argument, %{argument: :project_id}} =
+             apply_request(Rules.new(), envelope("bind-invalid-project", :bind_project, invalid_project))
 
     invalid_enroll = enrollment_args("bad-resources", 1) |> Map.put(:resources, :bad)
-    assert {:error, :invalid_argument, %{argument: :resources}} = apply_request(list_bound, envelope("enroll-invalid-resources", :enroll, invalid_enroll))
+    invalid_resource_request = envelope("enroll-invalid-resources", :enroll, invalid_enroll)
+
+    assert {:error, :invalid_argument, %{argument: :resources}} =
+             apply_request(list_bound, invalid_resource_request)
 
     invalid_phase = enrollment_args("bad-phase", 1) |> Map.put(:board_state, "ACTIVE")
-    assert {:error, :invalid_phase, %{}} = apply_request(list_bound, envelope("enroll-invalid-phase", :enroll, invalid_phase))
+
+    assert {:error, :invalid_phase, %{}} =
+             apply_request(list_bound, envelope("enroll-invalid-phase", :enroll, invalid_phase))
 
     assert {:ok, _string_operation_state, _} = apply_request(Rules.new(), envelope("string-operation", "pause", %{"expected_revision" => 0}))
   end
@@ -627,7 +689,12 @@ defmodule SymphonyElixir.ManagedRulesTest do
   test "request history remains bounded after many valid operations" do
     state =
       Enum.reduce(1..101, Rules.new(), fn index, state ->
-        assert {:ok, next_state, _response} = apply_request(state, envelope("pause-#{index}", :pause, %{expected_revision: index - 1}))
+        assert {:ok, next_state, _response} =
+                 apply_request(
+                   state,
+                   envelope("pause-#{index}", :pause, %{expected_revision: index - 1})
+                 )
+
         next_state
       end)
 
