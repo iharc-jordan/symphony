@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.GitHubProjects.Client
-  alias SymphonyElixir.Managed.{Checkout, Journal, Migration, Principal, Projection, Rules}
+  alias SymphonyElixir.Managed.{Checkout, Journal, Principal, Projection, Rules}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -725,8 +725,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp managed_dispatch_candidate(state, _issue), do: state
 
   defp managed_dispatch_enabled?(assignment) do
-    assignment[:dispatch_paused] != true and assignment[:operator_reconciliation_required] != true and
-      get_in(assignment, [:ownership, :status]) == :owned
+    assignment[:dispatch_paused] != true and get_in(assignment, [:ownership, :status]) == :owned
   end
 
   defp managed_issue_matches_assignment?(%Issue{} = issue, assignment) do
@@ -2324,7 +2323,6 @@ defmodule SymphonyElixir.Orchestrator do
       |> put_in([:effect_intents, intent.request_id, :status], :committed)
       |> put_in([:effect_intents, intent.request_id, :committed_at], DateTime.utc_now())
       |> retire_obsolete_managed_auto_intents(intent)
-      |> complete_legacy_reconciliation(intent.assignment_id, intent.request_id)
       |> append_managed_event(%{
         operation: :provider_transition_committed,
         request_id: intent.request_id,
@@ -2339,31 +2337,6 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
     end
-  end
-
-  defp complete_legacy_reconciliation(data, assignment_id, request_id) do
-    assignment = get_in(data, [:assignments, assignment_id])
-    legacy_resources = Enum.any?(assignment[:resources] || [], &(map_value(&1, :authority) == "legacy"))
-
-    if assignment[:operator_reconciliation_required] == true and not legacy_resources do
-      data
-      |> put_in([:assignments, assignment_id, :operator_reconciliation_required], false)
-      |> Map.update(:effect_intents, %{}, &retire_legacy_intents(&1, assignment_id, request_id))
-      |> Map.update(:review_intents, %{}, &retire_legacy_intents(&1, assignment_id, request_id))
-    else
-      data
-    end
-  end
-
-  defp retire_legacy_intents(intents, assignment_id, request_id) do
-    Map.new(intents, fn {id, intent} ->
-      if intent[:assignment_id] == assignment_id and intent[:legacy_intent] == true and
-           intent[:status] == :needs_operator_reconciliation do
-        {id, Map.merge(intent, %{status: :superseded, reconciled_by: request_id})}
-      else
-        {id, intent}
-      end
-    end)
   end
 
   defp retire_obsolete_managed_auto_intents(data, %{request: request, assignment_id: assignment_id})
@@ -2574,7 +2547,6 @@ defmodule SymphonyElixir.Orchestrator do
     completed_data =
       data
       |> complete_managed_review_intent(intent.request.request_id)
-      |> complete_legacy_reconciliation(intent.assignment.assignment_id, intent.request.request_id)
 
     case persist_managed_data(state, completed_data) do
       {:ok, final_state} ->
@@ -3739,7 +3711,8 @@ defmodule SymphonyElixir.Orchestrator do
           attempt_id: attempt_id,
           model: route_value(assignment[:route], :model),
           effort: route_value(assignment[:route], :effort),
-          escalation_reason: assignment[:escalation_reason]
+          escalation_reason: assignment[:escalation_reason],
+          review_feedback: assignment[:review_feedback]
         }
 
       _ ->
@@ -3797,6 +3770,7 @@ defmodule SymphonyElixir.Orchestrator do
         model: attempt[:model],
         effort: attempt[:effort],
         escalation_reason: attempt[:escalation_reason],
+        review_feedback: attempt[:review_feedback],
         workspace_preparer: workspace_preparer,
         issue_state_fetcher: managed_issue_state_fetcher(state, assignment),
         on_session: fn info -> managed_callback_call(owner, {:managed_session, attempt, info}) end,
@@ -4084,8 +4058,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     if enabled do
       with {:ok, journal, loaded} <- Journal.open(config.managed.journal_path),
-           {:ok, data} <- managed_data(loaded, config),
-           :ok <- persist_managed_migration(journal, loaded, data) do
+           {:ok, data} <- managed_data(loaded, config) do
         effects =
           Keyword.get(
             opts,
@@ -4111,23 +4084,18 @@ defmodule SymphonyElixir.Orchestrator do
     {:ok, Rules.new(usage_limit_tokens: config.managed.usage_limit_tokens)}
   end
 
-  defp managed_data(%{version: version} = data, config) when version in [1, 2] do
-    case Migration.migrate(data) do
-      {:ok, migrated} ->
-        defaults = Rules.new(usage_limit_tokens: config.managed.usage_limit_tokens)
-        merged = Map.merge(defaults, migrated)
-        usage_limit = config.managed.usage_limit_tokens || merged[:usage_limit_tokens]
-        {:ok, Map.put(merged, :usage_limit_tokens, usage_limit) |> normalize_managed_usage()}
-
-      {:error, code, details} ->
-        {:error, {code, details}}
+  defp managed_data(%{version: version} = data, config) do
+    if version == Rules.version() do
+      defaults = Rules.new(usage_limit_tokens: config.managed.usage_limit_tokens)
+      merged = Map.merge(defaults, data)
+      usage_limit = config.managed.usage_limit_tokens || merged[:usage_limit_tokens]
+      {:ok, Map.put(merged, :usage_limit_tokens, usage_limit) |> normalize_managed_usage()}
+    else
+      {:error, :managed_journal_schema_mismatch}
     end
   end
 
   defp managed_data(_data, _config), do: {:error, :managed_journal_schema_mismatch}
-
-  defp persist_managed_migration(journal, %{version: 1}, %{version: 2} = data), do: Journal.append(journal, data)
-  defp persist_managed_migration(_journal, _loaded, _data), do: :ok
 
   defp normalize_managed_usage(%{usage: usage} = data) when is_map(usage) do
     normalized = %{

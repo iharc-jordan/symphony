@@ -39,7 +39,6 @@ defmodule SymphonyElixir.ManagedOwnershipResourcesTest do
       assigned = Ownership.assigned(@pm_a, 2)
       assignment = %{assignment_id: "item", project_id: "P1", ownership: assigned}
 
-      assert Ownership.legacy_principal().role == :operator
       assert Ownership.unassigned().status == :unassigned
       assert Ownership.needs_claim().status == :needs_claim
       assert %DateTime{} = assigned.changed_at
@@ -181,13 +180,9 @@ defmodule SymphonyElixir.ManagedOwnershipResourcesTest do
       end
     end
 
-    test "rejects malformed references and legacy policy violations" do
+    test "rejects malformed resource references" do
       assert {:error, :resource_reference_required, %{resource: "acme/one"}} = Resources.normalize("acme/one")
-
-      assert {:ok, %{kind: :other, authority: "legacy", identity: "acme/one", access: :write}} =
-               Resources.normalize(" Acme/One ", allow_legacy: true)
-
-      assert {:error, :resource_identity_required, %{}} = Resources.normalize("   ", allow_legacy: true)
+      assert {:error, :resource_reference_required, %{resource: "   "}} = Resources.normalize("   ")
       assert {:error, :resource_reference_required, %{resource: :invalid}} = Resources.normalize(:invalid)
 
       for {resource, error} <- [
@@ -216,9 +211,6 @@ defmodule SymphonyElixir.ManagedOwnershipResourcesTest do
 
       coalesced = %{repository | access: :write}
       assert {:ok, [^coalesced, ^database]} = Resources.normalize_all([repository, writer, database])
-
-      assert {:ok, [%{kind: :other, authority: "legacy", identity: "legacy", access: :write}]} =
-               Resources.normalize_all(["legacy"], allow_legacy: true)
 
       assert {:error, :resource_reference_required, %{resource: "bad"}} = Resources.normalize_all([repository, "bad"])
       assert {:error, :resources_must_be_list, %{resources: :bad}} = Resources.normalize_all(:bad)
@@ -267,10 +259,6 @@ defmodule SymphonyElixir.ManagedOwnershipResourcesTest do
 
       assert {:error, :resources_invalid, %{}} = Resources.conflict(repository, :bad)
       assert {:error, :resources_invalid, %{}} = Resources.conflict(:bad, [])
-    end
-
-    test "normalizes legacy identities" do
-      assert Resources.legacy_identity("  Acme/One  ") == "acme/one"
     end
   end
 

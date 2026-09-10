@@ -33,11 +33,6 @@ defmodule SymphonyElixir.Managed.Ownership do
 
   def principal(_context), do: {:error, :principal_required, %{}}
 
-  @spec legacy_principal() :: principal()
-  def legacy_principal do
-    %{principal_id: "legacy", role: :operator, project_scope: :all, capability_id: nil}
-  end
-
   @spec unassigned() :: ownership()
   def unassigned do
     %{status: :unassigned, pm_id: nil, capability_id: nil, ownership_revision: 0, changed_at: nil, last_handoff_id: nil}

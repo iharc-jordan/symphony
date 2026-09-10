@@ -121,7 +121,7 @@ defmodule SymphonyElixir.ManagedV2RulesGateTest do
       )
 
     assert {:ok, bound, _} = Rules.apply(Rules.new(), binding_request, %{principal: @operator})
-    assert bound.binding.projection_field_id == "FIELD_summary"
+    assert bound.projects[@project_id].projection_field_id == "FIELD_summary"
 
     invalid_projection =
       binding_args() |> put_in([:project, :projection_field_id], 42)
@@ -143,7 +143,7 @@ defmodule SymphonyElixir.ManagedV2RulesGateTest do
     refute Map.has_key?(enrolled.assignments["source-fallback"], :issue_url)
 
     malformed_binding =
-      Rules.new(projects: %{@project_id => Map.delete(bound.binding, :repositories)})
+      Rules.new(projects: %{@project_id => Map.delete(bound.projects[@project_id], :repositories)})
 
     assert {:error, :project_not_bound, %{}} =
              Rules.apply(
@@ -167,7 +167,6 @@ defmodule SymphonyElixir.ManagedV2RulesGateTest do
         "expected_ownership_revisions" => %{"item" => 1},
         "destination_pm_id" => "pm-b",
         "project_item_id" => "item",
-        "native_project_item_id" => "native-item",
         "native_issue_id" => "issue",
         "native_repository_id" => "repository",
         "status_field_id" => "field",
@@ -190,7 +189,6 @@ defmodule SymphonyElixir.ManagedV2RulesGateTest do
         "evidence" => ["proof"],
         "reason" => "reason",
         "disable" => false,
-        "owner" => "owner",
         "principal" => %{"principal_id" => "nested"},
         "target_principal_id" => "pm-b",
         "handoff_id" => "handoff",
@@ -270,21 +268,18 @@ defmodule SymphonyElixir.ManagedV2RulesGateTest do
              )
   end
 
-  test "new projects derive from a binding and accept a malformed legacy binding only for replacement" do
-    binding = binding_args() |> Map.fetch!(:project)
-    derived = Rules.new(binding: binding)
+  test "new state starts without a project and binding creates its project entry" do
+    assert Rules.new().projects == %{}
 
-    assert derived.projects[@project_id].project_id == @project_id
-    assert derived.projects[@project_id].revision == 0
-
-    assert {:ok, replaced, _} =
+    assert {:ok, bound, _} =
              Rules.apply(
-               Rules.new(binding: :malformed_legacy_binding),
-               envelope("replace-malformed-binding", :bind_project, binding_args()),
+               Rules.new(),
+               envelope("bind-new-project", :bind_project, binding_args()),
                %{principal: @operator}
              )
 
-    assert replaced.binding.project_id == @project_id
+    assert bound.projects[@project_id].project_id == @project_id
+    assert bound.projects[@project_id].revision == 1
   end
 
   test "operator takeover and handoff preserve fences across missing, pending, and malformed state" do
@@ -447,8 +442,19 @@ defmodule SymphonyElixir.ManagedV2RulesGateTest do
              )
   end
 
-  test "binding replacement reports active assignment conflicts and preserves empty project slots" do
+  test "binding replacement fences active work only in the affected project" do
     state = enrolled_state("binding-rebind")
+
+    same_binding = binding_args() |> Map.put(:expected_revision, state.control_revision)
+
+    assert {:ok, rebound, _} =
+             Rules.apply(
+               state,
+               envelope("binding-rebind-same", :bind_project, same_binding),
+               %{principal: @operator}
+             )
+
+    assert rebound.projects[@project_id].revision == 2
 
     changed_binding =
       binding_args()
@@ -462,31 +468,25 @@ defmodule SymphonyElixir.ManagedV2RulesGateTest do
                %{principal: @operator}
              )
 
-    bindingless = %{state | binding: nil}
-
-    assert {:error, :binding_in_use, %{assignment_id: "binding-rebind"}} =
-             Rules.apply(
-               bindingless,
-               envelope("bindingless-rebind-conflict", :bind_project, changed_binding),
-               %{principal: @operator}
-             )
-
     other_project =
       binding_args()
       |> Map.put(:expected_revision, state.control_revision)
       |> put_in([:project, :project_id], "PVT_other")
 
-    assert {:error, :binding_in_use, %{assignment_id: "binding-rebind"}} =
+    assert {:ok, expanded, _} =
              Rules.apply(
                state,
                envelope("binding-rebind-other-project", :bind_project, other_project),
                %{principal: @operator}
              )
+
+    assert expanded.projects["PVT_other"].project_id == "PVT_other"
   end
 
   test "binding replacement ignores malformed inactive entries when no active owner exists" do
     binding = binding_args() |> Map.fetch!(:project)
-    malformed_state = Rules.new(binding: binding, assignments: %{"malformed" => :malformed})
+    project = Map.merge(binding, %{revision: 0, dispatch_paused: false})
+    malformed_state = Rules.new(projects: %{@project_id => project}, assignments: %{"malformed" => :malformed})
 
     other_project =
       binding_args()
@@ -503,7 +503,7 @@ defmodule SymphonyElixir.ManagedV2RulesGateTest do
     assert replaced.projects["PVT_other"].project_id == "PVT_other"
   end
 
-  test "revision accepts normalized resources and legacy request records replay only for legacy" do
+  test "revision accepts normalized resources and rejected enrollment ignores obsolete owner inputs" do
     state = enrolled_state("resource-revision")
 
     resource = %{kind: :database, authority: "Acme.DB", identity: "Primary", access: :write}
@@ -523,25 +523,24 @@ defmodule SymphonyElixir.ManagedV2RulesGateTest do
              %{kind: :database, authority: "acme.db", identity: "primary", access: :write}
            ]
 
-    legacy_request = envelope("legacy-replay", :pause, %{expected_revision: 0})
-    canonical = Rules.canonical_input(legacy_request)
-    legacy_record = %{canonical: canonical, response: %{operation: :pause, replayed: true}}
-    legacy_state = Rules.new(requests: %{"legacy-replay" => legacy_record})
+    owner_enrollment = enrollment_args("obsolete-owner", 1) |> Map.put(:owner, "display-only")
 
-    assert {:duplicate, %{replayed: true}} =
-             Rules.apply(
-               legacy_state,
-               legacy_request,
-               %{principal: Ownership.legacy_principal()}
-             )
+    assert {:error, :invalid_argument, %{argument: :owner}} =
+             Rules.apply(bind_state(), envelope("obsolete-owner", :enroll, owner_enrollment), %{principal: @pm})
+  end
 
-    assert {:error, :request_principal_conflict, %{request_id: "legacy-replay"}} =
-             Rules.apply(legacy_state, legacy_request, %{principal: @operator})
+  test "request replay requires a recorded trusted principal" do
+    request = envelope("missing-principal", :pause, %{expected_revision: 0})
+    state = Rules.new(requests: %{"missing-principal" => %{canonical: Rules.canonical_input(request), response: %{operation: :pause}}})
+
+    assert {:error, :request_principal_conflict, %{request_id: "missing-principal"}} =
+             Rules.apply(state, request, %{principal: @operator})
   end
 
   test "binding replacement handles malformed assignments in an existing project slot" do
     binding = binding_args() |> Map.fetch!(:project)
-    state = Rules.new(binding: binding, assignments: %{"malformed" => :malformed})
+    project = Map.merge(binding, %{revision: 0, dispatch_paused: false})
+    state = Rules.new(projects: %{@project_id => project}, assignments: %{"malformed" => :malformed})
 
     replacement =
       binding_args()

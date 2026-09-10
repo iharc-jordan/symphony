@@ -37,8 +37,7 @@ defmodule SymphonyElixir.Managed.Rules do
       event_cursor: Keyword.get(opts, :event_cursor, 0),
       paused: Keyword.get(opts, :paused, false),
       disabled: Keyword.get(opts, :disabled, false),
-      binding: Keyword.get(opts, :binding),
-      projects: Keyword.get(opts, :projects, projects_from_binding(Keyword.get(opts, :binding))),
+      projects: Keyword.get(opts, :projects, %{}),
       principals: Keyword.get(opts, :principals, %{}),
       assignments: Keyword.get(opts, :assignments, %{}),
       requests: Keyword.get(opts, :requests, %{}),
@@ -810,45 +809,21 @@ defmodule SymphonyElixir.Managed.Rules do
          {:ok, binding} <- binding_from_args(args),
          :ok <- binding_rebind_allowed?(state, binding) do
       project = Map.merge(binding, %{revision: project_revision(state, binding.project_id) + 1, dispatch_paused: false})
-      response = %{operation: :bind_project, project: project, binding: binding, revision: state.control_revision + 1}
-      commit(state, request, canonical, response, %{binding: binding, projects: Map.put(Map.get(state, :projects, %{}), binding.project_id, project)})
+      response = %{operation: :bind_project, project: project, revision: state.control_revision + 1}
+      commit(state, request, canonical, response, %{projects: Map.put(Map.get(state, :projects, %{}), binding.project_id, project)})
     end
   end
 
   # A project binding is an authority boundary. Replacing it while any
   # assignment is still owned by the service could make the old worker mutate
   # a different project after restart.
-  defp binding_rebind_allowed?(%{binding: nil} = state, binding) do
-    current = Map.get(Map.get(state, :projects, %{}), binding.project_id)
-
-    if is_nil(current) or current == binding do
-      :ok
-    else
-      binding_rebind_conflict_for_project(state, binding.project_id)
-    end
-  end
-
   defp binding_rebind_allowed?(state, binding) do
     current = Map.get(state, :projects, %{}) |> Map.get(binding.project_id)
 
     cond do
-      Map.get(state, :binding) == binding -> :ok
-      current == binding -> :ok
-      is_nil(current) and is_map(Map.get(state, :binding)) -> binding_rebind_conflict(state)
+      is_map(current) and Map.take(current, Map.keys(binding)) == binding -> :ok
       is_nil(current) -> :ok
       true -> binding_rebind_conflict_for_project(state, binding.project_id)
-    end
-  end
-
-  defp binding_rebind_conflict(state) do
-    case Enum.find(state.assignments, fn {_id, assignment} ->
-           is_map(assignment) and phase(assignment[:phase]) not in @terminal_phases
-         end) do
-      nil ->
-        :ok
-
-      {assignment_id, assignment} ->
-        {:error, :binding_in_use, %{assignment_id: assignment_id, phase: phase(assignment[:phase])}}
     end
   end
 
@@ -973,11 +948,17 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp review_deferred(disposition, args) do
     reason = text_value(args, :reason)
+    evidence = Map.get(args, :evidence, [])
 
-    with :ok <- present(reason, :reason) do
+    with :ok <- present(reason, :reason),
+         :ok <- review_feedback_evidence(evidence) do
       next_phase = if disposition == :waiting, do: :waiting, else: :ready
 
-      updates = %{board_state: next_phase, disposition_reason: reason}
+      updates = %{
+        board_state: next_phase,
+        review_feedback: %{reason: reason, evidence: evidence}
+      }
+
       response = %{operation: :review, disposition: disposition, reason: reason}
       {:ok, next_phase, updates, response}
     end
@@ -1048,7 +1029,8 @@ defmodule SymphonyElixir.Managed.Rules do
   defp assignment_from_args(args, opts) do
     input = assignment_input(args)
 
-    with :ok <- present(input.assignment_id, :assignment_id),
+    with :ok <- reject_obsolete_enrollment_inputs(args),
+         :ok <- present(input.assignment_id, :assignment_id),
          :ok <- present(input.repository, :repository),
          :ok <- positive(input.issue_number, :issue_number),
          :ok <- present(input.base_commit, :base_commit),
@@ -1061,9 +1043,18 @@ defmodule SymphonyElixir.Managed.Rules do
     end
   end
 
+  defp reject_obsolete_enrollment_inputs(args) do
+    case Enum.find([:owner, :native_project_item_id, :issue_id, :issue_node_id, :repository_id, :repository_node_id], fn key ->
+           Map.has_key?(args, key) or Map.has_key?(args, Atom.to_string(key))
+         end) do
+      nil -> :ok
+      key -> {:error, :invalid_argument, %{argument: key}}
+    end
+  end
+
   defp assignment_input(args) do
     assignment_id = text_value(args, :assignment_id)
-    project_item_id = first_text_value(args, [:project_item_id, :native_project_item_id])
+    project_item_id = text_value(args, :project_item_id)
 
     %{
       assignment_id: assignment_id,
@@ -1076,20 +1067,15 @@ defmodule SymphonyElixir.Managed.Rules do
       resources: Map.get(args, :resources, Map.get(args, "resources", [])),
       dependencies: Map.get(args, :dependencies, Map.get(args, "dependencies", [])),
       project_item_id: value_or_default(project_item_id, assignment_id),
-      native_issue_id: first_text_value(args, [:native_issue_id, :issue_id, :issue_node_id]),
-      native_repository_id: first_text_value(args, [:native_repository_id, :repository_id, :repository_node_id]),
+      native_issue_id: text_value(args, :native_issue_id),
+      native_repository_id: text_value(args, :native_repository_id),
       escalation_reason: text_value(args, :escalation_reason),
-      owner: Map.get(args, :owner, Map.get(args, "owner")),
       turn_limit: min(value_or_default(number_value(args, :turn_limit), 20), 20)
     }
   end
 
   defp assignment_board_state(args) do
-    Map.get(
-      args,
-      :board_state,
-      Map.get(args, "board_state", Map.get(args, :phase, Map.get(args, "phase", "READY")))
-    )
+    Map.get(args, :board_state, "READY")
   end
 
   defp assignment_payload(input, resources, requirements) do
@@ -1101,7 +1087,6 @@ defmodule SymphonyElixir.Managed.Rules do
       base_commit: input.base_commit,
       phase: :ready,
       board_state: :ready,
-      owner: input.owner,
       resources: Enum.uniq(resources),
       dependencies: Enum.uniq(input.dependencies),
       route: input.route,
@@ -1122,10 +1107,6 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp underlying_issue_id(%{repository: repository, issue_number: issue_number}) do
     repository <> "#" <> Integer.to_string(issue_number)
-  end
-
-  defp first_text_value(map, keys) do
-    Enum.find_value(keys, &text_value(map, &1))
   end
 
   defp value_or_default(nil, default), do: default
@@ -1162,15 +1143,6 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp repository_in_binding(_binding, _repository), do: {:error, :project_not_bound, %{}}
 
-  defp projects_from_binding(binding) when is_map(binding) do
-    case text_value(binding, :project_id) do
-      nil -> %{}
-      project_id -> %{project_id => Map.merge(binding, %{project_id: project_id, revision: 0, dispatch_paused: false})}
-    end
-  end
-
-  defp projects_from_binding(_binding), do: %{}
-
   defp project_revision(state, project_id) do
     get_in(state, [:projects, project_id, :revision]) || 0
   end
@@ -1182,33 +1154,15 @@ defmodule SymphonyElixir.Managed.Rules do
       binding when is_map(binding) ->
         {:ok, binding}
 
-      nil ->
-        fetch_legacy_project_binding(state, project_id)
-
       _ ->
         {:error, :project_not_bound, %{}}
-    end
-  end
-
-  defp fetch_legacy_project_binding(state, project_id) do
-    case Map.get(state, :binding) do
-      binding when is_map(binding) -> project_binding_match(binding, project_id)
-      _ -> {:error, :project_not_bound, %{}}
-    end
-  end
-
-  defp project_binding_match(binding, project_id) do
-    if text_value(binding, :project_id) == project_id do
-      {:ok, binding}
-    else
-      {:error, :project_not_bound, %{}}
     end
   end
 
   defp assignment_project_matches(assignment, project_id) do
     actual = text_value(assignment, :project_id)
 
-    if actual == project_id or (is_nil(actual) and project_id == text_value(Map.get(assignment, :binding, %{}), :project_id)) do
+    if actual == project_id do
       :ok
     else
       {:error, :assignment_project_mismatch, %{project_id: project_id, assignment_project_id: actual}}
@@ -1222,8 +1176,8 @@ defmodule SymphonyElixir.Managed.Rules do
     Map.put_new(Map.get(state, :principals, %{}), principal.principal_id, metadata)
   end
 
-  defp assignment_resources(resources, opts) do
-    case Resources.normalize_all(resources, allow_legacy: Keyword.get(opts, :allow_legacy_resources, false)) do
+  defp assignment_resources(resources, _opts) do
+    case Resources.normalize_all(resources) do
       {:ok, normalized} -> {:ok, normalized}
       {:error, _code, _details} -> {:error, :invalid_argument, %{argument: :resources}}
     end
@@ -1282,7 +1236,7 @@ defmodule SymphonyElixir.Managed.Rules do
       # A successful operator revision starts a fresh automatic retry window.
       # Lifetime turn accounting and the existing workspace/session are retained.
       |> Map.put(:retry_count, 0)
-      |> Map.delete(:blocked_reason)
+      |> Map.drop([:blocked_reason, :review_feedback])
       |> Map.put(:route, route || assignment.route)
       |> reset_changed_route_session(assignment.route)
 
@@ -1454,7 +1408,7 @@ defmodule SymphonyElixir.Managed.Rules do
   defp assignment_identity(assignment) when is_map(assignment) do
     provider = value_or_default(text_value(assignment, :provider), "github")
 
-    case first_text_value(assignment, [:native_issue_id, :issue_id]) do
+    case text_value(assignment, :native_issue_id) do
       nil ->
         repository = value_or_default(text_value(assignment, :repository), "")
         issue_number = value_or_default(number_value(assignment, :issue_number), 0)
@@ -1462,10 +1416,7 @@ defmodule SymphonyElixir.Managed.Rules do
 
       issue_id ->
         repository =
-          value_or_default(
-            first_text_value(assignment, [:native_repository_id, :repository_id, :repository_node_id]),
-            text_value(assignment, :repository) || ""
-          )
+          value_or_default(text_value(assignment, :native_repository_id), text_value(assignment, :repository) || "")
 
         provider <> ":issue:" <> repository <> ":" <> issue_id
     end
@@ -1488,8 +1439,8 @@ defmodule SymphonyElixir.Managed.Rules do
   def resources_available?(_state, _assignment), do: false
 
   defp resources_conflict?(resources, existing) do
-    with {:ok, left} <- Resources.normalize_all(resources, allow_legacy: true),
-         {:ok, right} <- Resources.normalize_all(existing, allow_legacy: true) do
+    with {:ok, left} <- Resources.normalize_all(resources),
+         {:ok, right} <- Resources.normalize_all(existing) do
       Enum.any?(left, fn candidate -> Enum.any?(right, &Resources.conflicts?(candidate, &1)) end)
     else
       _ -> true
@@ -1563,7 +1514,7 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp request_principal_allowed?(record, principal) do
     case Map.get(record, :principal_id) do
-      nil -> principal.principal_id == "legacy"
+      nil -> false
       value -> value == principal.principal_id
     end
   end
@@ -1605,13 +1556,8 @@ defmodule SymphonyElixir.Managed.Rules do
   defp normalize_key("project_id"), do: :project_id
   defp normalize_key("destination_pm_id"), do: :destination_pm_id
   defp normalize_key("project_item_id"), do: :project_item_id
-  defp normalize_key("native_project_item_id"), do: :native_project_item_id
   defp normalize_key("native_issue_id"), do: :native_issue_id
-  defp normalize_key("issue_id"), do: :issue_id
-  defp normalize_key("issue_node_id"), do: :issue_node_id
   defp normalize_key("native_repository_id"), do: :native_repository_id
-  defp normalize_key("repository_id"), do: :repository_id
-  defp normalize_key("repository_node_id"), do: :repository_node_id
   defp normalize_key("status_field_id"), do: :status_field_id
   defp normalize_key("projection_field_id"), do: :projection_field_id
   defp normalize_key("project_number"), do: :project_number
@@ -1632,7 +1578,6 @@ defmodule SymphonyElixir.Managed.Rules do
   defp normalize_key("evidence"), do: :evidence
   defp normalize_key("reason"), do: :reason
   defp normalize_key("disable"), do: :disable
-  defp normalize_key("owner"), do: :owner
   defp normalize_key("principal"), do: :principal
   defp normalize_key("target_principal_id"), do: :target_principal_id
   defp normalize_key("handoff_id"), do: :handoff_id
@@ -1693,6 +1638,9 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp evidence_present(value) when is_list(value) and value != [], do: :ok
   defp evidence_present(_value), do: {:error, :evidence_required, %{}}
+
+  defp review_feedback_evidence(value) when is_list(value), do: :ok
+  defp review_feedback_evidence(_value), do: {:error, :invalid_argument, %{argument: :evidence}}
 
   defp normalize_evidence(evidence), do: Enum.take(evidence, 20)
 

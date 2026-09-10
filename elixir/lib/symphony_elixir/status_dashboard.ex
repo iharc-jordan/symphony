@@ -1107,24 +1107,6 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp humanize_codex_event(:turn_input_required, _message, _payload), do: "turn blocked: waiting for user input"
 
-  defp humanize_codex_event(:approval_auto_approved, message, payload) do
-    method =
-      map_value(payload, ["method", :method]) ||
-        map_path(message, ["payload", "method"]) ||
-        map_path(message, [:payload, :method])
-
-    decision = map_value(message, ["decision", :decision])
-
-    base =
-      if is_binary(method) do
-        "#{humanize_codex_method(method, payload)} (auto-approved)"
-      else
-        "approval request auto-approved"
-      end
-
-    if is_binary(decision), do: "#{base}: #{decision}", else: base
-  end
-
   defp humanize_codex_event(:tool_call_completed, _message, payload),
     do: humanize_dynamic_tool_event("dynamic tool call completed", payload)
 

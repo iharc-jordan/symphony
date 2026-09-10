@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
-  test "managed app server sends the approved route and accepts orchestration reports" do
+  test "managed app server uses configured tools and repairs invalid report input in the same turn" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -29,10 +29,12 @@ defmodule SymphonyElixir.AppServerTest do
         case "$count" in
           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
           2) ;;
-          3) printf '%s\\n' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
-          4) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-managed"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
-          5)
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-managed"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
+          4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-managed"}}}'
+            printf '%s\\n' '{"id":98,"method":"item/tool/call","params":{"tool":"orchestration_report","arguments":{"kind":"checkpoint","report_id":"report-invalid","summary":"missing evidence"}}}'
+            ;;
+          5)
             printf '%s\\n' '{"id":99,"method":"item/tool/call","params":{"tool":"orchestration_report","arguments":{"kind":"checkpoint","report_id":"report-1","summary":"validated","evidence":[{"test":"green"}]}}}'
             ;;
           6)
@@ -47,7 +49,9 @@ defmodule SymphonyElixir.AppServerTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        codex_command: "#{codex_binary} app-server"
+        codex_command: "#{codex_binary} app-server",
+        codex_thread_sandbox: "danger-full-access",
+        codex_turn_sandbox_policy: %{"type" => "dangerFullAccess"}
       )
 
       previous_codex_home = System.get_env("CODEX_HOME")
@@ -98,6 +102,7 @@ defmodule SymphonyElixir.AppServerTest do
                  managed_attempt: attempt,
                  model: "gpt-5.6-luna",
                  effort: "xhigh",
+                 on_message: fn event -> send(parent, {:managed_event, event}) end,
                  report_callback: fn report ->
                    send(parent, {:managed_report, report})
                    :ok
@@ -115,21 +120,14 @@ defmodule SymphonyElixir.AppServerTest do
                         turn_id: "turn-managed"
                       }}
 
-      permission_config =
-        (trace_file <> ".args")
-        |> File.read!()
-        |> String.split("\n", trim: true)
-        |> Enum.find(&String.starts_with?(&1, "permissions.symphony_worker.filesystem="))
+      refute_received {:managed_report, _}
+      assert_received {:managed_event, %{event: :session_started, model: "gpt-5.6-luna", effort: "xhigh"}}
 
-      assert {:ok, parsed_permissions} = TomlElixir.decode(permission_config)
-      filesystem = get_in(parsed_permissions, ["permissions", "symphony_worker", "filesystem"])
-      assert filesystem[workspace] == "write"
-      assert filesystem[Path.join(workspace, ".git")] == "write"
-      assert filesystem[workspace_root] == "deny"
-      assert filesystem[Path.expand("~/.codex")] == "deny"
-      assert filesystem[Path.expand("~/.config/codex-orchestration")] == "deny"
-      assert filesystem[codex_home] == "deny"
-      refute Map.has_key?(filesystem, gh_config_dir)
+      launch_args = File.read!(trace_file <> ".args")
+      assert launch_args =~ "agents.enabled=false"
+      refute launch_args =~ "--disable"
+      refute launch_args =~ "permissions."
+      refute launch_args =~ "mcp_servers."
 
       payloads =
         trace_file
@@ -141,6 +139,8 @@ defmodule SymphonyElixir.AppServerTest do
 
       thread_start = Enum.find(payloads, &(&1["method"] == "thread/start"))
       assert get_in(thread_start, ["params", "model"]) == "gpt-5.6-luna"
+      assert get_in(thread_start, ["params", "sandbox"]) == "danger-full-access"
+      refute Map.has_key?(thread_start["params"], "permissions")
 
       assert Enum.any?(get_in(thread_start, ["params", "dynamicTools"]), fn tool ->
                tool["name"] == "orchestration_report" and
@@ -151,6 +151,14 @@ defmodule SymphonyElixir.AppServerTest do
       turn_start = Enum.find(payloads, &(&1["method"] == "turn/start"))
       assert get_in(turn_start, ["params", "model"]) == "gpt-5.6-luna"
       assert get_in(turn_start, ["params", "effort"]) == "xhigh"
+      assert get_in(turn_start, ["params", "sandboxPolicy"]) == %{"type" => "dangerFullAccess"}
+      refute Map.has_key?(turn_start["params"], "permissions")
+      assert Enum.count(payloads, &(&1["method"] == "turn/start")) == 1
+      refute Enum.any?(payloads, &(&1["method"] == "turn/interrupt"))
+      invalid_response = Enum.find(payloads, &(&1["id"] == 98))
+      assert get_in(invalid_response, ["result", "success"]) == false
+      assert Jason.encode!(invalid_response) =~ "execution identity is attached by the runtime"
+      assert Enum.any?(payloads, &(&1["id"] == 99 and get_in(&1, ["result", "success"]) == true))
     after
       File.rm_rf(test_root)
     end
@@ -182,18 +190,17 @@ defmodule SymphonyElixir.AppServerTest do
         case "$count" in
           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
           2) ;;
-          3) printf '%s\\n' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
-          4) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-terminal"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
-          5)
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-terminal"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
+          4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-terminal"}}}'
             printf '%s\\n' '{"id":99,"method":"item/tool/call","params":{"tool":"orchestration_report","arguments":{"kind":"result","report_id":"report-terminal","summary":"done","evidence":[]}}}'
             ;;
-          6) ;;
-          7)
+          5) ;;
+          6)
             printf '%s\\n' '{"id":5,"result":{}}'
             printf '%s\\n' '{"id":100,"method":"item/tool/call","params":{"tool":"forbidden_after_report","arguments":{}}}'
             ;;
-          8)
+          7)
             printf '%s\\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-terminal","tokenUsage":{"total":{"inputTokens":714937,"outputTokens":18786,"totalTokens":733723}}}}'
             printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-terminal","turn":{"id":"turn-terminal","status":"interrupted"}}}'
             ;;
@@ -340,12 +347,11 @@ defmodule SymphonyElixir.AppServerTest do
         case "$count" in
           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
           2) ;;
-          3) printf '%s\\n' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
-          4)
+          3)
             printf '%s\\n' '{"id":4,"result":{"thread":{"id":"thread-resume"},"model":"gpt-5.6-luna","reasoningEffort":null}}'
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-resume"}}}'
             ;;
-          5)
+          4)
             printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-resume","turn":{"id":"turn-resume","status":"completed","items":[]}}}'
             exit 0
             ;;
@@ -422,7 +428,6 @@ defmodule SymphonyElixir.AppServerTest do
     while IFS= read -r line; do
       case "$line" in
         *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
-        *'"method":"config/read"'*) printf '%s\\n' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
         *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-stale"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
       esac
     done
@@ -510,7 +515,6 @@ defmodule SymphonyElixir.AppServerTest do
     while IFS= read -r line; do
       case "$line" in
         *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
-        *'"method":"config/read"'*) printf '%s\\n' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
         *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-recorded"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
       esac
     done
@@ -614,8 +618,6 @@ defmodule SymphonyElixir.AppServerTest do
         ' '{"id":1,"result":{}}' ;;
             2) ;;
             3) printf '%s
-        ' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
-            4) printf '%s
         ' '{"id":#{response_id},"result":{"thread":{"id":"thread-model"}#{extra_response}}}' ;;
             *) exit 0 ;;
           esac
@@ -901,12 +903,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1001"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1001"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1001"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1001"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -1007,12 +1009,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{\"id\":1,\"result\":{}}'
             ;;
           2)
-            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-88\"}}}'
             ;;
           3)
-            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
+            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-88\"}}}'
             ;;
           4)
+            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
             printf '%s\\n' '{\"method\":\"turn/input_required\",\"id\":\"resp-1\",\"params\":{\"requiresInput\":true,\"reason\":\"blocked\"}}'
             ;;
           *)
@@ -1072,12 +1074,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-188"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-188"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-188"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-188"}}}'
             printf '%s\\n' '{"method":"mcpServer/elicitation/request","params":{"message":"Need operator input"}}'
             ;;
           *)
@@ -1137,9 +1139,11 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-89"}}}'
             ;;
           3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-89"}}}'
+            ;;
+          4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-89"}}}'
             printf '%s\\n' '{"id":99,"method":"item/commandExecution/requestApproval","params":{"command":"gh pr view","cwd":"/tmp","reason":"need approval"}}'
             ;;
@@ -1176,7 +1180,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server auto-approves command execution approval requests when approval policy is never" do
+  test "app server surfaces unexpected command approval without manufacturing authorization" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1251,7 +1255,7 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Handle approval request", issue)
+      assert {:error, {:approval_required, _payload}} = AppServer.run(workspace, "Handle approval request", issue)
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
@@ -1296,14 +1300,14 @@ defmodule SymphonyElixir.AppServerTest do
                end
              end)
 
-      assert Enum.any?(lines, fn line ->
+      refute Enum.any?(lines, fn line ->
                if String.starts_with?(line, "JSON:") do
                  payload =
                    line
                    |> String.trim_leading("JSON:")
                    |> Jason.decode!()
 
-                 payload["id"] == 99 and get_in(payload, ["result", "decision"]) == "acceptForSession"
+                 payload["id"] == 99 and Map.has_key?(payload, "result")
                else
                  false
                end
@@ -1313,7 +1317,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server auto-approves MCP tool approval prompts when approval policy is never" do
+  test "app server never answers MCP approval questions on the user behalf" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1388,21 +1392,19 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Handle tool approval prompt", issue)
+      assert {:error, {:turn_input_required, _payload}} = AppServer.run(workspace, "Handle tool approval prompt", issue)
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
 
-      assert Enum.any?(lines, fn line ->
+      refute Enum.any?(lines, fn line ->
                if String.starts_with?(line, "JSON:") do
                  payload =
                    line
                    |> String.trim_leading("JSON:")
                    |> Jason.decode!()
 
-                 payload["id"] == 110 and
-                   get_in(payload, ["result", "answers", "mcp_tool_call_approval_call-717", "answers"]) ==
-                     ["Approve this Session"]
+                 payload["id"] == 110 and Map.has_key?(payload, "result")
                else
                  false
                end
@@ -1906,12 +1908,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '{"id":1,"result":{},"padding":"%s"}\\n' "$padding"
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-91"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-91"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-91"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-91"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -1969,12 +1971,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-92"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-92"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-92"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-92"}}}'
             printf '%s\\n' 'warning: this is stderr noise' >&2
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
@@ -2044,12 +2046,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-93"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-93"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-93"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-93"}}}'
             printf '%s\\n' '{"method":"turn/completed"'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
@@ -2149,12 +2151,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-secret"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-secret"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-secret"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-secret"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -2232,12 +2234,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-remote"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-remote"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-remote"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-remote"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;

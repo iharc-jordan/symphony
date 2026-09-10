@@ -3,10 +3,9 @@ defmodule SymphonyElixir.Managed.Resources do
   Canonical resource references and collision rules for managed assignments.
 
   Provider adapters may normalize richer provider objects before calling these
-  pure helpers. Legacy string resources are accepted only when explicitly
-  requested by migration. Repository and path references share an overlap
-  boundary when their canonical identities name the same tree, so a path
-  spelling cannot bypass a repository-wide write claim.
+  pure helpers. Repository and path references share an overlap boundary when
+  their canonical identities name the same tree, so a path spelling cannot
+  bypass a repository-wide write claim.
   """
 
   @kinds [:repository, :path, :database, :deployment, :other]
@@ -35,19 +34,9 @@ defmodule SymphonyElixir.Managed.Resources do
   def kinds, do: @kinds
 
   @spec normalize(term()) :: {:ok, resource_ref()} | {:error, atom(), map()}
-  def normalize(resource), do: normalize(resource, [])
+  def normalize(resource) when is_binary(resource), do: {:error, :resource_reference_required, %{resource: resource}}
 
-  @spec normalize(term(), keyword()) :: {:ok, resource_ref()} | {:error, atom(), map()}
-
-  def normalize(resource, opts) when is_binary(resource) do
-    if Keyword.get(opts, :allow_legacy, false) do
-      legacy(resource)
-    else
-      {:error, :resource_reference_required, %{resource: resource}}
-    end
-  end
-
-  def normalize(resource, _opts) when is_map(resource) do
+  def normalize(resource) when is_map(resource) do
     kind = resource |> value(:kind) |> normalize_kind()
     authority = resource |> value(:authority) |> text()
     identity = resource |> value(:identity) |> text()
@@ -62,17 +51,13 @@ defmodule SymphonyElixir.Managed.Resources do
     end
   end
 
-  def normalize(resource, _opts), do: {:error, :resource_reference_required, %{resource: resource}}
+  def normalize(resource), do: {:error, :resource_reference_required, %{resource: resource}}
 
   @spec normalize_all(term()) :: {:ok, [resource_ref()]} | {:error, atom(), map()}
-  def normalize_all(resources), do: normalize_all(resources, [])
-
-  @spec normalize_all(term(), keyword()) :: {:ok, [resource_ref()]} | {:error, atom(), map()}
-
-  def normalize_all(resources, opts) when is_list(resources) do
+  def normalize_all(resources) when is_list(resources) do
     resources
     |> Enum.reduce_while({:ok, []}, fn resource, {:ok, acc} ->
-      case normalize(resource, opts) do
+      case normalize(resource) do
         {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
         error -> {:halt, error}
       end
@@ -83,7 +68,7 @@ defmodule SymphonyElixir.Managed.Resources do
     end
   end
 
-  def normalize_all(resources, _opts), do: {:error, :resources_must_be_list, %{resources: resources}}
+  def normalize_all(resources), do: {:error, :resources_must_be_list, %{resources: resources}}
 
   @spec identity(resource_ref()) :: {kind(), String.t(), String.t()}
   def identity(%{kind: kind, authority: authority, identity: identity}), do: {kind, authority, identity}
@@ -115,21 +100,6 @@ defmodule SymphonyElixir.Managed.Resources do
   end
 
   def conflict(_candidate, _existing), do: {:error, :resources_invalid, %{}}
-
-  @spec legacy_identity(String.t()) :: String.t()
-  def legacy_identity(resource) when is_binary(resource) do
-    resource |> String.trim() |> String.downcase()
-  end
-
-  defp legacy(resource) do
-    identity = legacy_identity(resource)
-
-    if identity == "" do
-      {:error, :resource_identity_required, %{}}
-    else
-      {:ok, %{kind: :other, authority: "legacy", identity: identity, access: :write}}
-    end
-  end
 
   defp canonical(:repository, authority, identity, access) do
     authority = normalize_authority(authority)

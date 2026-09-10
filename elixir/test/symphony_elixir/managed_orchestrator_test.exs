@@ -161,8 +161,6 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
           method = message.get('method')
           if method == 'initialize':
               print(json.dumps({'id': message['id'], 'result': {}}), flush=True)
-          elif method == 'config/read':
-              print(json.dumps({'id': message['id'], 'result': {'config': {'mcp_servers': {}}}}), flush=True)
           elif method in ['thread/start', 'thread/resume']:
               pathlib.Path('thread-request-proof.json').write_text(json.dumps(message))
               print(json.dumps({'id': message['id'], 'error': {'code': -32000, 'message': 'Fixture captured request'}}), flush=True)
@@ -284,7 +282,9 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
           assert request["params"]["model"] == "gpt-5.6-terra"
         end
 
-        assert request["params"]["permissions"] == "symphony_worker"
+        assert request["id"] == if(@dispatch_scenario == :resume, do: 4, else: 2)
+        assert request["params"]["sandbox"] == "workspace-write"
+        refute Map.has_key?(request["params"], "permissions")
       end
 
       GenServer.stop(pid)

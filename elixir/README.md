@@ -172,9 +172,22 @@ Notes:
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
   unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
   Symphony validation.
-- Workflows that run package managers or other commands that resolve external hosts should set
-  `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
-  by the Codex turn sandbox.
+- Managed workers use the host's configured permissions, MCP servers, apps, and plugins. Symphony
+  does not build a custom permission profile or scan/disable configured MCP servers; it only
+  sets `agents.enabled=false` so delegation remains owned by Symphony. Protocol approval and
+  user-input requests fail the run without a synthetic response.
+- A private trusted-host workflow may explicitly use full access:
+
+  ```md
+  codex:
+    thread_sandbox: danger-full-access
+    turn_sandbox_policy: {type: dangerFullAccess}
+  ```
+
+  Choose that policy in the host configuration; `approval_policy: never` does not make Symphony
+  answer a protocol approval request.
+- With a `workspaceWrite` turn policy, workflows that resolve external hosts should set
+  `networkAccess: true` in that policy. A `dangerFullAccess` policy needs no additional network field.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
@@ -243,9 +256,9 @@ The version two control contract has these boundaries:
   Resources are typed `{kind, authority, identity, access}` references. GitHub's native issue
   and repository IDs prevent enrollment of a second card for the same underlying issue.
 - Pending provider effects retain their originating principal and Project binding. Recovery
-  revalidates those fences before a write. A version one journal upgrades in place while
-  retaining history; assignments require an explicit operator takeover. Legacy pending
-  effects require operator reconciliation rather than automatic replay under a new owner.
+  revalidates those fences before a write. Managed state must use control-contract version two;
+  the runtime rejects older state rather than converting or replaying it. The journal record
+  envelope remains version one.
 - A binding may specify `projection_field_id`, an existing text field belonging to that
   Project. Summary updates run outside the control request, expose pending/failed/synced
   status, and never replace issue requirements or the workflow Status field.

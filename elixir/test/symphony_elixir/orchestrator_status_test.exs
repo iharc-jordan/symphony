@@ -1682,23 +1682,6 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert StatusDashboard.humanize_codex_message(message) == "git status --short"
   end
 
-  test "status dashboard formats auto-approval updates from codex" do
-    message = %{
-      event: :approval_auto_approved,
-      message: %{
-        payload: %{
-          "method" => "item/commandExecution/requestApproval",
-          "params" => %{"parsedCmd" => "mix test"}
-        },
-        decision: "acceptForSession"
-      }
-    }
-
-    humanized = StatusDashboard.humanize_codex_message(message)
-    assert humanized =~ "command approval requested"
-    assert humanized =~ "auto-approved"
-  end
-
   test "status dashboard enriches wrapper reasoning and message streaming events with payload context" do
     reasoning_message = %{
       event: :notification,

@@ -550,7 +550,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp owner_label(assignment) do
     cond do
       assignment.ownership.status == "needs_claim" -> "Operator claim required"
-      assignment.ownership.status == "needs_operator_reconciliation" -> "Operator reconciliation required"
       assignment.ownership.display_name -> assignment.ownership.display_name
       assignment.ownership.pm_id -> assignment.ownership.pm_id
       assignment.phase == "review" -> "Review owner unavailable"
@@ -559,7 +558,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp ownership_status_visible?(assignment) do
-    assignment.ownership.status not in ["needs_claim", "needs_operator_reconciliation"]
+    assignment.ownership.status != "needs_claim"
   end
 
   defp task_label(assignment) do

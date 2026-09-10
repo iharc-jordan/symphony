@@ -1071,7 +1071,6 @@ Important emitted events include, for example:
 - `turn_cancelled`
 - `turn_ended_with_error`
 - `turn_input_required`
-- `approval_auto_approved`
 - `unsupported_tool_call`
 - `notification`
 - `other_message`
@@ -1089,11 +1088,9 @@ Policy requirements:
   implementation MAY either satisfy them, surface them to an operator, auto-resolve them, or
   fail the run according to its documented policy.
 
-Example high-trust behavior:
-
-- Auto-approve command execution approvals for the session.
-- Auto-approve file-change approvals for the session.
-- Treat user-input-required turns as hard failure.
+The managed implementation passes configured approval and sandbox policies to Codex. It does not
+answer command, file-change, or user-input protocol requests; each ends the run and returns the
+request to the orchestrator as a blocker.
 
 Unsupported dynamic tool calls:
 
@@ -2356,8 +2353,8 @@ Operator-level service controls are distinct from PM controls.
 Enrollment MUST verify the provider item and its ready state and prevent duplicate underlying
 issue enrollment across Project cards. Resource claims MUST use canonical references and
 preserve write conflicts. Pending external effects MUST retain their originating identity,
-binding, and revision fences across restart. Migrated legacy state MUST be visibly unclaimed;
-legacy pending effects MUST require explicit reconciliation before they can permit dispatch.
+binding, and revision fences across restart. The managed state schema is version two; an
+implementation MUST reject older state rather than migrate, replay, or reconcile it.
 
 Optional Project card summaries are derived projections of journal state. Projection failures
 MUST be visible and MUST NOT be reported as synchronized. Summary writes MUST NOT replace issue

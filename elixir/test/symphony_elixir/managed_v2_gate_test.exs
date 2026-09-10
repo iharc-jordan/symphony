@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.ManagedV2GateTest do
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.Managed.{Migration, Ownership, Projection, Resources}
+  alias SymphonyElixir.Managed.{Ownership, Projection, Resources}
 
   @pm_a %{principal_id: "pm-a", role: :pm, project_scope: :all, capability_id: "cap-a"}
   @pm_b %{principal_id: "pm-b", role: :pm, project_scope: ["project-1"], capability_id: "cap-b"}
@@ -67,136 +67,6 @@ defmodule SymphonyElixir.ManagedV2GateTest do
              Resources.normalize(%{kind: :path, authority: "gitlab.example", identity: "..\\outside", access: :read})
   end
 
-  test "migration exposes version identity and malformed state errors" do
-    assert Migration.current_version() == 2
-    assert Migration.migrated?(%{version: 2})
-    refute Migration.migrated?(%{version: 1})
-    refute Migration.migrated?(:invalid)
-
-    state = %{version: 2, marker: :preserved}
-    assert {:ok, ^state} = Migration.migrate(state)
-    assert {:error, :managed_state_invalid, %{}} = Migration.migrate(:invalid)
-  end
-
-  test "migration accepts an unbound journal and rejects invalid bindings or assignments" do
-    assert {:ok, migrated} = Migration.migrate(v1_state(binding: nil))
-    assert migrated.projects == %{}
-    assert migrated.migration.status == :complete
-    refute Map.has_key?(migrated, :binding)
-
-    assert {:error, :project_binding_invalid, %{}} =
-             Migration.migrate(v1_state(binding: %{project_id: "   "}))
-
-    assert {:error, :project_binding_invalid, %{}} = Migration.migrate(v1_state(binding: :invalid))
-
-    assert {:error, :assignments_invalid, %{}} = Migration.migrate(v1_state(assignments: :invalid))
-
-    assert {:error, :assignment_invalid, %{assignment_id: "bad"}} =
-             Migration.migrate(v1_state(assignments: %{"bad" => :invalid}))
-  end
-
-  test "migration records native and canonical issue identities without inventing incomplete ones" do
-    native =
-      assignment("native",
-        provider: "linear",
-        repository: "Acme/Repo",
-        native_repository_id: " R-1 ",
-        native_issue_id: " I-1 "
-      )
-
-    canonical = assignment("canonical", repository: "Acme/Repo", issue_number: 7)
-    incomplete = assignment("incomplete", repository: "Acme/Repo", issue_number: "7")
-
-    assert {:ok, migrated} =
-             Migration.migrate(v1_state(assignments: %{"native" => native, "canonical" => canonical, "incomplete" => incomplete}))
-
-    assert migrated.assignments["native"].underlying_identity == %{
-             provider: "linear",
-             repository: "Acme/Repo",
-             native_repository_id: "R-1",
-             native_issue_id: "I-1"
-           }
-
-    assert migrated.assignments["canonical"].underlying_identity == %{
-             provider: "github",
-             repository: "acme/repo",
-             issue_number: 7
-           }
-
-    refute Map.has_key?(migrated.assignments["incomplete"], :underlying_identity)
-    assert migrated.migration.conflicts == []
-  end
-
-  test "migration holds pending legacy intents and preserves completed history" do
-    assignment = assignment("item")
-
-    state =
-      v1_state(
-        assignments: %{"item" => assignment},
-        review_intents: %{
-          "pending" => %{request: %{args: %{assignment_id: "item"}}, status: "pending"},
-          "done" => %{request: %{args: %{assignment_id: "item"}}, status: :complete},
-          "orphan" => %{status: :complete},
-          "malformed_args" => %{request: %{args: :invalid}, status: :complete},
-          "raw" => :legacy
-        },
-        effect_intents: :invalid
-      )
-
-    assert {:ok, migrated} = Migration.migrate(state)
-
-    pending = migrated.review_intents["pending"]
-    assert pending.assignment_id == "item"
-    assert pending.project_id == "project-1"
-    assert pending.ownership_revision == 0
-    assert pending.status == :needs_operator_reconciliation
-    assert pending.principal_context.principal_id == "operator"
-    assert pending.binding == migrated.projects["project-1"]
-
-    assert migrated.review_intents["done"].status == :complete
-    refute Map.has_key?(migrated.review_intents["orphan"], :assignment_id)
-    refute Map.has_key?(migrated.review_intents["malformed_args"], :assignment_id)
-    assert migrated.effect_intents == %{}
-    assert migrated.assignments["item"].operator_reconciliation_required
-    assert migrated.migration.reconciliation_required == ["pending"]
-  end
-
-  test "migration normalizes binding keys and attributes request records to the operator" do
-    state =
-      v1_state(
-        binding: %{
-          "project_id" => " project-1 ",
-          "revision" => 3,
-          "dispatch_paused" => true,
-          "status_field_id" => "status"
-        },
-        principals: :invalid,
-        requests: %{
-          "record" => %{principal_id: "existing", response: %{"status" => "ok"}},
-          "raw" => :preserve
-        }
-      )
-
-    assert {:ok, migrated} = Migration.migrate(state)
-    assert migrated.projects["project-1"].revision == 3
-    assert migrated.projects["project-1"].dispatch_paused
-    assert migrated.projects["project-1"].status_field_id == "status"
-
-    assert migrated.principals == %{
-             "operator" => %{principal_id: "operator", role: :operator, project_scope: :all, legacy: true}
-           }
-
-    assert migrated.requests["record"].principal_id == "existing"
-    assert migrated.requests["record"].capability_id == nil
-    assert migrated.requests["record"].legacy_request
-    assert migrated.requests["raw"] == :preserve
-  end
-
-  test "migration leaves a non-map request collection untouched" do
-    assert {:ok, migrated} = Migration.migrate(v1_state(requests: :invalid))
-    assert migrated.requests == :invalid
-  end
-
   test "projection invalidates changed responsibility fields and ignores stale receipts" do
     now = ~U[2026-01-01 00:00:00Z]
 
@@ -260,28 +130,5 @@ defmodule SymphonyElixir.ManagedV2GateTest do
     refute text =~ "\t"
     assert text =~ "Workers: 1 active"
     assert text =~ "Work: queued"
-  end
-
-  defp project_binding do
-    %{project_id: "project-1", project_number: 1, status_field_id: "status", status_options: %{"READY" => "ready"}}
-  end
-
-  defp assignment(id, overrides \\ []) do
-    base = %{assignment_id: id, project_id: "project-1", resources: []}
-    Map.merge(base, Map.new(overrides))
-  end
-
-  defp v1_state(overrides) do
-    base = %{
-      version: 1,
-      binding: project_binding(),
-      assignments: %{},
-      principals: %{},
-      requests: %{},
-      review_intents: %{},
-      effect_intents: %{}
-    }
-
-    Map.merge(base, Map.new(overrides))
   end
 end

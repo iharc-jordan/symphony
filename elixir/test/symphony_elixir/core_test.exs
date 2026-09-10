@@ -1539,6 +1539,44 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt == "Retry #2"
   end
 
+  test "prompt builder appends current review feedback after workflow prompt" do
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: "Stale issue body and template instructions")
+
+    issue = %Issue{
+      identifier: "MT-202",
+      title: "Apply reviewer changes",
+      description: "Original issue description",
+      state: "Ready",
+      url: "https://example.org/issues/MT-202",
+      labels: []
+    }
+
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        review_feedback: %{
+          reason: "The implementation did not satisfy the acceptance contract.",
+          evidence: ["Acceptance check A failed", %{check: "B", result: "missing"}]
+        }
+      )
+
+    assert prompt =~ "Stale issue body and template instructions"
+    assert prompt =~ "CURRENT ASSIGNMENT REVIEW FEEDBACK"
+    assert prompt =~ "Reason: The implementation did not satisfy the acceptance contract."
+    assert prompt =~ "- Acceptance check A failed"
+    assert prompt =~ ~s(- %{check: "B", result: "missing"})
+
+    assert :binary.match(prompt, "CURRENT ASSIGNMENT REVIEW FEEDBACK") |> elem(0) >
+             :binary.match(prompt, "Stale issue body") |> elem(0)
+
+    reason_only_prompt =
+      PromptBuilder.build_prompt(issue,
+        review_feedback: %{reason: "Correct the missing acceptance behavior.", evidence: []}
+      )
+
+    assert reason_only_prompt =~ "Reason: Correct the missing acceptance behavior."
+    assert reason_only_prompt =~ "- No evidence supplied."
+  end
+
   test "agent runner keeps workspace after successful codex run" do
     test_root =
       Path.join(
@@ -1882,7 +1920,15 @@ defmodule SymphonyElixir.CoreTest do
         labels: []
       }
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 issue_state_fetcher: state_fetcher,
+                 review_feedback: %{
+                   reason: "Reviewer found an acceptance gap.",
+                   evidence: ["The acceptance check was not covered.", %{check: "coverage", result: "missing"}]
+                 }
+               )
+
       assert_receive {:issue_state_fetch, 1}
       assert_receive {:issue_state_fetch, 2}
 
@@ -1904,6 +1950,10 @@ defmodule SymphonyElixir.CoreTest do
 
       assert length(turn_texts) == 2
       assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
+      assert Enum.at(turn_texts, 0) =~ "CURRENT ASSIGNMENT REVIEW FEEDBACK"
+      assert Enum.at(turn_texts, 0) =~ "Reason: Reviewer found an acceptance gap."
+      assert Enum.at(turn_texts, 0) =~ "- The acceptance check was not covered."
+      assert Enum.at(turn_texts, 0) =~ ~s(- %{check: "coverage", result: "missing"})
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"

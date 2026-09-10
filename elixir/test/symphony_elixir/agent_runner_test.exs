@@ -22,21 +22,20 @@ defmodule SymphonyElixir.AgentRunnerTest do
         case "$count" in
           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
           2) ;;
-          3) printf '%s\\n' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
-          4)
+          3)
             case "$_line" in
-              *'"permissions":"symphony_worker"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-runner"},"model":"gpt-5.6-luna","reasoningEffort":"high"}}' ;;
-              *) printf '%s\\n' '{"id":2,"error":{"code":"missing_permissions_profile"}}' ;;
+              *'"method":"thread/start"'*'"sandbox":"workspace-write"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-runner"},"model":"gpt-5.6-luna","reasoningEffort":"high"}}' ;;
+              *) printf '%s\\n' '{"id":2,"error":{"code":"invalid_runtime_request"}}' ;;
             esac
             ;;
-          5)
+          4)
             case "$_line" in
-              *'"permissions":"symphony_worker"'*)
+              *'"method":"turn/start"'*'"sandboxPolicy"'*)
                 printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-runner"}}}'
                 printf '%s\\n' '{"method":"turn/completed"}'
                 exit 0
                 ;;
-              *) printf '%s\\n' '{"id":3,"error":{"code":"missing_permissions_profile"}}' ;;
+              *) printf '%s\\n' '{"id":3,"error":{"code":"invalid_runtime_request"}}' ;;
             esac
             ;;
         esac
@@ -138,20 +137,19 @@ defmodule SymphonyElixir.AgentRunnerTest do
         case "$count" in
           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
           2) ;;
-          3) printf '%s\\n' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
-          4)
+          3)
             case "$_line" in
-              *'"permissions":"symphony_worker"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-final-budget"},"model":"gpt-5.6-luna","reasoningEffort":"xhigh"}}' ;;
-              *) printf '%s\\n' '{"id":2,"error":{"code":"missing_permissions_profile"}}' ;;
+              *'"method":"thread/start"'*'"sandbox":"workspace-write"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-final-budget"},"model":"gpt-5.6-luna","reasoningEffort":"xhigh"}}' ;;
+              *) printf '%s\\n' '{"id":2,"error":{"code":"invalid_runtime_request"}}' ;;
             esac
             ;;
-          5)
+          4)
             case "$_line" in
-              *'"permissions":"symphony_worker"'*)
+              *'"method":"turn/start"'*'"sandboxPolicy"'*)
                 printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-final-budget"}}}'
                 printf '%s\\n' '{"method":"turn/completed"}'
                 ;;
-              *) printf '%s\\n' '{"id":3,"error":{"code":"missing_permissions_profile"}}' ;;
+              *) printf '%s\\n' '{"id":3,"error":{"code":"invalid_runtime_request"}}' ;;
             esac
             ;;
         esac

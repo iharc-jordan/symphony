@@ -22,7 +22,7 @@
         "cursor": 0,
         "paused": false,
         "disabled": false,
-        "binding": null,
+        "projects": {},
         "assignments": {}
       }
     },
@@ -59,20 +59,6 @@
       "response": {
         "operation": "bind_project",
         "project": {
-          "project_id": "PVT_one",
-          "project_number": 1,
-          "status_field_id": "status-field-one",
-          "status_options": {
-            "READY": "option-ready",
-            "ACTIVE": "option-active",
-            "REVIEW": "option-review",
-            "ACCEPTED": "option-accepted",
-            "WAITING": "option-waiting",
-            "CANCELLED": "option-cancelled"
-          },
-          "repositories": ["acme/one"]
-        },
-        "binding": {
           "project_id": "PVT_one",
           "project_number": 1,
           "status_field_id": "status-field-one",

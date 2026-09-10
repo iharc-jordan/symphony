@@ -325,11 +325,9 @@ defmodule SymphonyElixir.AgentRunner do
       :managed_attempt,
       :model,
       :effort,
-      :reasoning_effort,
       :escalation_reason,
       :resume_thread_id,
-      :report_callback,
-      :report
+      :report_callback
     ])
     |> Keyword.put(:worker_host, worker_host)
   end
@@ -382,11 +380,10 @@ defmodule SymphonyElixir.AgentRunner do
     """
     Continuation guidance:
 
-    - The previous Codex turn completed normally, but the tracker work item is still in an active state.
+    - Continue the current assignment in the existing workspace and workpad; do not restart from scratch.
     - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
-    - Resume from the current workspace and workpad state instead of restarting from scratch.
-    - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
-    - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+    - Honor the latest assignment requirements and current reviewer feedback already provided for this assignment.
+    - Finish the remaining work, verify the result, and report the acceptance evidence when it passes.
     """
   end
 

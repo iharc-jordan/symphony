@@ -4,19 +4,17 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH, Workflow}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
   @thread_resume_id 4
   @turn_interrupt_id 5
-  @config_read_id 6
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @managed_default_model "gpt-5.6-luna"
   @managed_default_effort "xhigh"
-  @managed_permissions_profile "symphony_worker"
   @managed_models ["gpt-5.6-luna", "gpt-5.6-terra"]
   @managed_efforts ["xhigh", "max"]
   @report_kinds ["result", "checkpoint", "context_needed"]
@@ -28,7 +26,6 @@ defmodule SymphonyElixir.Codex.AppServer do
           port: port(),
           metadata: map(),
           approval_policy: String.t() | map(),
-          auto_approve_requests: boolean(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
@@ -40,8 +37,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           turn_model: String.t() | nil,
           turn_effort: String.t() | nil,
           thread_default_reasoning_effort: String.t() | nil,
-          report_callback: (map() -> term()) | nil,
-          permissions_profile: String.t() | nil
+          report_callback: (map() -> term()) | nil
         }
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -70,7 +66,6 @@ defmodule SymphonyElixir.Codex.AppServer do
            attempt: attempt,
            route: route,
            report_callback: report_callback,
-           permissions_profile: @managed_permissions_profile,
            unit_nonce: managed_unit_nonce()
          }}
       end
@@ -97,9 +92,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp normalize_managed_attempt(_attempt), do: {:error, :invalid_managed_attempt}
 
   defp managed_route(opts, raw_attempt) do
-    with {:ok, configured_effort} <- configured_effort(opts) do
-      managed_route_values(opts, raw_attempt, configured_effort || @managed_default_effort)
-    end
+    managed_route_values(opts, raw_attempt, Keyword.get(opts, :effort) || @managed_default_effort)
   end
 
   defp managed_route_values(opts, raw_attempt, effort) do
@@ -166,7 +159,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     do: {:error, :managed_escalation_reason_required}
 
   defp normalize_report_callback(opts) do
-    callback = Keyword.get(opts, :report_callback, Keyword.get(opts, :report))
+    callback = Keyword.get(opts, :report_callback)
 
     cond do
       is_nil(callback) -> {:ok, nil}
@@ -186,30 +179,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp wire_route(_opts, %{route: route}), do: route
 
   defp wire_route(opts, nil) do
-    %{model: Keyword.get(opts, :model), effort: configured_effort_value(opts), managed: false}
-  end
-
-  defp configured_effort(opts) do
-    effort = Keyword.get(opts, :effort)
-    reasoning_effort = Keyword.get(opts, :reasoning_effort)
-
-    cond do
-      not is_nil(effort) and not is_nil(reasoning_effort) and effort != reasoning_effort ->
-        {:error, {:route_mismatch, :effort, effort, reasoning_effort}}
-
-      not is_nil(effort) ->
-        {:ok, effort}
-
-      true ->
-        {:ok, reasoning_effort}
-    end
-  end
-
-  defp configured_effort_value(opts) do
-    case configured_effort(opts) do
-      {:ok, effort} -> effort
-      {:error, _reason} -> nil
-    end
+    %{model: Keyword.get(opts, :model), effort: Keyword.get(opts, :effort), managed: false}
   end
 
   defp required_binary(map, key) do
@@ -243,9 +213,6 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp report_callback(%{report_callback: callback}), do: callback
   defp report_callback(nil), do: nil
-
-  defp permissions_profile(%{permissions_profile: profile}), do: profile
-  defp permissions_profile(nil), do: nil
 
   defp route_value(route, key), do: Map.get(route, key)
 
@@ -364,22 +331,6 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp maybe_put_permissions(params, nil), do: params
-
-  defp maybe_put_permissions(params, profile) when is_binary(profile) do
-    params
-    |> Map.delete("sandbox")
-    |> Map.put("permissions", profile)
-  end
-
-  defp maybe_put_turn_permissions(params, nil), do: params
-
-  defp maybe_put_turn_permissions(params, profile) when is_binary(profile) do
-    params
-    |> Map.delete("sandboxPolicy")
-    |> Map.put("permissions", profile)
-  end
-
   defp route_wire_key(:model), do: "model"
   defp route_wire_key(:effort), do: "effort"
 
@@ -390,7 +341,6 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, managed_config} <- managed_config(opts),
-         {:ok, managed_config} <- prepare_managed_config(expanded_workspace, managed_config),
          {:ok, resume_thread_id} <- resume_thread_id(opts),
          :ok <- validate_managed_worker_host(worker_host, managed_config),
          :ok <- validate_managed_runtime(worker_host, managed_config),
@@ -409,15 +359,13 @@ defmodule SymphonyElixir.Codex.AppServer do
                session_policies,
                dynamic_tool_binding,
                wire_route,
-               resume_thread_id,
-               permissions_profile(managed_config)
+               resume_thread_id
              ) do
         {:ok,
          %{
            port: port,
            metadata: metadata,
            approval_policy: session_policies.approval_policy,
-           auto_approve_requests: session_policies.approval_policy == "never",
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_info.thread_id,
@@ -429,8 +377,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            turn_model: route_value(wire_route, :model),
            turn_effort: route_value(wire_route, :effort),
            thread_default_reasoning_effort: thread_info.default_reasoning_effort,
-           report_callback: report_callback(managed_config),
-           permissions_profile: permissions_profile(managed_config)
+           report_callback: report_callback(managed_config)
          }}
       else
         {:error, reason} ->
@@ -452,7 +399,6 @@ defmodule SymphonyElixir.Codex.AppServer do
           port: port,
           metadata: metadata,
           approval_policy: approval_policy,
-          auto_approve_requests: auto_approve_requests,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           workspace: workspace,
@@ -460,8 +406,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           managed_attempt: managed_attempt,
           turn_model: turn_model,
           turn_effort: turn_effort,
-          report_callback: report_callback,
-          permissions_profile: permissions_profile
+          report_callback: report_callback
         },
         prompt,
         issue,
@@ -484,7 +429,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            workspace,
            approval_policy,
            turn_sandbox_policy,
-           %{route: route, permissions_profile: permissions_profile}
+           route
          ) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
@@ -496,7 +441,9 @@ defmodule SymphonyElixir.Codex.AppServer do
           %{
             session_id: session_id,
             thread_id: thread_id,
-            turn_id: turn_id
+            turn_id: turn_id,
+            model: turn_model,
+            effort: turn_effort
           },
           metadata
         )
@@ -513,8 +460,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         case await_turn_completion(
                port,
                on_message,
-               managed_tool_executor,
-               auto_approve_requests
+               managed_tool_executor
              ) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
@@ -578,8 +524,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         thread_model: thread_model,
         turn_model: turn_model,
         turn_effort: turn_effort,
-        thread_default_reasoning_effort: thread_default_reasoning_effort,
-        permissions_profile: permissions_profile
+        thread_default_reasoning_effort: thread_default_reasoning_effort
       }) do
     %{
       thread_id: thread_id,
@@ -590,7 +535,6 @@ defmodule SymphonyElixir.Codex.AppServer do
       turn_model: turn_model,
       turn_effort: turn_effort,
       thread_default_reasoning_effort: thread_default_reasoning_effort,
-      permissions_profile: permissions_profile,
       metadata: metadata
     }
   end
@@ -675,17 +619,8 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     process_command =
       case managed_config do
-        %{permissions_profile: profile} ->
-          managed_process_wrapper(
-            workspace,
-            launch_command <>
-              managed_cli_overrides(
-                workspace,
-                profile,
-                Map.get(managed_config, :mcp_server_names, [])
-              ),
-            managed_config
-          )
+        %{} ->
+          managed_process_wrapper(workspace, launch_command <> managed_cli_overrides(), managed_config)
 
         nil ->
           "exec #{launch_command}"
@@ -705,16 +640,8 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     launch_command =
       case managed_config do
-        %{permissions_profile: profile} ->
-          launch_command <>
-            managed_cli_overrides(
-              workspace,
-              profile,
-              Map.get(managed_config, :mcp_server_names, [])
-            )
-
-        nil ->
-          launch_command
+        %{} -> launch_command <> managed_cli_overrides()
+        nil -> launch_command
       end
 
     [
@@ -739,203 +666,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     |> Enum.join(" ")
   end
 
-  defp managed_cli_overrides(workspace, profile, mcp_server_names) do
-    filesystem =
-      managed_filesystem_paths(workspace)
-      |> Enum.map(&{&1, "deny"})
-      |> Kernel.++([
-        {workspace, "write"},
-        {Path.join(workspace, ".git"), "write"},
-        {":workspace_roots", {:table, [{".", "write"}]}}
-      ])
-      |> toml_inline_table()
-
-    config_overrides = [
-      "default_permissions=#{toml_string(profile)}",
-      "permissions.#{profile}.extends=\":workspace\"",
-      "permissions.#{profile}.filesystem.glob_scan_max_depth=3",
-      "permissions.#{profile}.filesystem=#{filesystem}"
-    ]
-
-    feature_overrides = [
-      "--disable apps",
-      "--disable plugins",
-      "--disable multi_agent",
-      "--disable multi_agent_v2"
-    ]
-
-    config_overrides =
-      config_overrides ++
-        ["agents.enabled=false"] ++
-        Enum.map(mcp_server_names, fn name ->
-          "mcp_servers.#{toml_key(name)}.enabled=false"
-        end)
-
-    (feature_overrides ++ Enum.flat_map(config_overrides, &["-c", shell_escape(&1)]))
-    |> Enum.join(" ")
-    |> then(&(" " <> &1))
-  end
-
-  defp toml_inline_table(entries) when is_list(entries) do
-    entries
-    |> Enum.map_join(",", fn {key, value} -> "#{toml_string(key)}=#{toml_value(value)}" end)
-    |> then(&("{" <> &1 <> "}"))
-  end
-
-  defp toml_value({:table, entries}), do: toml_inline_table(entries)
-  defp toml_value(value) when is_binary(value), do: toml_string(value)
-
-  defp managed_filesystem_paths(workspace) when is_binary(workspace) do
-    settings = Config.settings!()
-    managed = Map.get(settings, :managed)
-
-    [
-      "~/.codex",
-      managed_codex_home(),
-      "~/.ssh",
-      "~/.config/gh",
-      "~/.config/codex-orchestration",
-      "~/.local/state/codex-orchestration",
-      System.get_env("GH_CONFIG_DIR"),
-      Config.local_workspace_root(),
-      Workflow.workflow_file_path(),
-      managed_path(managed, :control_token_file),
-      managed_path(managed, :journal_path),
-      managed_path(managed, :checkout_policy_file),
-      managed_path(managed, :checkout_helper_path)
-    ]
-    |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
-    |> Enum.map(&Path.expand/1)
-    |> minimal_denied_paths()
-  end
-
-  defp minimal_denied_paths(paths) when is_list(paths) do
-    paths
-    |> Enum.uniq()
-    |> Enum.sort_by(fn path -> {length(Path.split(path)), path} end)
-    |> Enum.reduce([], fn path, minimal_paths ->
-      if Enum.any?(minimal_paths, &path_covers?(&1, path)) do
-        minimal_paths
-      else
-        [path | minimal_paths]
-      end
-    end)
-    |> Enum.reverse()
-  end
-
-  defp path_covers?(ancestor, path) when is_binary(ancestor) and is_binary(path) do
-    ancestor_parts = Path.split(ancestor)
-    path_parts = Path.split(path)
-    Enum.take(path_parts, length(ancestor_parts)) == ancestor_parts
-  end
-
-  defp managed_codex_home do
-    case System.get_env("CODEX_HOME") do
-      value when is_binary(value) ->
-        case String.trim(value) do
-          "" -> nil
-          value -> Path.expand(value)
-        end
-
-      _ ->
-        nil
-    end
-  end
-
-  defp prepare_managed_config(_workspace, nil), do: {:ok, nil}
-
-  defp prepare_managed_config(workspace, managed_config) when is_binary(workspace) do
-    with {:ok, names} <- managed_mcp_server_names(workspace) do
-      {:ok, Map.put(managed_config, :mcp_server_names, names)}
-    end
-  end
-
-  defp managed_mcp_server_names(workspace) when is_binary(workspace) do
-    workspace
-    |> managed_config_paths()
-    |> Enum.reduce_while({:ok, MapSet.new()}, fn path, {:ok, names} ->
-      case mcp_server_names_from_config(path) do
-        :absent ->
-          {:cont, {:ok, names}}
-
-        {:ok, path_names} ->
-          names = Enum.reduce(path_names, names, &MapSet.put(&2, &1))
-          {:cont, {:ok, names}}
-
-        {:error, reason} ->
-          {:halt, {:error, {:managed_mcp_config_unreadable, path, reason}}}
-      end
-    end)
-    |> case do
-      {:ok, names} -> {:ok, names |> MapSet.to_list() |> Enum.sort()}
-      error -> error
-    end
-  end
-
-  defp managed_config_paths(workspace) when is_binary(workspace) do
-    codex_home = System.get_env("CODEX_HOME")
-
-    user_config =
-      if is_binary(codex_home) and String.trim(codex_home) != "" do
-        Path.join(Path.expand(codex_home), "config.toml")
-      else
-        Path.expand("~/.codex/config.toml")
-      end
-
-    project_configs =
-      workspace
-      |> Path.expand()
-      |> ancestor_paths()
-      |> Enum.map(&Path.join([&1, ".codex", "config.toml"]))
-
-    [user_config | project_configs] |> Enum.uniq()
-  end
-
-  defp ancestor_paths(path) when is_binary(path) do
-    path = Path.expand(path)
-    do_ancestor_paths(path, [])
-  end
-
-  defp do_ancestor_paths(path, acc) do
-    parent = Path.dirname(path)
-
-    if parent == path do
-      Enum.reverse([path | acc])
-    else
-      do_ancestor_paths(parent, [path | acc])
-    end
-  end
-
-  defp mcp_server_names_from_config(path) when is_binary(path) do
-    case File.stat(path) do
-      {:error, reason} when reason in [:enoent, :enotdir] ->
-        :absent
-
-      {:error, reason} ->
-        {:error, reason}
-
-      {:ok, %{type: :regular}} ->
-        case File.read(path) do
-          {:ok, contents} -> parse_mcp_config(contents)
-          {:error, reason} -> {:error, reason}
-        end
-
-      {:ok, _file_info} ->
-        {:error, :not_a_regular_file}
-    end
-  end
-
-  defp parse_mcp_config(contents) when is_binary(contents) do
-    with {:ok, config} when is_map(config) <- TomlElixir.decode(contents),
-         servers when is_map(servers) <- Map.get(config, "mcp_servers", %{}) do
-      {:ok, servers |> Map.keys() |> Enum.sort()}
-    else
-      _ -> {:error, {:invalid_mcp_config, :invalid_toml}}
-    end
-  end
-
-  defp managed_path(managed, key) when is_map(managed), do: Map.get(managed, key)
-  defp managed_path(_managed, _key), do: nil
+  # Symphony owns delegation. All ordinary host tools and configured permission
+  # policies remain available to the assigned worker.
+  defp managed_cli_overrides, do: " -c agents.enabled=false"
 
   defp systemd_unit_for_managed(workspace, %{attempt: attempt, unit_nonce: unit_nonce})
        when is_binary(workspace) and is_binary(unit_nonce) do
@@ -993,15 +726,6 @@ defmodule SymphonyElixir.Codex.AppServer do
           nil
       end
     end
-  end
-
-  defp toml_key(value) when is_binary(value) do
-    if String.match?(value, ~r/^[A-Za-z0-9_-]+$/), do: value, else: toml_string(value)
-  end
-
-  defp toml_string(value) when is_binary(value) do
-    escaped = value |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"")
-    "\"#{escaped}\""
   end
 
   defp tracker_secret_port_env(dynamic_tool_binding) do
@@ -1115,8 +839,6 @@ defmodule SymphonyElixir.Codex.AppServer do
       unit_nonce: Map.get(managed_config, :unit_nonce)
     }
   end
-
-  defp managed_unit_identity(_managed_config), do: nil
 
   defp managed_unit_nonce do
     :crypto.strong_rand_bytes(12) |> Base.encode16(case: :lower)
@@ -1325,58 +1047,19 @@ defmodule SymphonyElixir.Codex.AppServer do
          session_policies,
          dynamic_tool_binding,
          wire_route,
-         resume_thread_id,
-         permissions_profile
+         resume_thread_id
        ) do
-    case send_initialize(port) do
-      :ok ->
-        with :ok <- validate_managed_mcp_configuration(port, workspace, permissions_profile) do
-          start_thread_or_resume(
-            port,
-            workspace,
-            session_policies,
-            dynamic_tool_binding,
-            wire_route,
-            resume_thread_id,
-            permissions_profile
-          )
-        end
-
-      {:error, reason} ->
-        {:error, reason}
+    with :ok <- send_initialize(port) do
+      start_thread_or_resume(
+        port,
+        workspace,
+        session_policies,
+        dynamic_tool_binding,
+        wire_route,
+        resume_thread_id
+      )
     end
   end
-
-  defp validate_managed_mcp_configuration(_port, _workspace, nil), do: :ok
-
-  defp validate_managed_mcp_configuration(port, workspace, _permissions_profile)
-       when is_port(port) and is_binary(workspace) do
-    send_message(port, %{
-      "method" => "config/read",
-      "id" => @config_read_id,
-      "params" => %{"cwd" => workspace, "includeLayers" => true}
-    })
-
-    case await_response(port, @config_read_id) do
-      {:ok, %{"config" => %{"mcp_servers" => mcp_servers}}} when is_map(mcp_servers) ->
-        reject_enabled_mcp_servers(mcp_servers)
-
-      {:ok, _response} ->
-        {:error, {:managed_mcp_configuration_unavailable, :invalid_response}}
-
-      {:error, reason} ->
-        {:error, {:managed_mcp_configuration_read_failed, reason}}
-    end
-  end
-
-  defp reject_enabled_mcp_servers(mcp_servers) do
-    case Enum.find(mcp_servers, &mcp_server_enabled?/1) do
-      nil -> :ok
-      {name, _config} -> {:error, {:managed_mcp_server_enabled, name}}
-    end
-  end
-
-  defp mcp_server_enabled?({_name, config}), do: Map.get(config, "enabled", true) != false
 
   defp start_thread_or_resume(
          port,
@@ -1384,8 +1067,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          session_policies,
          dynamic_tool_binding,
          wire_route,
-         resume_thread_id,
-         permissions_profile
+         resume_thread_id
        )
        when is_binary(resume_thread_id) do
     resume_thread(
@@ -1394,8 +1076,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       session_policies,
       dynamic_tool_binding,
       wire_route,
-      resume_thread_id,
-      permissions_profile
+      resume_thread_id
     )
   end
 
@@ -1405,16 +1086,14 @@ defmodule SymphonyElixir.Codex.AppServer do
          session_policies,
          dynamic_tool_binding,
          wire_route,
-         nil,
-         permissions_profile
+         nil
        ) do
     start_thread(
       port,
       workspace,
       session_policies,
       dynamic_tool_binding,
-      wire_route,
-      permissions_profile
+      wire_route
     )
   end
 
@@ -1423,8 +1102,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          workspace,
          %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
          dynamic_tool_binding,
-         wire_route,
-         permissions_profile
+         wire_route
        ) do
     params = %{
       "approvalPolicy" => approval_policy,
@@ -1439,7 +1117,6 @@ defmodule SymphonyElixir.Codex.AppServer do
       "params" =>
         params
         |> maybe_put_route(wire_route, :model)
-        |> maybe_put_permissions(permissions_profile)
     })
 
     case await_response(port, @thread_start_id) do
@@ -1454,8 +1131,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
          dynamic_tool_binding,
          wire_route,
-         resume_thread_id,
-         permissions_profile
+         resume_thread_id
        ) do
     params = %{
       "threadId" => resume_thread_id,
@@ -1471,7 +1147,6 @@ defmodule SymphonyElixir.Codex.AppServer do
       "params" =>
         params
         |> maybe_put_route(wire_route, :model)
-        |> maybe_put_permissions(permissions_profile)
     })
 
     case await_response(port, @thread_resume_id) do
@@ -1542,7 +1217,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          workspace,
          approval_policy,
          turn_sandbox_policy,
-         %{route: wire_route, permissions_profile: permissions_profile}
+         wire_route
        ) do
     params =
       %{
@@ -1558,7 +1233,6 @@ defmodule SymphonyElixir.Codex.AppServer do
         "approvalPolicy" => approval_policy,
         "sandboxPolicy" => turn_sandbox_policy
       }
-      |> maybe_put_turn_permissions(permissions_profile)
 
     send_message(port, %{
       "method" => "turn/start",
@@ -1572,22 +1246,21 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, on_message, tool_executor) do
     receive_loop(
       port,
       on_message,
       Config.settings!().codex.turn_timeout_ms,
       "",
-      tool_executor,
-      auto_approve_requests
+      tool_executor
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -1595,8 +1268,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           on_message,
           timeout_ms,
           pending_line <> to_string(chunk),
-          tool_executor,
-          auto_approve_requests
+          tool_executor
         )
 
       {^port, {:exit_status, status}} ->
@@ -1607,7 +1279,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
@@ -1652,8 +1324,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           payload_string,
           method,
           timeout_ms,
-          tool_executor,
-          auto_approve_requests
+          tool_executor
         )
 
       {:ok, payload} ->
@@ -1667,7 +1338,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -1684,7 +1355,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor)
     end
   end
 
@@ -1734,8 +1405,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          payload_string,
          method,
          timeout_ms,
-         tool_executor,
-         auto_approve_requests
+         tool_executor
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -1746,8 +1416,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            payload_string,
            on_message,
            metadata,
-           tool_executor,
-           auto_approve_requests
+           tool_executor
          ) do
       :input_required ->
         emit_message(
@@ -1760,7 +1429,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor)
 
       :approval_required ->
         emit_message(
@@ -1804,32 +1473,24 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          receive_loop(port, on_message, timeout_ms, "", tool_executor)
         end
     end
   end
 
+  # The host applies its configured approval policy. Any remaining request
+  # requires an actual decision, even if command approvals are set to never.
   defp maybe_handle_approval_request(
-         port,
-         "item/commandExecution/requestApproval",
-         %{"id" => id} = payload,
-         payload_string,
-         on_message,
-         metadata,
-         _tool_executor,
-         auto_approve_requests
-       ) do
-    approve_or_require(
-      port,
-      id,
-      "acceptForSession",
-      payload,
-      payload_string,
-      on_message,
-      metadata,
-      auto_approve_requests
-    )
-  end
+         _port,
+         method,
+         _payload,
+         _payload_string,
+         _on_message,
+         _metadata,
+         _tool_executor
+       )
+       when method in ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"],
+       do: :approval_required
 
   defp maybe_handle_approval_request(
          port,
@@ -1838,8 +1499,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          payload_string,
          on_message,
          metadata,
-         tool_executor,
-         _auto_approve_requests
+         tool_executor
        ) do
     tool_name = tool_call_name(params)
     arguments = tool_call_arguments(params)
@@ -1859,6 +1519,14 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         drain_interrupted_turn(port, on_message, metadata, report_thread_id, report_turn_id)
         {:stop, {:orchestration_report_terminal, report}}
+
+      {:error, {:orchestration_report, :invalid_orchestration_report, _report_thread_id, _report_turn_id}} ->
+        result =
+          normalize_dynamic_tool_result({:error, "Use kind, report_id, summary, and an evidence array; execution identity is attached by the runtime."})
+
+        send_message(port, %{"id" => id, "result" => result})
+        emit_message(on_message, :tool_call_failed, %{payload: payload, raw: payload_string}, metadata)
+        :approved
 
       {:error, {:orchestration_report, reason, report_thread_id, report_turn_id}} ->
         result = normalize_dynamic_tool_result({:error, reason})
@@ -1895,12 +1563,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           "result" => result
         })
 
-        event =
-          case result do
-            %{"success" => true} -> :tool_call_completed
-            _ when is_nil(tool_name) -> :unsupported_tool_call
-            _ -> :tool_call_failed
-          end
+        event = dynamic_tool_event(result, tool_name)
 
         emit_message(on_message, event, %{payload: payload, raw: payload_string}, metadata)
 
@@ -1909,92 +1572,15 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_handle_approval_request(
-         port,
-         "execCommandApproval",
-         %{"id" => id} = payload,
-         payload_string,
-         on_message,
-         metadata,
-         _tool_executor,
-         auto_approve_requests
-       ) do
-    approve_or_require(
-      port,
-      id,
-      "approved_for_session",
-      payload,
-      payload_string,
-      on_message,
-      metadata,
-      auto_approve_requests
-    )
-  end
-
-  defp maybe_handle_approval_request(
-         port,
-         "applyPatchApproval",
-         %{"id" => id} = payload,
-         payload_string,
-         on_message,
-         metadata,
-         _tool_executor,
-         auto_approve_requests
-       ) do
-    approve_or_require(
-      port,
-      id,
-      "approved_for_session",
-      payload,
-      payload_string,
-      on_message,
-      metadata,
-      auto_approve_requests
-    )
-  end
-
-  defp maybe_handle_approval_request(
-         port,
-         "item/fileChange/requestApproval",
-         %{"id" => id} = payload,
-         payload_string,
-         on_message,
-         metadata,
-         _tool_executor,
-         auto_approve_requests
-       ) do
-    approve_or_require(
-      port,
-      id,
-      "acceptForSession",
-      payload,
-      payload_string,
-      on_message,
-      metadata,
-      auto_approve_requests
-    )
-  end
-
-  defp maybe_handle_approval_request(
-         port,
+         _port,
          "item/tool/requestUserInput",
-         %{"id" => id, "params" => params} = payload,
-         payload_string,
-         on_message,
-         metadata,
-         _tool_executor,
-         auto_approve_requests
-       ) do
-    maybe_auto_answer_tool_request_user_input(
-      port,
-      id,
-      params,
-      payload,
-      payload_string,
-      on_message,
-      metadata,
-      auto_approve_requests
-    )
-  end
+         _payload,
+         _payload_string,
+         _on_message,
+         _metadata,
+         _tool_executor
+       ),
+       do: :input_required
 
   defp maybe_handle_approval_request(
          _port,
@@ -2003,8 +1589,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          _payload_string,
          _on_message,
          _metadata,
-         _tool_executor,
-         _auto_approve_requests
+         _tool_executor
        ) do
     :unhandled
   end
@@ -2117,140 +1702,6 @@ defmodule SymphonyElixir.Codex.AppServer do
         "text" => output
       }
     ]
-  end
-
-  defp approve_or_require(
-         port,
-         id,
-         decision,
-         payload,
-         payload_string,
-         on_message,
-         metadata,
-         true
-       ) do
-    send_message(port, %{"id" => id, "result" => %{"decision" => decision}})
-
-    emit_message(
-      on_message,
-      :approval_auto_approved,
-      %{payload: payload, raw: payload_string, decision: decision},
-      metadata
-    )
-
-    :approved
-  end
-
-  defp approve_or_require(
-         _port,
-         _id,
-         _decision,
-         _payload,
-         _payload_string,
-         _on_message,
-         _metadata,
-         false
-       ) do
-    :approval_required
-  end
-
-  defp maybe_auto_answer_tool_request_user_input(
-         port,
-         id,
-         params,
-         payload,
-         payload_string,
-         on_message,
-         metadata,
-         true
-       ) do
-    case tool_request_user_input_approval_answers(params) do
-      {:ok, answers, decision} ->
-        send_message(port, %{"id" => id, "result" => %{"answers" => answers}})
-
-        emit_message(
-          on_message,
-          :approval_auto_approved,
-          %{payload: payload, raw: payload_string, decision: decision},
-          metadata
-        )
-
-        :approved
-
-      :error ->
-        :input_required
-    end
-  end
-
-  defp maybe_auto_answer_tool_request_user_input(
-         _port,
-         _id,
-         _params,
-         _payload,
-         _payload_string,
-         _on_message,
-         _metadata,
-         false
-       ),
-       do: :input_required
-
-  defp tool_request_user_input_approval_answers(%{"questions" => questions}) when is_list(questions) do
-    answers =
-      Enum.reduce_while(questions, %{}, fn question, acc ->
-        case tool_request_user_input_approval_answer(question) do
-          {:ok, question_id, answer_label} ->
-            {:cont, Map.put(acc, question_id, %{"answers" => [answer_label]})}
-
-          :error ->
-            {:halt, :error}
-        end
-      end)
-
-    case answers do
-      :error -> :error
-      answer_map when map_size(answer_map) > 0 -> {:ok, answer_map, "Approve this Session"}
-      _ -> :error
-    end
-  end
-
-  defp tool_request_user_input_approval_answers(_params), do: :error
-
-  defp tool_request_user_input_approval_answer(%{"id" => question_id, "options" => options})
-       when is_binary(question_id) and is_list(options) do
-    if String.starts_with?(question_id, "mcp_tool_call_approval_") do
-      case tool_request_user_input_approval_option_label(options) do
-        nil -> :error
-        answer_label -> {:ok, question_id, answer_label}
-      end
-    else
-      :error
-    end
-  end
-
-  defp tool_request_user_input_approval_answer(_question), do: :error
-
-  defp tool_request_user_input_approval_option_label(options) do
-    options
-    |> Enum.map(&tool_request_user_input_option_label/1)
-    |> Enum.reject(&is_nil/1)
-    |> case do
-      labels ->
-        Enum.find(labels, &(&1 == "Approve this Session")) ||
-          Enum.find(labels, &(&1 == "Approve Once")) ||
-          Enum.find(labels, &approval_option_label?/1)
-    end
-  end
-
-  defp tool_request_user_input_option_label(%{"label" => label}) when is_binary(label), do: label
-  defp tool_request_user_input_option_label(_option), do: nil
-
-  defp approval_option_label?(label) when is_binary(label) do
-    normalized_label =
-      label
-      |> String.trim()
-      |> String.downcase()
-
-    String.starts_with?(normalized_label, "approve") or String.starts_with?(normalized_label, "allow")
   end
 
   defp await_response(port, request_id) do
@@ -2680,6 +2131,10 @@ defmodule SymphonyElixir.Codex.AppServer do
     line = Jason.encode!(message) <> "\n"
     Port.command(port, line)
   end
+
+  defp dynamic_tool_event(%{"success" => true}, _tool_name), do: :tool_call_completed
+  defp dynamic_tool_event(_result, nil), do: :unsupported_tool_call
+  defp dynamic_tool_event(_result, _tool_name), do: :tool_call_failed
 
   defp needs_input?("mcpServer/elicitation/request", payload) when is_map(payload), do: true
 

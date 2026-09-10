@@ -222,7 +222,6 @@ defmodule SymphonyElixirWeb.Presenter do
       board_state: text_value(Map.get(assignment, :board_state)),
       ownership: ownership_payload(Map.get(assignment, :ownership), principals),
       dispatch_paused: Map.get(assignment, :dispatch_paused) == true,
-      operator_reconciliation_required: Map.get(assignment, :operator_reconciliation_required) == true,
       worker: safe_worker(assignment),
       projection: projection,
       reports: safe_reports(Map.get(assignment, :reports)),
@@ -396,7 +395,6 @@ defmodule SymphonyElixirWeb.Presenter do
     Map.get(assignment, :dispatch_paused) == true or
       get_in(assignment, [:projection, :status]) in ["failed", "unknown"] or
       get_in(assignment, [:ownership, :status]) == "needs_claim" or
-      Map.get(assignment, :operator_reconciliation_required) == true or
       String.downcase(Map.get(assignment, :status, "")) in ["blocked", "failed", "error"]
   end
 
