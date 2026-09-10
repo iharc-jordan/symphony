@@ -25,7 +25,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
           3) printf '%s\\n' '{"id":6,"result":{"config":{"mcp_servers":{}}}}' ;;
           4)
             case "$_line" in
-              *'"permissions":"symphony_worker"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-runner"},"model":"gpt-5.6-luna","reasoningEffort":null}}' ;;
+              *'"permissions":"symphony_worker"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-runner"},"model":"gpt-5.6-luna","reasoningEffort":"high"}}' ;;
               *) printf '%s\\n' '{"id":2,"error":{"code":"missing_permissions_profile"}}' ;;
             esac
             ;;
@@ -90,8 +90,27 @@ defmodule SymphonyElixir.AgentRunnerTest do
                )
 
       assert_receive {:worker_runtime_info, "issue-runner", %{attempt: ^attempt}}
-      assert_receive {:on_session, %{thread_id: "thread-runner", model: "gpt-5.6-luna", effort: "xhigh"}}
-      assert_receive {:before_turn, %{attempt: ^attempt, turn: 1, remaining_turns: 1, model: "gpt-5.6-luna", effort: "xhigh"}}
+
+      assert_receive {:on_session,
+                      %{
+                        thread_id: "thread-runner",
+                        thread_model: "gpt-5.6-luna",
+                        turn_model: "gpt-5.6-luna",
+                        turn_effort: "xhigh",
+                        thread_default_reasoning_effort: "high"
+                      }}
+
+      assert_receive {:before_turn,
+                      %{
+                        attempt: ^attempt,
+                        turn: 1,
+                        remaining_turns: 1,
+                        thread_model: "gpt-5.6-luna",
+                        turn_model: "gpt-5.6-luna",
+                        turn_effort: "xhigh",
+                        thread_default_reasoning_effort: "high"
+                      }}
+
       assert_receive {:codex_worker_update, "issue-runner", %{attempt: ^attempt, event: :session_started}}
     after
       File.rm_rf(test_root)

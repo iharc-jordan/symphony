@@ -203,7 +203,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <tr :for={{_assignment_id, assignment} <- managed_entries(@payload.managed.assignments)}>
                       <td>
                         <div class="issue-stack">
-                          <span class="issue-id"><%= task_label(assignment) %></span>
+                          <%= if Map.get(assignment, :issue_url) do %>
+                            <a class="issue-id" href={assignment.issue_url}><%= task_label(assignment) %></a>
+                          <% else %>
+                            <span class="issue-id"><%= task_label(assignment) %></span>
+                          <% end %>
                           <span class="muted mono"><%= assignment.assignment_id %></span>
                         </div>
                       </td>
@@ -559,7 +563,16 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp task_label(assignment) do
-    Map.get(assignment, :title) || assignment.task.id || assignment.assignment_id
+    Map.get(assignment, :title) || assignment.task.id || repository_issue_label(assignment)
+  end
+
+  defp repository_issue_label(%{repository: repository, issue_number: number})
+       when is_binary(repository) and is_integer(number) do
+    "#{repository} ##{number}"
+  end
+
+  defp repository_issue_label(assignment) do
+    assignment.assignment_id
   end
 
   defp worker_label(assignment) do

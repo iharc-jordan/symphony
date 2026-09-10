@@ -340,9 +340,10 @@ defmodule SymphonyElixir.AgentRunner do
       turn: turn_number,
       remaining_turns: max(max_turns - turn_number + 1, 0),
       thread_id: session.thread_id,
-      model: session.model,
-      effort: session.effort,
-      thread_reasoning_effort: session.thread_reasoning_effort,
+      thread_model: session.thread_model,
+      turn_model: session.turn_model,
+      turn_effort: session.turn_effort,
+      thread_default_reasoning_effort: session.thread_default_reasoning_effort,
       issue: issue,
       workspace: workspace
     }

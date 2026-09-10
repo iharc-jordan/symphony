@@ -1,3 +1,26 @@
+defmodule SymphonyElixir.ManagedOrchestratorTestControl do
+  alias SymphonyElixir.Managed.{Control, Principal}
+
+  # Existing lifecycle scenarios use one explicit PM and Project. Ownership
+  # adversarial tests call the authenticated API directly with their own fences.
+  def principal, do: %{principal_id: "00000000-0000-4000-8000-000000000001", role: :pm, project_scope: :all}
+
+  def envelope(%{operation: operation} = request) when operation in [:bind_project, "bind_project"], do: request
+
+  def envelope(request) do
+    update_in(request, [:args], fn args ->
+      args
+      |> Map.put_new(:project_id, "PVT_test")
+      |> Map.put_new(:expected_ownership_revision, 1)
+    end)
+  end
+
+  def submit(pid, request) do
+    principal = if request.operation in [:bind_project, "bind_project"], do: Principal.operator(), else: principal()
+    Control.submit_authorized(pid, envelope(request), principal)
+  end
+end
+
 defmodule SymphonyElixir.ManagedReviewEffectsStub do
   def review(_assignment, _args, _context) do
     {:ok,
@@ -84,7 +107,7 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
       issue_number: 5,
       base_commit: "base",
       board_state: "READY",
-      resources: ["repo:acme/example"],
+      resources: [%{kind: :repository, authority: "github.com", identity: "acme/example", access: :write}],
       dependencies: [],
       route: %{model: "gpt-5.6-luna", effort: "xhigh"}
     }
@@ -185,9 +208,9 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
         File.rm_rf!(root)
       end)
 
-      assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+      assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
       args = %{enrollment_args() | base_commit: String.duplicate("a", 40)}
-      assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: args})
+      assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: args})
 
       if @dispatch_scenario != :fresh do
         :sys.replace_state(pid, fn state ->
@@ -203,7 +226,7 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
       if @dispatch_scenario == :escalate do
         changes = %{route: %{model: "gpt-5.6-terra", effort: "xhigh"}, escalation_reason: "Complex diagnosis"}
         args = %{assignment_id: "item-1", expected_revision: 1, changes: changes}
-        assert {:ok, _} = Control.submit(pid, %{request_id: "escalate", operation: :revise, args: args})
+        assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "escalate", operation: :revise, args: args})
       end
 
       :sys.replace_state(pid, fn state ->
@@ -272,10 +295,10 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     {pid, _path} = managed_server()
 
     assert {:ok, %{operation: :bind_project, revision: 1}} =
-             Control.submit(pid, %{request_id: "bind", operation: "bind_project", args: binding_args()})
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: "bind_project", args: binding_args()})
 
     assert {:ok, %{operation: :enroll, assignment_id: "item-1", revision: 1}} =
-             Control.submit(pid, %{request_id: "enroll", operation: "enroll", args: enrollment_args()})
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: "enroll", args: enrollment_args()})
 
     assert {:ok, snapshot} = Control.state(pid)
     assert snapshot.revision == 2
@@ -283,15 +306,15 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     assert snapshot.assignments["item-1"].repository == "acme/example"
 
     assert {:ok, duplicate} =
-             Control.submit(pid, %{request_id: "enroll", operation: "enroll", args: enrollment_args()})
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: "enroll", args: enrollment_args()})
 
     assert duplicate.duplicate == true
   end
 
   test "accepted review journals intent and service reconciliation before commit" do
     {pid, _path} = managed_server()
-    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
-    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
 
     :sys.replace_state(pid, fn state ->
       data =
@@ -306,7 +329,7 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     args = %{assignment_id: "item-1", expected_revision: 2, disposition: "accepted", evidence: ["receipt"]}
 
     assert {:ok, %{operation: :review, phase: :accepted}} =
-             Control.submit(pid, %{request_id: "review-1", operation: :review, args: args})
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "review-1", operation: :review, args: args})
 
     assert {:ok, snapshot} = Control.state(pid)
     assert snapshot.assignments["item-1"].phase == :accepted
@@ -321,8 +344,8 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
 
   test "managed callbacks fence stale attempts, reserve turns, and retain review reports" do
     {pid, _path} = managed_server()
-    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
-    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
 
     attempt = %{assignment_id: "item-1", revision: 1, generation: 1, attempt_id: "attempt-1"}
 
@@ -369,8 +392,8 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
 
   test "service reconciliation supplies review facts while caller fields are ignored" do
     {pid, _path} = managed_server()
-    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
-    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
 
     :sys.replace_state(pid, fn state ->
       data =
@@ -392,7 +415,7 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
              })
 
     assert {:ok, response} =
-             Control.submit(pid, %{
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{
                request_id: "review",
                operation: :review,
                args: %{
@@ -442,7 +465,7 @@ defmodule SymphonyElixir.ManagedOrchestratorDeferredReportTest do
       issue_number: 5,
       base_commit: "base",
       board_state: "READY",
-      resources: ["repo:acme/example"],
+      resources: [%{kind: :repository, authority: "github.com", identity: "acme/example", access: :write}],
       dependencies: [],
       route: %{model: "gpt-5.6-luna", effort: "xhigh"}
     }
@@ -463,8 +486,8 @@ defmodule SymphonyElixir.ManagedOrchestratorDeferredReportTest do
       File.rm(path)
     end)
 
-    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
-    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
 
     attempt = %{assignment_id: "item-1", revision: 1, generation: 1, attempt_id: "attempt-1"}
     fake_pid = spawn(fn -> Process.sleep(:infinity) end)
@@ -540,8 +563,8 @@ defmodule SymphonyElixir.ManagedOrchestratorDeferredReportTest do
       File.rm(path)
     end)
 
-    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
-    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
 
     attempt = %{assignment_id: "item-1", revision: 1, generation: 1, attempt_id: "attempt-1"}
     fake_pid = spawn(fn -> Process.sleep(:infinity) end)
@@ -579,10 +602,16 @@ defmodule SymphonyElixir.ManagedOrchestratorDeferredReportTest do
     end)
 
     assert {:ok, pending} =
-             Control.submit(pid, %{
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{
                request_id: "interrupt-1",
                operation: :interrupt,
-               args: %{assignment_id: "item-1", expected_revision: 1, reason: "operator stop"}
+               args: %{
+                 assignment_id: "item-1",
+                 expected_revision: 1,
+                 project_id: "PVT_test",
+                 expected_ownership_revision: 1,
+                 reason: "operator stop"
+               }
              })
 
     assert pending.pending == true
@@ -594,6 +623,7 @@ defmodule SymphonyElixir.ManagedOrchestratorDeferredReportTest do
     assert {:ok, snapshot} = Control.state(pid)
     assert snapshot.assignments["item-1"].phase == :waiting
     assert snapshot.assignments["item-1"].board_state == :waiting
+    assert snapshot.assignments["item-1"].stop_pending == false
 
     state = :sys.get_state(pid)
     assert state.managed.data.effect_intents["interrupt-1"].status == :committed
@@ -635,7 +665,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       issue_number: 5,
       base_commit: "base",
       board_state: "READY",
-      resources: ["repo:acme/example"],
+      resources: [%{kind: :repository, authority: "github.com", identity: "acme/example", access: :write}],
       dependencies: [],
       route: %{model: "gpt-5.6-luna", effort: "xhigh"}
     }
@@ -674,8 +704,8 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       File.rm(path)
     end)
 
-    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
-    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
 
     state = :sys.get_state(pid)
 
@@ -686,6 +716,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       |> put_in([:effect_intents, "auto-ready"], %{
         request_id: "auto-ready",
         request: nil,
+        binding: state.managed.data.projects["PVT_test"],
         assignment_id: "item-1",
         target: :ready,
         status: :pending
@@ -716,8 +747,8 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       File.rm(path)
     end)
 
-    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
-    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
 
     state = :sys.get_state(pid)
 
@@ -727,6 +758,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       |> put_in([:effect_intents, "auto-active"], %{
         request_id: "auto-active",
         request: nil,
+        binding: state.managed.data.projects["PVT_test"],
         assignment_id: "item-1",
         target: :active,
         status: :pending
@@ -742,6 +774,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       |> put_in([:effect_intents, "auto-ready"], %{
         request_id: "auto-ready",
         request: nil,
+        binding: state.managed.data.projects["PVT_test"],
         assignment_id: "item-1",
         target: :ready,
         status: :pending
@@ -847,14 +880,14 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
   end
 
   defp prepare_revision_assignment(pid, old_fingerprint, new_fingerprint) do
-    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
 
     enrollment =
       enrollment_args()
       |> Map.put(:requirements_fingerprint, old_fingerprint)
       |> Map.put(:requirements_revision, 1)
 
-    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment})
     observer = self()
 
     :sys.replace_state(pid, fn state ->
@@ -879,9 +912,63 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       args: %{
         assignment_id: "item-1",
         expected_revision: expected_revision,
+        project_id: "PVT_test",
+        expected_ownership_revision: 1,
         changes: %{requirements_fingerprint: fingerprint, requirements_revision: 2}
       }
     }
+  end
+
+  for {disposition, target} <- [{:rework, :ready}, {:waiting, :waiting}] do
+    @review_disposition disposition
+    @review_target target
+    test "deferred review reconciles the provider before committing #{@review_disposition}" do
+      fingerprint = body_fingerprint("unchanged-requirements")
+      {pid, _path} = revision_server()
+      prepare_revision_assignment(pid, fingerprint, fingerprint)
+
+      :sys.replace_state(pid, fn state ->
+        data = update_in(state.managed.data, [:assignments, "item-1"], &Map.merge(&1, %{phase: :review, board_state: :review}))
+        %{state | managed: %{state.managed | data: data}}
+      end)
+
+      request = %{
+        request_id: "deferred-review",
+        operation: :review,
+        args: %{assignment_id: "item-1", expected_revision: 1, disposition: @review_disposition, reason: "Continue retained work"}
+      }
+
+      assert {:ok, response} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, request)
+      assert_receive {:requirements_transition_target, @review_target, _assignment}
+      assert response.phase == @review_target
+      state = :sys.get_state(pid).managed.data
+      assert state.effect_intents["deferred-review"].status == :committed
+      assert state.assignments["item-1"].pending_effect.facts.provider_state == @review_target
+      assert {:ok, %{duplicate: true}} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, request)
+      refute_receive {:requirements_transition_target, _, _}, 100
+    end
+  end
+
+  test "rework provider failure preserves the prior phase and durable recovery intent" do
+    {pid, _path} = revision_server()
+    prepare_revision_assignment(pid, body_fingerprint("old"), body_fingerprint("changed"))
+
+    :sys.replace_state(pid, fn state ->
+      data = update_in(state.managed.data, [:assignments, "item-1"], &Map.merge(&1, %{phase: :waiting, board_state: :waiting}))
+      %{state | managed: %{state.managed | data: data}}
+    end)
+
+    request = %{
+      request_id: "failed-rework",
+      operation: :review,
+      args: %{assignment_id: "item-1", expected_revision: 1, disposition: :rework, reason: "Continue retained work"}
+    }
+
+    assert {:error, {:requirements_changed, _}} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, request)
+    state = :sys.get_state(pid).managed.data
+    assert state.assignments["item-1"].phase == :waiting
+    assert state.assignments["item-1"].revision == 1
+    assert state.effect_intents["failed-rework"].status == :pending
   end
 
   test "fresh revise control verifies new requirements before committing locally" do
@@ -891,7 +978,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     prepare_revision_assignment(pid, old_fingerprint, new_fingerprint)
 
     request = revise_request("revise-r2", 1, new_fingerprint)
-    assert {:ok, response} = Control.submit(pid, request)
+    assert {:ok, response} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, request)
     assert response.revision == 2
     assert_receive {:requirements_transition, provider_assignment}
     assert provider_assignment.requirements_fingerprint == new_fingerprint
@@ -905,7 +992,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     assert state.managed.data.effect_intents["revise-r2"].status == :committed
 
     event_cursor = state.managed.data.event_cursor
-    assert {:ok, duplicate} = Control.submit(pid, request)
+    assert {:ok, duplicate} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, request)
     assert duplicate.duplicate == true
     refute_receive {:requirements_transition, _assignment}, 100
     assert :sys.get_state(pid).managed.data.event_cursor == event_cursor
@@ -925,9 +1012,11 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       put_in(state.managed.data, [:effect_intents, "revise-recovered-r2"], %{
         request_id: "revise-recovered-r2",
         request: request,
+        binding: state.managed.data.projects["PVT_test"],
+        principal_context: SymphonyElixir.ManagedOrchestratorTestControl.principal(),
         assignment_id: "item-1",
         target: :ready,
-        context: %{stop_reconciled: true},
+        context: Map.put(SymphonyElixir.ManagedOrchestratorTestControl.principal(), :stop_reconciled, true),
         status: :pending
       })
 
@@ -965,9 +1054,11 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       put_in(state.managed.data, [:effect_intents, "revise-pending-r2"], %{
         request_id: "revise-pending-r2",
         request: pending_request,
+        binding: state.managed.data.projects["PVT_test"],
+        principal_context: SymphonyElixir.ManagedOrchestratorTestControl.principal(),
         assignment_id: "item-1",
         target: :ready,
-        context: %{stop_reconciled: true},
+        context: Map.put(SymphonyElixir.ManagedOrchestratorTestControl.principal(), :stop_reconciled, true),
         status: :pending
       })
 
@@ -975,7 +1066,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     event_cursor = state.managed.data.event_cursor
     changed_request = revise_request("revise-pending-r2", 1, wrong_fingerprint)
 
-    assert {:error, :request_id_conflict, _details} = Control.submit(pid, changed_request)
+    assert {:error, :request_id_conflict, _details} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, changed_request)
     refute_receive {:requirements_transition, _assignment}, 100
     refute_receive {:requirements_transition_rejected, _assignment}, 100
 
@@ -994,7 +1085,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     {pid, _path} = revision_server()
     prepare_revision_assignment(pid, old_fingerprint, new_fingerprint)
 
-    assert {:error, _reason} = Control.submit(pid, revise_request("revise-wrong-r2", 1, wrong_fingerprint))
+    assert {:error, _reason} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, revise_request("revise-wrong-r2", 1, wrong_fingerprint))
     assert_receive {:requirements_transition_rejected, provider_assignment}
     assert provider_assignment.requirements_fingerprint == wrong_fingerprint
 
@@ -1014,7 +1105,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     state = :sys.get_state(pid)
     event_cursor = state.managed.data.event_cursor
 
-    assert {:error, :stale_revision, _details} = Control.submit(pid, revise_request("revise-stale-r2", 0, new_fingerprint))
+    assert {:error, :stale_revision, _details} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, revise_request("revise-stale-r2", 0, new_fingerprint))
     refute_receive {:requirements_transition, _assignment}, 100
     refute_receive {:requirements_transition_rejected, _assignment}, 100
 
@@ -1051,6 +1142,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     auto_active = %{
       request_id: "auto-active-before-revise",
       request: nil,
+      binding: state.managed.data.projects["PVT_test"],
       assignment_id: "item-1",
       target: :active,
       revision: 1,
@@ -1061,7 +1153,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     data = put_in(exhausted.managed.data, [:effect_intents, auto_active.request_id], auto_active)
     :sys.replace_state(pid, fn current -> %{current | managed: %{current.managed | data: data}} end)
 
-    assert {:ok, response} = Control.submit(pid, revise_request("revise-after-retries", 1, new_fingerprint))
+    assert {:ok, response} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, revise_request("revise-after-retries", 1, new_fingerprint))
     assert response.revision == 2
     assert_receive {:requirements_transition, provider_assignment}
     assert provider_assignment.requirements_fingerprint == new_fingerprint
@@ -1108,6 +1200,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     auto_active = %{
       request_id: "auto-active-uncertain",
       request: nil,
+      binding: state.managed.data.projects["PVT_test"],
       assignment_id: "item-1",
       target: :active,
       revision: 1,
@@ -1119,7 +1212,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     :sys.replace_state(pid, fn current -> %{current | managed: %{current.managed | data: data}} end)
 
     assert {:error, {:requirements_changed, _details}} =
-             Control.submit(pid, revise_request("revise-failed-after-retries", 1, wrong_fingerprint))
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, revise_request("revise-failed-after-retries", 1, wrong_fingerprint))
 
     assert_receive {:requirements_transition_rejected, provider_assignment}
     assert provider_assignment.requirements_fingerprint == wrong_fingerprint
@@ -1148,14 +1241,16 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       |> put_in([:effect_intents, request.request_id], %{
         request_id: request.request_id,
         request: request,
+        binding: state.managed.data.projects["PVT_test"],
+        principal_context: SymphonyElixir.ManagedOrchestratorTestControl.principal(),
         assignment_id: "item-1",
         target: :ready,
-        context: %{stop_reconciled: true},
+        context: Map.put(SymphonyElixir.ManagedOrchestratorTestControl.principal(), :stop_reconciled, true),
         status: :pending
       })
 
     :sys.replace_state(pid, fn current -> %{current | managed: %{current.managed | data: data}} end)
-    assert {:error, {:stale_revision, _details}} = Control.submit(pid, request)
+    assert {:error, {:stale_revision, _details}} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, request)
     refute_receive {:requirements_transition, _assignment}, 100
     refute_receive {:requirements_transition_rejected, _assignment}, 100
 
@@ -1185,6 +1280,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     auto_active = %{
       request_id: "auto-active-cold-recovery",
       request: nil,
+      binding: state.managed.data.projects["PVT_test"],
       assignment_id: "item-1",
       target: :active,
       revision: 1,
@@ -1198,9 +1294,11 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       |> put_in([:effect_intents, request.request_id], %{
         request_id: request.request_id,
         request: request,
+        binding: state.managed.data.projects["PVT_test"],
+        principal_context: SymphonyElixir.ManagedOrchestratorTestControl.principal(),
         assignment_id: "item-1",
         target: :ready,
-        context: %{stop_reconciled: true},
+        context: Map.put(SymphonyElixir.ManagedOrchestratorTestControl.principal(), :stop_reconciled, true),
         status: :pending
       })
 
@@ -1251,7 +1349,13 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     request = %{
       request_id: "interrupt-pending-stale",
       operation: :interrupt,
-      args: %{assignment_id: "item-1", expected_revision: 1, reason: "operator stop"}
+      args: %{
+        assignment_id: "item-1",
+        expected_revision: 1,
+        project_id: "PVT_test",
+        expected_ownership_revision: 1,
+        reason: "operator stop"
+      }
     }
 
     state = :sys.get_state(pid)
@@ -1264,14 +1368,16 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       |> put_in([:effect_intents, request.request_id], %{
         request_id: request.request_id,
         request: request,
+        binding: state.managed.data.projects["PVT_test"],
+        principal_context: SymphonyElixir.ManagedOrchestratorTestControl.principal(),
         assignment_id: "item-1",
         target: :waiting,
-        context: %{stop_reconciled: true},
+        context: Map.put(SymphonyElixir.ManagedOrchestratorTestControl.principal(), :stop_reconciled, true),
         status: :pending
       })
 
     :sys.replace_state(pid, fn current -> %{current | managed: %{current.managed | data: data}} end)
-    assert {:error, {:stale_revision, _details}} = Control.submit(pid, request)
+    assert {:error, {:stale_revision, _details}} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, request)
     refute_receive {:requirements_transition, _assignment}, 100
     refute_receive {:requirements_transition_rejected, _assignment}, 100
     state = :sys.get_state(pid)
@@ -1281,8 +1387,8 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
   test "managed dispatch failures retry twice then block" do
     {pid, _path} = managed_server()
 
-    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
-    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
 
     attempt = fn generation ->
       %{assignment_id: "item-1", revision: 1, generation: generation, attempt_id: "attempt-#{generation}"}
@@ -1344,8 +1450,10 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
   test "dispatch failure preserves an uncertain provider transition" do
     {pid, _path} = managed_server()
 
-    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
-    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+
+    state = :sys.get_state(pid)
 
     provider_effect = %{
       kind: :provider_transition,
@@ -1357,14 +1465,13 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     intent = %{
       request_id: "auto-active",
       request: nil,
+      binding: state.managed.data.projects["PVT_test"],
       assignment_id: "item-1",
       target: :active,
       auto: true,
       status: :pending,
       last_error: :managed_provider_effect_failed
     }
-
-    state = :sys.get_state(pid)
 
     data =
       state.managed.data
@@ -1422,8 +1529,8 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     assert false == :code.is_loaded(module)
 
     {pid, _path} = managed_server()
-    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
-    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
 
     state = :sys.get_state(pid)
 
@@ -1434,6 +1541,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
       |> put_in([:effect_intents, "cold-active"], %{
         request_id: "cold-active",
         request: nil,
+        binding: state.managed.data.projects["PVT_test"],
         assignment_id: "item-1",
         target: :active,
         status: :pending
@@ -1511,7 +1619,7 @@ defmodule SymphonyElixir.ManagedOrchestratorSourceReconciliationTest do
       %{state | managed: %{journal: journal, data: Rules.new(), effects: SymphonyElixir.ManagedReviewEffectsStub}, poll_check_in_progress: true}
     end)
 
-    assert {:ok, _} = Control.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
 
     body = "requirements"
 
@@ -1522,14 +1630,12 @@ defmodule SymphonyElixir.ManagedOrchestratorSourceReconciliationTest do
       issue_number: 5,
       base_commit: "base",
       board_state: "READY",
-      resources: ["repo:acme/example"],
+      resources: [%{kind: :repository, authority: "github.com", identity: "acme/example", access: :write}],
       dependencies: [],
       route: %{model: "gpt-5.6-luna", effort: "xhigh"},
       requirements_fingerprint: body_fingerprint(body),
       requirements_revision: 1
     }
-
-    assert {:ok, _} = Control.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment})
 
     issue = %Issue{
       id: "item-1",
@@ -1546,6 +1652,14 @@ defmodule SymphonyElixir.ManagedOrchestratorSourceReconciliationTest do
         "repository" => %{"id" => "R_1", "name_with_owner" => "acme/example"}
       }
     }
+
+    ready_issue = %{issue | state: "READY"}
+
+    :sys.replace_state(pid, fn state ->
+      %{state | managed: Map.put(state.managed, :source_fetcher, fn _ids -> {:ok, [ready_issue]} end)}
+    end)
+
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment})
 
     :sys.replace_state(pid, fn state ->
       data =
@@ -1661,5 +1775,187 @@ defmodule SymphonyElixir.ManagedOrchestratorUsageRecoveryTest do
 
     assert {:ok, events} = Control.events(pid, 0, 100)
     assert Enum.any?(events, &(&1.operation == :startup_usage_recovery))
+  end
+end
+
+defmodule SymphonyElixir.ManagedOperatorTakeoverRecoveryTest do
+  use SymphonyElixir.TestSupport
+
+  alias SymphonyElixir.Managed.{Control, Journal, Principal, Rules}
+
+  defp binding_args do
+    %{
+      expected_revision: 0,
+      project: %{
+        project_id: "PVT_takeover",
+        project_number: 4,
+        status_field_id: "PVTSSF_takeover",
+        status_options: %{
+          "READY" => "ready",
+          "ACTIVE" => "active",
+          "REVIEW" => "review",
+          "ACCEPTED" => "accepted",
+          "WAITING" => "waiting",
+          "CANCELLED" => "cancelled"
+        },
+        repositories: ["acme/example"]
+      }
+    }
+  end
+
+  defp enrollment_args do
+    %{
+      expected_revision: 1,
+      assignment_id: "stale-waiting",
+      project_id: "PVT_takeover",
+      repository: "acme/example",
+      issue_number: 5,
+      base_commit: "base",
+      board_state: "READY",
+      resources: [%{kind: :repository, authority: "github.com", identity: "acme/example", access: :write}],
+      dependencies: [],
+      route: %{model: "gpt-5.6-luna", effort: "xhigh"}
+    }
+  end
+
+  defp pm(principal_id), do: %{principal_id: principal_id, role: :pm, project_scope: :all}
+
+  defp managed_server do
+    name = Module.concat(__MODULE__, :"server_#{System.unique_integer([:positive])}")
+    path = Path.join(System.tmp_dir!(), "managed-takeover-#{System.unique_integer([:positive])}.log")
+    {:ok, pid} = Orchestrator.start_link(name: name, managed_effects: SymphonyElixir.ManagedReviewEffectsStub)
+    {:ok, journal, %{}} = Journal.open(path, name: String.to_atom("managed_takeover_#{System.unique_integer([:positive])}"))
+
+    :sys.replace_state(pid, fn state ->
+      %{state | managed: %{journal: journal, data: Rules.new(), effects: SymphonyElixir.ManagedReviewEffectsStub}, poll_check_in_progress: true}
+    end)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      File.rm(path)
+    end)
+
+    pid
+  end
+
+  defp enroll_assignment(pid) do
+    assert {:ok, _} =
+             Control.submit_authorized(
+               pid,
+               %{request_id: "bind-takeover", operation: :bind_project, args: binding_args()},
+               Principal.operator()
+             )
+
+    assert {:ok, _} =
+             Control.submit_authorized(
+               pid,
+               %{request_id: "enroll-takeover", operation: :enroll, args: enrollment_args()},
+               pm("source-pm")
+             )
+
+    assert {:ok, _} =
+             Control.submit_authorized(
+               pid,
+               %{request_id: "register-target", operation: :register_pm, args: %{display_name: "Target PM"}},
+               pm("target-pm")
+             )
+  end
+
+  defp takeover_envelope(revision \\ 1) do
+    %{
+      request_id: "takeover-stale-waiting",
+      operation: :operator_takeover,
+      args: %{
+        project_id: "PVT_takeover",
+        destination_pm_id: "target-pm",
+        reason: "recover stale worker",
+        assignments: [%{assignment_id: "stale-waiting", expected_revision: revision, expected_ownership_revision: 1}]
+      }
+    }
+  end
+
+  test "operator takeover proves and clears a stale WAITING stop before transfer" do
+    parent = self()
+    pid = managed_server()
+    enroll_assignment(pid)
+
+    metadata = %{containment: :test_recorded_process, process_id: "stale-waiting"}
+
+    stopper = fn ^metadata ->
+      send(parent, {:stop_recorded_process, metadata})
+      :ok
+    end
+
+    :sys.replace_state(pid, fn state ->
+      data =
+        update_in(state.managed.data, [:assignments, "stale-waiting"], fn assignment ->
+          Map.merge(assignment, %{phase: :waiting, board_state: :waiting, stop_pending: true, metadata: metadata})
+        end)
+
+      managed = Map.put(state.managed, :data, data) |> Map.put(:process_stopper, stopper)
+      %{state | managed: managed}
+    end)
+
+    assert {:ok, response} = Control.submit(pid, takeover_envelope())
+    assert response.operation == :operator_takeover
+    assert_received {:stop_recorded_process, ^metadata}
+
+    assert {:ok, snapshot} = Control.state(pid)
+    assignment = snapshot.assignments["stale-waiting"]
+    assert assignment.phase == :waiting
+    assert assignment.stop_pending == false
+    assert assignment.stop_reconciled == true
+    assert assignment.ownership.pm_id == "target-pm"
+    assert snapshot.external_reconciliations["stale-waiting"].process_stopped == true
+  end
+
+  test "operator takeover retains stale stop state when recorded process proof is unknown" do
+    pid = managed_server()
+    enroll_assignment(pid)
+    stopper = fn _metadata -> {:error, :process_identity_unknown} end
+
+    :sys.replace_state(pid, fn state ->
+      data =
+        update_in(state.managed.data, [:assignments, "stale-waiting"], fn assignment ->
+          Map.merge(assignment, %{phase: :waiting, board_state: :waiting, stop_pending: true, metadata: %{containment: :unknown}})
+        end)
+
+      managed = Map.put(state.managed, :data, data) |> Map.put(:process_stopper, stopper)
+      %{state | managed: managed}
+    end)
+
+    assert {:error, :managed_process_stop_unconfirmed, %{reason: {"stale-waiting", :process_identity_unknown}}} =
+             Control.submit(pid, takeover_envelope())
+
+    assert {:ok, snapshot} = Control.state(pid)
+    assert snapshot.assignments["stale-waiting"].stop_pending == true
+    assert snapshot.assignments["stale-waiting"].ownership.pm_id == "source-pm"
+
+    refute Map.has_key?(snapshot, :external_reconciliations) and
+             Map.has_key?(snapshot.external_reconciliations, "stale-waiting")
+  end
+
+  test "invalid takeover fences fail before a stale process stop is attempted" do
+    parent = self()
+    pid = managed_server()
+    enroll_assignment(pid)
+
+    stopper = fn metadata ->
+      send(parent, {:unexpected_stop, metadata})
+      :ok
+    end
+
+    :sys.replace_state(pid, fn state ->
+      data =
+        update_in(state.managed.data, [:assignments, "stale-waiting"], fn assignment ->
+          Map.merge(assignment, %{phase: :waiting, board_state: :waiting, stop_pending: true, metadata: %{containment: :test_recorded_process}})
+        end)
+
+      managed = Map.put(state.managed, :data, data) |> Map.put(:process_stopper, stopper)
+      %{state | managed: managed}
+    end)
+
+    assert {:error, :stale_revision, %{expected: 99, actual: 1}} = Control.submit(pid, takeover_envelope(99))
+    refute_received {:unexpected_stop, _}
   end
 end

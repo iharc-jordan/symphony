@@ -57,6 +57,30 @@ defmodule SymphonyElixir.ManagedGitHubEffectsTest do
     assert %{status: "REVIEW", issue_state: "OPEN", status_writes: 1, close_writes: 0} = snapshot(provider)
   end
 
+  test "card summary writes only its dedicated field and keeps issue requirements intact", %{provider: provider} do
+    binding = Map.put(context().binding, :projection_field_id, "FIELD_summary")
+    projected = Map.put(assignment(), :project_id, binding.project_id)
+    assert :ok = GitHubEffects.project_summary(projected, binding, "PM: Fixture PM | Work: PM review required")
+    assert %{summary_writes: 1, status_writes: 0, close_writes: 0, body: @requirements, status: "REVIEW"} = snapshot(provider)
+
+    assert {:error, :managed_projection_unconfirmed} =
+             GitHubEffects.project_summary(%{projected | project_id: "wrong-project"}, binding, "wrong")
+
+    assert snapshot(provider).summary_writes == 1
+  end
+
+  test "missing binding and missing item Status fail before provider writes", %{provider: provider} do
+    assert {:error, :managed_project_status_identity_missing, %{}} = GitHubEffects.transition(assignment(), :ready)
+    assert snapshot(provider).requests == 0
+
+    Agent.update(provider, &%{&1 | status: nil})
+
+    assert {:error, :managed_project_status_required, %{assignment_id: "PVTI_fixture"}} =
+             GitHubEffects.review(assignment(), %{}, context())
+
+    assert %{status_writes: 0, close_writes: 0} = snapshot(provider)
+  end
+
   test "changed source requirements prohibit review writes", %{provider: provider} do
     Agent.update(provider, &%{&1 | body: "New requirements invalidate old evidence."})
     assert {:error, :requirements_changed, %{}} = GitHubEffects.review(assignment(), %{}, context())
@@ -86,7 +110,7 @@ defmodule SymphonyElixir.ManagedGitHubEffectsTest do
 
   test "canceled alias reconciles without writes and unknown state cannot be accepted", %{provider: provider} do
     Agent.update(provider, &%{&1 | status: "CANCELED"})
-    assert {:ok, %{provider_state: :cancelled}} = GitHubEffects.transition(assignment(), :cancelled)
+    assert {:ok, %{provider_state: :cancelled}} = GitHubEffects.transition(assignment(), :cancelled, context())
     assert snapshot(provider).status_writes == 0
     Agent.update(provider, &%{&1 | status: "UNRECOGNIZED"})
 
@@ -279,7 +303,8 @@ defmodule SymphonyElixir.ManagedGitHubEffectsTest do
       fail_close: false,
       requests: 0,
       status_writes: 0,
-      close_writes: 0
+      close_writes: 0,
+      summary_writes: 0
     }
   end
 
@@ -297,12 +322,31 @@ defmodule SymphonyElixir.ManagedGitHubEffectsTest do
 
   defp provider_reply(%{"query" => query, "variables" => variables}, state) do
     cond do
-      String.contains?(query, "SymphonyManagedSetProjectStatus") -> update_status(variables, state)
-      String.contains?(query, "SymphonyManagedCloseIssue") -> close_issue(variables, state)
-      String.contains?(query, "ProjectFields") -> {fields_body(), state}
-      String.contains?(query, "ProjectItemsById") -> items_reply(state)
-      String.contains?(query, "SymphonyGitHubUserProject") -> {project_body(), state}
-      true -> raise "Unexpected fixture GraphQL operation"
+      String.contains?(query, "SymphonyManagedSummary") ->
+        assert variables["projectId"] == "PVT_fixture"
+        assert variables["itemId"] == "PVTI_fixture"
+        assert variables["fieldId"] == "FIELD_summary"
+        assert variables["text"] =~ "Fixture PM"
+        body = %{"data" => %{"updateProjectV2ItemFieldValue" => %{"projectV2Item" => %{"id" => "PVTI_fixture"}}}}
+        {body, %{state | summary_writes: state.summary_writes + 1}}
+
+      String.contains?(query, "SymphonyManagedSetProjectStatus") ->
+        update_status(variables, state)
+
+      String.contains?(query, "SymphonyManagedCloseIssue") ->
+        close_issue(variables, state)
+
+      String.contains?(query, "ProjectFields") ->
+        {fields_body(), state}
+
+      String.contains?(query, "ProjectItemsById") ->
+        items_reply(state)
+
+      String.contains?(query, "SymphonyGitHubUserProject") ->
+        {project_body(), state}
+
+      true ->
+        raise "Unexpected fixture GraphQL operation"
     end
   end
 

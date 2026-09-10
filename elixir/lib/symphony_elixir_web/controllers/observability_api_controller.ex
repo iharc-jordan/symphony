@@ -7,7 +7,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   alias Plug.Conn
   alias SymphonyElixir.Config
-  alias SymphonyElixir.Managed.Control
+  alias SymphonyElixir.Managed.{Control, Principal}
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
@@ -41,9 +41,9 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   @spec managed_state(Conn.t(), map()) :: Conn.t()
   def managed_state(conn, _params) do
-    with :ok <- authorize_managed(conn),
+    with {:ok, principal} <- authorize_managed(conn),
          {:ok, payload} <- Control.state(orchestrator(), snapshot_timeout_ms()) do
-      json(conn, payload)
+      json(conn, Map.put(payload, :principal, principal))
     else
       {:error, :unauthorized} -> managed_error(conn, 401, "unauthorized", "Unauthorized")
       {:error, :forbidden} -> managed_error(conn, 403, "loopback_required", "Loopback access required")
@@ -54,7 +54,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   @spec managed_events(Conn.t(), map()) :: Conn.t()
   def managed_events(conn, params) do
-    with :ok <- authorize_managed(conn),
+    with {:ok, _principal} <- authorize_managed(conn),
          {:ok, after_cursor} <- bounded_integer(params["after"], 0, 0, :infinity),
          {:ok, limit} <- bounded_integer(params["limit"], 100, 1, 100),
          {:ok, wait_ms} <- bounded_integer(params["wait_ms"], 0, 0, 60_000),
@@ -70,8 +70,8 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   @spec managed_control(Conn.t(), map()) :: Conn.t()
   def managed_control(conn, params) do
-    with :ok <- authorize_managed(conn),
-         {:ok, response} <- Control.submit(orchestrator(), params, snapshot_timeout_ms()) do
+    with {:ok, principal} <- authorize_managed(conn),
+         {:ok, response} <- Control.submit_authorized(orchestrator(), params, principal, snapshot_timeout_ms()) do
       conn |> put_status(200) |> json(response)
     else
       {:error, :unauthorized} ->
@@ -84,7 +84,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
         managed_error(conn, 503, "managed_mode_disabled", "Managed mode is disabled")
 
       {:error, code, details} when is_atom(code) ->
-        managed_error(conn, 409, Atom.to_string(code), safe_managed_message(details))
+        managed_error(conn, 409, Atom.to_string(code), safe_managed_message(details), safe_managed_details(details))
 
       {:error, reason} ->
         managed_error(conn, 400, "invalid_request", safe_managed_message(reason))
@@ -102,24 +102,21 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   end
 
   defp authorize_managed(conn) do
-    cond do
-      not loopback?(conn.remote_ip) -> {:error, :forbidden}
-      not valid_bearer?(conn) -> {:error, :unauthorized}
-      true -> :ok
-    end
+    if loopback?(conn.remote_ip), do: authenticate_bearer(conn), else: {:error, :forbidden}
   end
 
   defp loopback?({127, _, _, _}), do: true
   defp loopback?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
   defp loopback?(_), do: false
 
-  defp valid_bearer?(conn) do
+  defp authenticate_bearer(conn) do
     expected = Config.managed_control_token()
     [header | _] = get_req_header(conn, "authorization") ++ [""]
     token = String.replace_prefix(header, "Bearer ", "")
 
-    is_binary(expected) and expected != "" and byte_size(token) == byte_size(expected) and
-      Plug.Crypto.secure_compare(token, expected)
+    if String.starts_with?(header, "Bearer "),
+      do: Principal.authenticate(token, expected),
+      else: {:error, :unauthorized}
   end
 
   defp bounded_integer(nil, default, _minimum, _maximum), do: {:ok, default}
@@ -168,8 +165,28 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
-  defp managed_error(conn, status, code, message) do
-    conn |> put_status(status) |> json(%{error: %{code: code, message: message}})
+  defp managed_error(conn, status, code, message, details \\ %{}) do
+    conn |> put_status(status) |> json(%{error: %{code: code, message: message, details: details}})
+  end
+
+  defp safe_managed_details(details) when is_map(details) do
+    details
+    |> Map.take([
+      :assignment_id,
+      :project_id,
+      :current_pm_id,
+      :pm_id,
+      :owner_pm_id,
+      :responsible_pm_id,
+      :expected,
+      :actual,
+      :expected_revision,
+      :actual_revision,
+      :ownership_revision,
+      :expected_ownership_revision,
+      :argument
+    ])
+    |> Map.filter(fn {_key, value} -> is_binary(value) or is_number(value) or is_atom(value) end)
   end
 
   defp safe_managed_message(reason) when is_atom(reason), do: Atom.to_string(reason)

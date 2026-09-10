@@ -36,10 +36,10 @@ defmodule SymphonyElixir.Codex.AppServer do
           worker_host: String.t() | nil,
           dynamic_tool_binding: map(),
           managed_attempt: map() | nil,
-          model: String.t() | nil,
-          configured_model: String.t() | nil,
-          effort: String.t() | nil,
-          thread_reasoning_effort: String.t() | nil,
+          thread_model: String.t() | nil,
+          turn_model: String.t() | nil,
+          turn_effort: String.t() | nil,
+          thread_default_reasoning_effort: String.t() | nil,
           report_callback: (map() -> term()) | nil,
           permissions_profile: String.t() | nil
         }
@@ -425,10 +425,10 @@ defmodule SymphonyElixir.Codex.AppServer do
            worker_host: worker_host,
            dynamic_tool_binding: dynamic_tool_binding,
            managed_attempt: managed_attempt_identity(managed_config),
-           model: thread_info.model,
-           configured_model: route_value(wire_route, :model),
-           effort: route_value(wire_route, :effort),
-           thread_reasoning_effort: thread_info.reasoning_effort,
+           thread_model: thread_info.model,
+           turn_model: route_value(wire_route, :model),
+           turn_effort: route_value(wire_route, :effort),
+           thread_default_reasoning_effort: thread_info.default_reasoning_effort,
            report_callback: report_callback(managed_config),
            permissions_profile: permissions_profile(managed_config)
          }}
@@ -458,8 +458,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           workspace: workspace,
           dynamic_tool_binding: dynamic_tool_binding,
           managed_attempt: managed_attempt,
-          configured_model: configured_model,
-          effort: effort,
+          turn_model: turn_model,
+          turn_effort: turn_effort,
           report_callback: report_callback,
           permissions_profile: permissions_profile
         },
@@ -474,7 +474,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
       end)
 
-    route = %{model: configured_model, effort: effort}
+    route = %{model: turn_model, effort: turn_effort}
 
     case start_turn(
            port,
@@ -575,9 +575,10 @@ defmodule SymphonyElixir.Codex.AppServer do
         workspace: workspace,
         worker_host: worker_host,
         managed_attempt: managed_attempt,
-        model: model,
-        effort: effort,
-        thread_reasoning_effort: thread_reasoning_effort,
+        thread_model: thread_model,
+        turn_model: turn_model,
+        turn_effort: turn_effort,
+        thread_default_reasoning_effort: thread_default_reasoning_effort,
         permissions_profile: permissions_profile
       }) do
     %{
@@ -585,9 +586,10 @@ defmodule SymphonyElixir.Codex.AppServer do
       workspace: workspace,
       worker_host: worker_host,
       managed_attempt: managed_attempt,
-      model: model,
-      effort: effort,
-      thread_reasoning_effort: thread_reasoning_effort,
+      thread_model: thread_model,
+      turn_model: turn_model,
+      turn_effort: turn_effort,
+      thread_default_reasoning_effort: thread_default_reasoning_effort,
       permissions_profile: permissions_profile,
       metadata: metadata
     }
@@ -1489,12 +1491,12 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     with %{"id" => thread_id} <- thread_payload,
          {:ok, model} <- response_model(response, wire_route),
-         {:ok, reasoning_effort} <- response_reasoning_effort(response) do
+         {:ok, default_reasoning_effort} <- response_reasoning_effort(response) do
       {:ok,
        %{
          thread_id: thread_id,
          model: model,
-         reasoning_effort: reasoning_effort
+         default_reasoning_effort: default_reasoning_effort
        }}
     else
       nil -> {:error, {:invalid_thread_payload, thread_payload}}
@@ -1520,7 +1522,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     case Map.fetch(response, "reasoningEffort") do
       {:ok, nil} -> {:ok, nil}
       {:ok, value} when is_binary(value) -> {:ok, value}
-      {:ok, value} -> {:error, {:invalid_thread_reasoning_effort, value}}
+      {:ok, value} -> {:error, {:invalid_thread_default_reasoning_effort, value}}
       :error -> {:ok, nil}
     end
   end
@@ -1855,6 +1857,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
+        drain_interrupted_turn(port, on_message, metadata, report_thread_id, report_turn_id)
         {:stop, {:orchestration_report_terminal, report}}
 
       {:error, {:orchestration_report, reason, report_thread_id, report_turn_id}} ->
@@ -1869,6 +1872,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
+        drain_interrupted_turn(port, on_message, metadata, report_thread_id, report_turn_id)
         {:stop, {:orchestration_report_failed, reason}}
 
       {:error, {:orchestration_report, reason}} ->
@@ -2017,6 +2021,65 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp interrupt_turn(_port, _thread_id, _turn_id), do: :ok
+
+  # A report ends authorization to act, but its final usage can arrive after the
+  # tool response. Drain the interrupted turn without executing further tools.
+  defp drain_interrupted_turn(port, on_message, metadata, thread_id, turn_id) do
+    deadline = System.monotonic_time(:millisecond) + min(Config.settings!().codex.read_timeout_ms, 10_000)
+    drain_interrupted_turn(port, on_message, metadata, {thread_id, turn_id}, deadline, "")
+  end
+
+  defp drain_interrupted_turn(port, on_message, metadata, identity, deadline, pending) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      emit_message(on_message, :final_usage_incomplete, %{reason: :interrupt_drain_timeout}, metadata)
+    else
+      receive_interrupted_turn(port, on_message, metadata, identity, deadline, pending, remaining)
+    end
+  end
+
+  defp receive_interrupted_turn(port, on_message, metadata, identity, deadline, pending, remaining) do
+    receive do
+      {^port, {:data, {:eol, chunk}}} ->
+        raw = pending <> to_string(chunk)
+
+        case drain_turn_message(port, on_message, metadata, identity, raw) do
+          :complete -> emit_message(on_message, :final_usage_complete, %{}, metadata)
+          :continue -> drain_interrupted_turn(port, on_message, metadata, identity, deadline, "")
+        end
+
+      {^port, {:data, {:noeol, chunk}}} ->
+        drain_interrupted_turn(port, on_message, metadata, identity, deadline, pending <> to_string(chunk))
+
+      {^port, {:exit_status, status}} ->
+        emit_message(on_message, :final_usage_incomplete, %{reason: {:port_exit, status}}, metadata)
+    after
+      remaining ->
+        emit_message(on_message, :final_usage_incomplete, %{reason: :interrupt_drain_timeout}, metadata)
+    end
+  end
+
+  defp drain_turn_message(port, on_message, metadata, {thread_id, turn_id}, raw) do
+    case Jason.decode(raw) do
+      {:ok, %{"id" => id, "method" => _method}} ->
+        send_message(port, %{"id" => id, "error" => %{"code" => -32_000, "message" => "Worker report ended this turn"}})
+        :continue
+
+      {:ok, %{"method" => method} = payload} ->
+        emit_message(on_message, :notification, %{payload: payload, raw: raw}, metadata)
+
+        if method == "turn/completed" and get_in(payload, ["params", "threadId"]) == thread_id and
+             get_in(payload, ["params", "turn", "id"]) == turn_id do
+          :complete
+        else
+          :continue
+        end
+
+      _ ->
+        :continue
+    end
+  end
 
   defp normalize_dynamic_tool_result(%{"success" => success} = result) when is_boolean(success) do
     output =

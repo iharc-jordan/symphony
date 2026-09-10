@@ -11,6 +11,12 @@ Workspace lifecycle hooks can read bounded JSON issue identity in `SYMPHONY_ISSU
 
 The Elixir reference implementation also supports GitHub Projects as an additive tracker, using project item identity, configured status fields, and native cross-repository issue dependencies. See [the tracker configuration](elixir/README.md) for setup.
 
+The optional managed control plane supports PM-owned assignments across multiple registered
+GitHub Projects and repositories. Each assignment has one responsible PM; explicit, revision-fenced
+handoffs transfer that responsibility while preserving a healthy worker. The operational journal
+remains authoritative for ownership, and optional Project card summaries expose that state to users.
+See [managed controls](elixir/README.md#managed-control-plane).
+
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 

@@ -676,6 +676,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Operator Takeover"
     assert html =~ "Assignments assign-active"
     assert html =~ "Outcome: Complete"
+    assert html =~ ~s(href="https://github.com/org/repo-alpha/issues/11")
     assert html =~ "pm-one"
     assert html =~ "pm-two"
     refute html =~ "/workspaces/"

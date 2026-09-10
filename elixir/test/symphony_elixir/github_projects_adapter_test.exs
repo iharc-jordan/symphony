@@ -172,6 +172,72 @@ defmodule SymphonyElixir.GitHubProjects.AdapterTest do
              Client.next_page_cursor_for_test(%{"hasNextPage" => true})
   end
 
+  test "managed reads use the selected Project independently of the configured default" do
+    request_fun = fn query, variables, _settings ->
+      cond do
+        String.contains?(query, "SymphonyManagedProject") ->
+          assert variables["id"] == "PVT_2"
+          {:ok, %{status: 200, body: %{"data" => %{"node" => %{"id" => "PVT_2", "number" => 10}}}}}
+
+        String.contains?(query, "ProjectFields") ->
+          assert variables["projectId"] == "PVT_2"
+          {:ok, %{status: 200, body: fields_body()}}
+
+        String.contains?(query, "ProjectItemsById") ->
+          selected = put_in(item(2, "two", false), ["project", "id"], "PVT_2")
+          {:ok, %{status: 200, body: %{"data" => %{"nodes" => [item(1, "one", false), selected]}}}}
+
+        true ->
+          flunk("Unexpected default-Project request: #{query}")
+      end
+    end
+
+    opts = [tracker_settings: tracker_settings(), request_fun: request_fun]
+    assert {:ok, binding} = Client.fetch_project_binding("PVT_2", opts)
+    assert binding.project_number == 10
+    assert {:ok, [issue]} = Client.fetch_project_issues(binding, ["PVTI_1", "PVTI_2"], opts)
+    assert issue.native_ref["project_id"] == "PVT_2"
+    assert issue.identifier == "octo/two#2"
+
+    assert {:error, :github_projects_binding_changed} =
+             Client.fetch_project_issues(%{binding | status_field_id: "stale-field"}, ["PVTI_2"], opts)
+  end
+
+  test "projection fields must be text fields in the exact selected Project" do
+    assert :ok = Client.validate_projection_field("PVT_1", nil)
+
+    for {project_id, data_type, expected} <- [
+          {"PVT_1", "TEXT", :ok},
+          {"PVT_other", "TEXT", {:error, :github_projects_projection_field_invalid}},
+          {"PVT_1", "NUMBER", {:error, :github_projects_projection_field_invalid}}
+        ] do
+      request_fun = fn query, variables, _settings ->
+        assert String.contains?(query, "SymphonyProjectionField")
+        assert variables == %{"id" => "FIELD_summary"}
+        node = %{"id" => "FIELD_summary", "dataType" => data_type, "project" => %{"id" => project_id}}
+        {:ok, %{status: 200, body: %{"data" => %{"node" => node}}}}
+      end
+
+      opts = [tracker_settings: tracker_settings(), request_fun: request_fun]
+      assert ^expected = Client.validate_projection_field("PVT_1", "FIELD_summary", opts)
+    end
+  end
+
+  test "managed enrollment reads retain a precise missing Status error" do
+    request_fun = fn query, _variables, _settings ->
+      if String.contains?(query, "ProjectFields") do
+        {:ok, %{status: 200, body: fields_body()}}
+      else
+        missing_status = Map.put(item(1, "one", false), "fieldValueByName", nil)
+        {:ok, %{status: 200, body: %{"data" => %{"nodes" => [missing_status]}}}}
+      end
+    end
+
+    binding = %{project_id: "PVT_1", status_field_id: "PVTF_status"}
+    opts = [tracker_settings: tracker_settings(), request_fun: request_fun]
+    assert {:error, :github_projects_missing_item_status} = Client.fetch_project_issues(binding, ["PVTI_1"], opts)
+  end
+
   test "rejects malformed and repeated pagination cursors" do
     assert {:error, :github_projects_malformed_page_info} =
              Client.next_page_cursor_for_test(%{})

@@ -41,9 +41,9 @@
         "args": {
           "expected_revision": 0,
           "project": {
-            "project_id": "project-example",
-            "project_number": 4,
-            "status_field_id": "status-field-example",
+            "project_id": "PVT_one",
+            "project_number": 1,
+            "status_field_id": "status-field-one",
             "status_options": {
               "READY": "option-ready",
               "ACTIVE": "option-active",
@@ -52,16 +52,16 @@
               "WAITING": "option-waiting",
               "CANCELLED": "option-cancelled"
             },
-            "repositories": ["fixture-owner/fixture-repository"]
+            "repositories": ["acme/one"]
           }
         }
       },
       "response": {
         "operation": "bind_project",
-        "binding": {
-          "project_id": "project-example",
-          "project_number": 4,
-          "status_field_id": "status-field-example",
+        "project": {
+          "project_id": "PVT_one",
+          "project_number": 1,
+          "status_field_id": "status-field-one",
           "status_options": {
             "READY": "option-ready",
             "ACTIVE": "option-active",
@@ -70,9 +70,58 @@
             "WAITING": "option-waiting",
             "CANCELLED": "option-cancelled"
           },
-          "repositories": ["fixture-owner/fixture-repository"]
+          "repositories": ["acme/one"]
+        },
+        "binding": {
+          "project_id": "PVT_one",
+          "project_number": 1,
+          "status_field_id": "status-field-one",
+          "status_options": {
+            "READY": "option-ready",
+            "ACTIVE": "option-active",
+            "REVIEW": "option-review",
+            "ACCEPTED": "option-accepted",
+            "WAITING": "option-waiting",
+            "CANCELLED": "option-cancelled"
+          },
+          "repositories": ["acme/one"]
         },
         "revision": 1
+      }
+    },
+    "register_pm": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "register-pm-b-1",
+        "operation": "register_pm",
+        "args": {"display_name": "PM B"}
+      },
+      "response": {
+        "operation": "register_pm",
+        "principal_id": "00000000-0000-4000-8000-000000000002",
+        "registered": true
+      }
+    },
+    "claim": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "claim-fixture-1",
+        "operation": "claim",
+        "args": {
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
+          "expected_revision": 1,
+          "expected_ownership_revision": 0
+        }
+      },
+      "response": {
+        "operation": "claim",
+        "assignment_id": "item-one",
+        "revision": 1,
+        "ownership_revision": 1,
+        "phase": "ready"
       }
     },
     "enroll": {
@@ -83,24 +132,27 @@
         "operation": "enroll",
         "args": {
           "expected_revision": 1,
-          "assignment_id": "project-item-example",
-          "repository": "fixture-owner/fixture-repository",
-          "issue_number": 42,
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
+          "repository": "acme/one",
+          "issue_number": 1,
           "base_commit": "0123456789abcdef0123456789abcdef01234567",
           "board_state": "READY",
-          "owner": "fixture-owner",
-          "resources": ["repo:fixture-owner/fixture-repository"],
+          "resources": [
+            {"kind":"repository","authority":"github.com","identity":"acme/one","access":"write"}
+          ],
           "dependencies": [],
           "route": {"model": "gpt-5.6-luna", "effort": "xhigh"},
-          "requirements_fingerprint": "sha256:fixture-requirements",
+          "requirements_fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
           "requirements_revision": 1
         }
       },
       "response": {
         "operation": "enroll",
-        "assignment_id": "project-item-example",
+        "assignment_id": "item-one",
         "revision": 1,
         "phase": "ready",
+        "project_id": "PVT_one",
         "control_revision": 2
       }
     },
@@ -111,18 +163,20 @@
         "request_id": "revise-fixture-1",
         "operation": "revise",
         "args": {
-          "assignment_id": "project-item-example",
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
           "expected_revision": 1,
+          "expected_ownership_revision": 1,
           "changes": {
             "base_commit": "fedcba9876543210fedcba9876543210fedcba98",
-            "requirements_fingerprint": "sha256:fixture-requirements-2",
+            "requirements_fingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
             "requirements_revision": 2
           }
         }
       },
       "response": {
         "operation": "revise",
-        "assignment_id": "project-item-example",
+        "assignment_id": "item-one",
         "revision": 2,
         "phase": "ready"
       }
@@ -133,9 +187,22 @@
       "body": {
         "request_id": "pause-fixture-1",
         "operation": "pause",
-        "args": {"expected_revision": 2, "disable": false, "reason": "fixture pause"}
+        "args": {
+          "scope": "assignments",
+          "project_id": "PVT_one",
+          "assignments": [
+            {"assignment_id":"item-one","expected_revision":1,"expected_ownership_revision":1}
+          ],
+          "reason": "fixture pause"
+        }
       },
-      "response": {"operation": "pause", "revision": 3, "paused": true, "disabled": false}
+      "response": {
+        "operation": "pause",
+        "scope": "assignments",
+        "project_id": "PVT_one",
+        "assignment_ids": ["item-one"],
+        "revision": 3
+      }
     },
     "resume": {
       "method": "POST",
@@ -143,9 +210,22 @@
       "body": {
         "request_id": "resume-fixture-1",
         "operation": "resume",
-        "args": {"expected_revision": 3, "reason": "fixture resume"}
+        "args": {
+          "scope": "assignments",
+          "project_id": "PVT_one",
+          "assignments": [
+            {"assignment_id":"item-one","expected_revision":1,"expected_ownership_revision":1}
+          ],
+          "reason": "fixture resume"
+        }
       },
-      "response": {"operation": "resume", "revision": 4, "paused": false, "disabled": false}
+      "response": {
+        "operation": "resume",
+        "scope": "assignments",
+        "project_id": "PVT_one",
+        "assignment_ids": ["item-one"],
+        "revision": 4
+      }
     },
     "interrupt": {
       "method": "POST",
@@ -153,9 +233,15 @@
       "body": {
         "request_id": "interrupt-fixture-1",
         "operation": "interrupt",
-        "args": {"assignment_id": "project-item-example", "expected_revision": 1, "reason": "fixture interruption"}
+        "args": {
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
+          "expected_revision": 1,
+          "expected_ownership_revision": 1,
+          "reason": "fixture interruption"
+        }
       },
-      "response": {"operation": "interrupt", "assignment_id": "project-item-example", "revision": 2, "phase": "waiting", "reason": "fixture interruption"}
+      "response": {"operation": "interrupt", "assignment_id": "item-one", "revision": 2, "phase": "waiting", "reason": "fixture interruption"}
     },
     "cancel": {
       "method": "POST",
@@ -163,9 +249,15 @@
       "body": {
         "request_id": "cancel-fixture-1",
         "operation": "cancel",
-        "args": {"assignment_id": "project-item-example", "expected_revision": 1, "reason": "fixture cancellation"}
+        "args": {
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
+          "expected_revision": 1,
+          "expected_ownership_revision": 1,
+          "reason": "fixture cancellation"
+        }
       },
-      "response": {"operation": "cancel", "assignment_id": "project-item-example", "revision": 2, "phase": "cancelled", "reason": "fixture cancellation"}
+      "response": {"operation": "cancel", "assignment_id": "item-one", "revision": 2, "phase": "cancelled", "reason": "fixture cancellation"}
     },
     "review": {
       "method": "POST",
@@ -174,25 +266,61 @@
         "request_id": "review-fixture-1",
         "operation": "review",
         "args": {
-          "assignment_id": "project-item-example",
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
           "expected_revision": 1,
+          "expected_ownership_revision": 1,
           "disposition": "accepted",
           "evidence": ["https://example.invalid/evidence/fixture-1"]
         }
       },
       "response": {
         "operation": "review",
-        "assignment_id": "project-item-example",
+        "assignment_id": "item-one",
         "revision": 2,
         "phase": "accepted",
         "disposition": "accepted",
         "issue_close": "ok"
       }
     },
+    "handoff": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "handoff-fixture-1",
+        "operation": "handoff",
+        "args": {
+          "project_id": "PVT_one",
+          "assignments": [
+            {"assignment_id":"item-one","expected_revision":1,"expected_ownership_revision":1}
+          ],
+          "destination_pm_id": "00000000-0000-4000-8000-000000000002",
+          "reason": "fixture coverage"
+        }
+      },
+      "response": {
+        "operation": "handoff",
+        "handoff_id": "handoff-fixture-1",
+        "assignment_ids": ["item-one"],
+        "source_pm_id": "00000000-0000-4000-8000-000000000001",
+        "destination_pm_id": "00000000-0000-4000-8000-000000000002",
+        "target_principal_id": "00000000-0000-4000-8000-000000000002",
+        "reason": "fixture coverage",
+        "status": "complete"
+      }
+    },
     "errors": {
       "stale_revision": {
         "status": 409,
         "body": {"error": {"code": "stale_revision", "message": "Managed request failed"}}
+      },
+      "stale_ownership_revision": {
+        "status": 409,
+        "body": {"error": {"code": "stale_ownership_revision", "message": "Managed request failed"}}
+      },
+      "ownership_conflict": {
+        "status": 409,
+        "body": {"error": {"code": "ownership_conflict", "message": "Managed request failed"}}
       },
       "unauthorized": {
         "status": 401,

@@ -214,6 +214,7 @@ defmodule SymphonyElixirWeb.Presenter do
       project_id: text_value(Map.get(assignment, :project_id)),
       repository: text_value(Map.get(assignment, :repository)),
       issue_number: Map.get(assignment, :issue_number),
+      issue_url: managed_issue_url(assignment),
       title: title,
       task: %{id: text_value(Map.get(assignment, :task_uuid)), title: title},
       phase: phase_name(Map.get(assignment, :phase)),
@@ -231,6 +232,13 @@ defmodule SymphonyElixirWeb.Presenter do
       workspace: safe_workspace(assignment)
     })
   end
+
+  defp managed_issue_url(%{repository: repository, issue_number: number})
+       when is_binary(repository) and is_integer(number) and number > 0 do
+    "https://github.com/#{repository}/issues/#{number}"
+  end
+
+  defp managed_issue_url(_assignment), do: nil
 
   defp assignment_status(assignment) do
     text_value(Map.get(assignment, :status) || Map.get(assignment, :board_state) || Map.get(assignment, :phase)) || "unknown"

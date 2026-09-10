@@ -156,7 +156,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "terminal orchestration reports interrupt the active turn before unwinding" do
+  test "terminal reports drain final usage and reject further tools before unwinding" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -189,7 +189,14 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":99,"method":"item/tool/call","params":{"tool":"orchestration_report","arguments":{"kind":"result","report_id":"report-terminal","summary":"done","evidence":[]}}}'
             ;;
           6) ;;
-          7) : ;;
+          7)
+            printf '%s\\n' '{"id":5,"result":{}}'
+            printf '%s\\n' '{"id":100,"method":"item/tool/call","params":{"tool":"forbidden_after_report","arguments":{}}}'
+            ;;
+          8)
+            printf '%s\\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-terminal","tokenUsage":{"total":{"inputTokens":714937,"outputTokens":18786,"totalTokens":733723}}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-terminal","turn":{"id":"turn-terminal","status":"interrupted"}}}'
+            ;;
         esac
       done
       """)
@@ -218,6 +225,8 @@ defmodule SymphonyElixir.AppServerTest do
         attempt_id: "attempt-terminal"
       }
 
+      observer = self()
+
       assert {:error, {:orchestration_report_terminal, report}} =
                AppServer.run(
                  workspace,
@@ -226,11 +235,16 @@ defmodule SymphonyElixir.AppServerTest do
                  managed_attempt: attempt,
                  model: "gpt-5.6-luna",
                  effort: "xhigh",
-                 report_callback: fn _report -> :ok end
+                 report_callback: fn _report -> :ok end,
+                 on_message: fn event -> send(observer, {:terminal_event, event}) end,
+                 tool_executor: fn tool, _args -> flunk("Unexpected post-report tool: #{tool}") end
                )
 
       assert report.kind == "result"
       assert report.report_id == "report-terminal"
+      assert_received {:terminal_event, %{payload: %{"method" => "thread/tokenUsage/updated", "params" => %{"tokenUsage" => usage}}}}
+      assert usage["total"]["totalTokens"] == 733_723
+      refute_received {:terminal_event, %{event: :final_usage_incomplete}}
 
       payloads =
         trace_file
@@ -246,6 +260,8 @@ defmodule SymphonyElixir.AppServerTest do
                  get_in(payload, ["params", "threadId"]) == "thread-terminal" and
                  get_in(payload, ["params", "turnId"]) == "turn-terminal"
              end)
+
+      assert Enum.any?(payloads, &(&1["id"] == 100 and get_in(&1, ["error", "code"]) == -32_000))
     after
       File.rm_rf(test_root)
     end

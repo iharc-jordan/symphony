@@ -8,8 +8,9 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.GitHubProjects.Client
-  alias SymphonyElixir.Managed.{Checkout, Journal, Rules}
+  alias SymphonyElixir.Managed.{Checkout, Journal, Migration, Principal, Projection, Rules}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -133,6 +134,10 @@ defmodule SymphonyElixir.Orchestrator do
     {:reply, {:error, :managed_mode_disabled}, state}
   end
 
+  def handle_call({:managed_control, _envelope, _principal}, _from, %State{managed: nil} = state) do
+    {:reply, {:error, :managed_mode_disabled}, state}
+  end
+
   def handle_call({:managed_reconcile, _assignment_id, _facts}, _from, %State{managed: nil} = state) do
     {:reply, {:error, :managed_mode_disabled}, state}
   end
@@ -192,13 +197,254 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_call(:request_refresh, from, state), do: request_refresh_call(from, state)
 
-  def handle_call({:managed_control, envelope}, _from, %State{managed: %{data: data}} = state)
+  def handle_call({:managed_control, envelope}, from, %State{} = state) when is_map(envelope) do
+    handle_call({:managed_control, envelope, Principal.operator()}, from, state)
+  end
+
+  def handle_call({:managed_control, envelope, principal}, _from, %State{managed: %{data: data}} = state)
       when is_map(envelope) do
+    with :ok <- Rules.authorize(data, envelope, principal),
+         {:ok, enrollment_context} <- validate_managed_enrollment(state, envelope) do
+      scoped_state = %{state | managed: Map.put(state.managed, :control_context, Map.merge(principal, enrollment_context))}
+      {:reply, response, next_state} = route_managed_control(scoped_state, envelope)
+      {:reply, response, %{next_state | managed: Map.delete(next_state.managed, :control_context)}}
+    else
+      {:error, code, details} -> {:reply, {:error, code, details}, state}
+    end
+  end
+
+  defp route_managed_control(%State{managed: %{data: data}} = state, envelope) do
     cond do
       managed_binding_envelope?(envelope) -> handle_managed_binding_control(state, envelope)
       managed_review_envelope?(envelope) -> handle_managed_review_control(state, envelope)
       managed_transition_envelope?(envelope) -> handle_managed_transition_control(state, envelope)
+      managed_operator_takeover_envelope?(envelope) -> handle_managed_operator_takeover(state, envelope)
       true -> apply_managed_control(state, envelope, managed_rules_context(data, envelope))
+    end
+  end
+
+  defp managed_operator_takeover_envelope?(envelope) when is_map(envelope) do
+    map_value(envelope, :operation) in [:operator_takeover, "operator_takeover"]
+  end
+
+  # Operator takeover is the explicit recovery boundary for a stale worker.
+  # Validate the complete takeover envelope before touching any recorded process,
+  # then stop only WAITING assignments whose runtime is no longer tracked.
+  defp handle_managed_operator_takeover(%State{} = state, envelope) do
+    case apply_managed_rules(state, envelope, %{effects_reconciled: true}) do
+      {:duplicate, response} ->
+        {:reply, {:ok, Map.put(response, :duplicate, true)}, state}
+
+      {:error, code, details} ->
+        {:reply, {:error, code, details}, state}
+
+      {:ok, _preview, _response} ->
+        assignment_ids = managed_operator_takeover_assignment_ids(envelope)
+
+        case reconcile_operator_takeover_processes(state, assignment_ids) do
+          {:ok, reconciled_state, stopped_ids} ->
+            context =
+              reconciled_state.managed.data
+              |> managed_rules_context_for_assignment_ids(assignment_ids)
+              |> Map.put(:stopped_assignment_ids, stopped_ids)
+
+            apply_managed_control(reconciled_state, envelope, context)
+
+          {:error, reason} ->
+            {:reply, {:error, :managed_process_stop_unconfirmed, %{reason: reason}}, state}
+        end
+    end
+  end
+
+  defp managed_operator_takeover_assignment_ids(envelope) do
+    envelope
+    |> map_value(:args)
+    |> map_value(:assignments)
+    |> Enum.map(&map_value(&1, :assignment_id))
+  end
+
+  defp managed_rules_context_for_assignment_ids(data, assignment_ids) do
+    reconciliations = data[:external_reconciliations] || %{}
+
+    assignment_ids
+    |> Enum.reduce(%{}, fn id, context ->
+      case Map.get(reconciliations, id) do
+        reconciliation when is_map(reconciliation) -> Map.merge(context, reconciliation)
+        _ -> context
+      end
+    end)
+  end
+
+  defp reconcile_operator_takeover_processes(%State{} = state, assignment_ids) do
+    stale_ids =
+      Enum.filter(assignment_ids, fn assignment_id ->
+        case get_in(state.managed.data, [:assignments, assignment_id]) do
+          assignment when is_map(assignment) ->
+            assignment[:phase] == :waiting and assignment[:stop_pending] == true and
+              not Map.has_key?(state.running, assignment_id)
+
+          _ ->
+            false
+        end
+      end)
+
+    Enum.reduce_while(stale_ids, {:ok, state, []}, fn assignment_id, {:ok, current_state, stopped_ids} ->
+      case reconcile_one_operator_takeover_process(current_state, assignment_id) do
+        {:ok, next_state} -> {:cont, {:ok, next_state, [assignment_id | stopped_ids]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> persist_operator_takeover_process_proof()
+  end
+
+  defp reconcile_one_operator_takeover_process(state, assignment_id) do
+    metadata = get_in(state.managed.data, [:assignments, assignment_id, :metadata])
+
+    with :ok <- stop_recorded_managed_process(state, metadata),
+         facts = %{
+           stop_reconciled: true,
+           process_stopped: true,
+           process_stop: %{authority: :codex_app_server, status: :verified_absent}
+         },
+         {:ok, next_data, _response} <- record_managed_reconciliation(state.managed.data, assignment_id, facts) do
+      {:ok, %{state | managed: Map.put(state.managed, :data, next_data)}}
+    else
+      {:error, code, details} -> {:error, {code, details}}
+      {:error, reason} -> {:error, {assignment_id, reason}}
+    end
+  end
+
+  defp persist_operator_takeover_process_proof({:ok, state, stopped_ids}) do
+    case stopped_ids do
+      [] ->
+        {:ok, state, []}
+
+      _ ->
+        case persist_managed_data(state, state.managed.data) do
+          {:ok, persisted} -> {:ok, persisted, Enum.reverse(stopped_ids)}
+          {:error, reason} -> {:error, {:managed_journal_write_failed, reason}}
+        end
+    end
+  end
+
+  defp persist_operator_takeover_process_proof({:error, reason}), do: {:error, reason}
+
+  defp stop_recorded_managed_process(%State{managed: managed}, metadata) when is_map(metadata) do
+    stopper = Map.get(managed, :process_stopper, &AppServer.stop_recorded_process/1)
+
+    if is_function(stopper, 1) do
+      try do
+        stopper.(metadata)
+      rescue
+        error -> {:error, {:process_stopper_exception, Exception.message(error)}}
+      catch
+        kind, reason -> {:error, {:process_stopper_exit, kind, reason}}
+      end
+    else
+      {:error, :recorded_process_stopper_unavailable}
+    end
+  end
+
+  defp stop_recorded_managed_process(_state, _metadata), do: {:error, :recorded_process_metadata_missing}
+
+  defp managed_principal_context(state), do: Map.get(state.managed, :control_context, %{})
+
+  defp apply_managed_rules(state, envelope, context) do
+    Rules.apply(state.managed.data, envelope, Map.merge(managed_principal_context(state), context))
+  end
+
+  defp prepare_managed_review(state, envelope, context \\ %{}) do
+    principal_context = Map.merge(managed_principal_context(state), context)
+
+    case Rules.prepare_review(state.managed.data, envelope, principal_context) do
+      {:ok, intent} ->
+        {:ok, intent |> Map.put(:principal_context, principal_context) |> Map.put(:binding, managed_assignment_binding(state, intent.assignment))}
+
+      result ->
+        result
+    end
+  end
+
+  defp validate_managed_enrollment(state, envelope) do
+    if map_value(envelope, :operation) in [:enroll, "enroll"] and managed_source_fetch_enabled?() and
+         not Map.has_key?(state.managed.data.requests, map_value(envelope, :request_id)) do
+      args = map_value(envelope, :args) || %{}
+      project_id = map_value(args, :project_id)
+      binding = get_in(state.managed.data, [:projects, project_id])
+      assignment_id = map_value(args, :assignment_id)
+
+      with true <- is_map(binding),
+           {:ok, [%Issue{} = issue]} <- fetch_managed_enrollment_source(state, binding, assignment_id),
+           :ok <- managed_source_identity_matches?(atomize_enrollment_identity(args), issue),
+           :ok <- managed_source_material_matches?(atomize_enrollment_identity(args), issue),
+           true <- issue.dispatchable == true and issue_state_ready?(issue.state) do
+        identity = %{
+          native_issue_id: source_native_value(issue, :issue_id),
+          native_repository_id: source_native_repository_id(issue),
+          title: issue.title,
+          issue_url: issue.url,
+          requirements_fingerprint: managed_material_fingerprint(issue.description)
+        }
+
+        {:ok, %{source_identity: identity}}
+      else
+        false ->
+          {:error, :managed_enrollment_not_ready, %{project_id: project_id, assignment_id: assignment_id}}
+
+        {:ok, []} ->
+          {:error, :managed_project_item_not_found, %{project_id: project_id, assignment_id: assignment_id}}
+
+        {:error, :github_projects_missing_item_status} ->
+          {:error, :managed_project_status_required, %{project_id: project_id, assignment_id: assignment_id}}
+
+        {:error, reason} when is_atom(reason) ->
+          {:error, reason, %{assignment_id: assignment_id}}
+
+        {:error, _reason} ->
+          {:error, :managed_enrollment_fetch_failed, %{assignment_id: assignment_id}}
+
+        _ ->
+          {:error, :managed_project_item_ambiguous, %{assignment_id: assignment_id}}
+      end
+    else
+      {:ok, %{}}
+    end
+  end
+
+  defp fetch_managed_enrollment_source(state, binding, assignment_id) do
+    case state.managed[:source_fetcher] do
+      fetcher when is_function(fetcher, 1) -> safe_managed_source_fetch(fetcher, [assignment_id])
+      _ -> Client.fetch_project_issues(binding, [assignment_id])
+    end
+  end
+
+  defp atomize_enrollment_identity(args) do
+    Map.new(
+      [
+        :assignment_id,
+        :project_item_id,
+        :repository,
+        :issue_number,
+        :native_issue_id,
+        :native_repository_id,
+        :requirements_fingerprint
+      ],
+      fn key -> {key, map_value(args, key)} end
+    )
+  end
+
+  defp managed_assignment_binding(%State{managed: %{data: data}}, assignment) when is_map(assignment) do
+    get_in(data, [:projects, assignment[:project_id]])
+  end
+
+  defp managed_assignment_binding(_state, _assignment), do: nil
+
+  defp managed_binding_unchanged(state, assignment, binding) do
+    if managed_assignment_binding(state, assignment) == binding do
+      :ok
+    else
+      details = Map.take(assignment, [:assignment_id, :project_id])
+      {:error, :managed_project_binding_changed, details}
     end
   end
 
@@ -363,17 +609,88 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
 
+  def handle_info(:sync_managed_projections, state), do: {:noreply, start_managed_projections(state)}
+
+  def handle_info({:managed_projection_result, id, revision, result}, %State{managed: %{data: data}} = state) do
+    managed = Map.update(state.managed, :projection_inflight, MapSet.new(), &MapSet.delete(&1, id))
+    state = %{state | managed: managed}
+    next_data = Projection.finish(data, id, revision, result)
+
+    next_state =
+      case persist_managed_data(state, next_data) do
+        {:ok, persisted} -> persisted
+        {:error, _reason} -> state
+      end
+
+    send(self(), :sync_managed_projections)
+    notify_dashboard()
+    {:noreply, next_state}
+  end
+
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
   end
 
+  defp start_managed_projections(%State{managed: %{data: data}} = state) do
+    inflight = Map.get(state.managed, :projection_inflight, MapSet.new())
+
+    data
+    |> Projection.ready()
+    |> Enum.reject(fn {id, _assignment} -> MapSet.member?(inflight, id) end)
+    |> Enum.take(max(2 - MapSet.size(inflight), 0))
+    |> Enum.reduce(state, &start_managed_projection(&2, &1))
+  end
+
+  defp start_managed_projections(state), do: state
+
+  defp start_managed_projection(state, {id, assignment}) do
+    recipient = self()
+    binding = managed_assignment_binding(state, assignment)
+    text = Projection.text(state.managed.data, assignment)
+    revision = assignment.projection.revision
+    effects = state.managed.effects
+
+    if Code.ensure_loaded?(effects) and function_exported?(effects, :project_summary, 3) do
+      task = fn ->
+        result =
+          try do
+            effects.project_summary(assignment, binding, text)
+          rescue
+            _ -> {:error, :projection_failed}
+          catch
+            _, _ -> {:error, :projection_failed}
+          end
+
+        send(recipient, {:managed_projection_result, id, revision, result})
+      end
+
+      case Task.Supervisor.start_child(state.task_supervisor, task) do
+        {:ok, _pid} ->
+          %{state | managed: Map.update(state.managed, :projection_inflight, MapSet.new([id]), &MapSet.put(&1, id))}
+
+        {:error, _reason} ->
+          send(self(), {:managed_projection_result, id, revision, {:error, :projection_unavailable}})
+          state
+      end
+    else
+      state
+    end
+  end
+
   defp managed_maybe_dispatch(%State{managed: %{data: data}} = state) do
+    state = start_managed_projections(state)
+
     if data.paused == true or data.disabled == true or available_slots(state) <= 0 or
          managed_usage_exhausted?(data) do
       state
     else
-      case Tracker.fetch_issues_by_states(["READY"]) do
+      ready_ids =
+        data.assignments
+        |> Enum.filter(fn {_id, assignment} -> managed_dispatch_enabled?(assignment) and assignment[:phase] == :ready end)
+        |> Enum.map(&elem(&1, 0))
+
+      case fetch_issues_for_state(state, ready_ids) do
         {:ok, issues} ->
           Enum.reduce(issues, state, &managed_dispatch_candidate(&2, &1))
 
@@ -390,9 +707,10 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(issue_id) do
     case get_in(state.managed, [:data, :assignments, issue_id]) do
       %{phase: :ready, board_state: :ready} = assignment ->
-        if available_slots(state) > 0 and
+        if available_slots(state) > 0 and managed_dispatch_enabled?(assignment) and
              managed_issue_matches_assignment?(issue, assignment) and
              managed_dependencies_ready?(state.managed.data, assignment, issue) and
+             Rules.resources_available?(state.managed.data, assignment) and
              not Map.has_key?(state.running, issue_id) do
           managed_start_assignment(state, issue, assignment)
         else
@@ -405,6 +723,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp managed_dispatch_candidate(state, _issue), do: state
+
+  defp managed_dispatch_enabled?(assignment) do
+    assignment[:dispatch_paused] != true and assignment[:operator_reconciliation_required] != true and
+      get_in(assignment, [:ownership, :status]) == :owned
+  end
 
   defp managed_issue_matches_assignment?(%Issue{} = issue, assignment) do
     repository =
@@ -624,9 +947,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp managed_apply_provider_transition(%State{managed: %{effects: module}} = state, assignment, target)
        when is_atom(module) and is_map(assignment) and is_atom(target) do
     with true <- Code.ensure_loaded?(module) and function_exported?(module, :transition, 3),
-         {:ok, intent_state, intent_id} <- ensure_managed_transition_intent(state, assignment, target) do
+         {:ok, intent_state, intent_id} <- ensure_managed_transition_intent(state, assignment, target),
+         binding <- get_in(intent_state.managed.data, [:effect_intents, intent_id, :binding]),
+         :ok <- managed_binding_unchanged(intent_state, assignment, binding) do
       context = %{
-        binding: intent_state.managed.data[:binding],
+        binding: binding,
         process_stopped: not Map.has_key?(intent_state.running, assignment.assignment_id)
       }
 
@@ -635,8 +960,11 @@ defmodule SymphonyElixir.Orchestrator do
       false ->
         {:error, state, {:managed_provider_effects_unavailable, %{}}}
 
-      {:error, state, reason} ->
-        {:error, state, reason}
+      {:error, %State{} = failed_state, reason} ->
+        {:error, failed_state, reason}
+
+      {:error, code, details} ->
+        {:error, state, {code, details}}
     end
   end
 
@@ -721,6 +1049,8 @@ defmodule SymphonyElixir.Orchestrator do
           assignment_id: assignment.assignment_id,
           target: target,
           revision: assignment[:revision],
+          binding: managed_assignment_binding(state, assignment),
+          project_id: assignment[:project_id],
           auto: true,
           status: :pending,
           at: DateTime.utc_now()
@@ -826,6 +1156,7 @@ defmodule SymphonyElixir.Orchestrator do
       if is_map(assignment) do
         assignment
         |> Map.put(:resume_ready, false)
+        |> Map.put(:worker_active, true)
         |> Map.put(:pending_effect, %{
           kind: :start,
           status: :started,
@@ -932,6 +1263,8 @@ defmodule SymphonyElixir.Orchestrator do
                 :external_effects,
                 :reconciled,
                 :stop_reconciled,
+                :process_stopped,
+                :process_stop,
                 :review_request_id,
                 :observed_issue_id,
                 :observed_project_item_id
@@ -1097,13 +1430,22 @@ defmodule SymphonyElixir.Orchestrator do
          thread_id when is_binary(thread_id) <- map_value(info, :thread_id) do
       patch =
         info
-        |> Map.take([:thread_id, :workspace, :worker_host, :model, :effort, :thread_reasoning_effort, :metadata])
+        |> Map.take([
+          :thread_id,
+          :workspace,
+          :worker_host,
+          :thread_model,
+          :turn_model,
+          :turn_effort,
+          :thread_default_reasoning_effort,
+          :metadata
+        ])
         |> Map.put(:session_id, thread_id)
         |> Map.put(:pending_effect, %{kind: :start, status: :session_started, thread_id: thread_id})
 
       data =
         data
-        |> put_in([:assignments, assignment_id], Map.merge(assignment, patch))
+        |> put_in([:assignments, assignment_id], Map.merge(Map.delete(assignment, :thread_reasoning_effort), patch))
         |> append_managed_event(%{operation: :session_started, assignment_id: assignment_id, thread_id: thread_id})
 
       {:ok, data}
@@ -1280,9 +1622,7 @@ defmodule SymphonyElixir.Orchestrator do
         {:ok, state, :unchanged}
 
       true ->
-        fetcher = Map.get(state.managed, :source_fetcher, &Tracker.fetch_issues_by_ids/1)
-
-        case safe_managed_source_fetch(fetcher, [assignment_id]) do
+        case fetch_issues_for_state(state, [assignment_id]) do
           {:ok, [%Issue{} = issue]} ->
             managed_reconcile_source_issue(state, assignment, issue)
 
@@ -1318,6 +1658,34 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp safe_managed_source_fetch(_fetcher, _ids), do: {:error, :managed_source_fetcher_unavailable}
+
+  defp fetch_issues_for_state(_state, []), do: {:ok, []}
+
+  defp fetch_issues_for_state(%State{managed: nil}, ids), do: Tracker.fetch_issues_by_ids(ids)
+
+  defp fetch_issues_for_state(%State{managed: managed} = state, ids) do
+    cond do
+      is_function(managed[:source_fetcher], 1) -> safe_managed_source_fetch(managed.source_fetcher, ids)
+      managed_source_fetch_enabled?() -> fetch_managed_project_groups(state, ids)
+      true -> Tracker.fetch_issues_by_ids(ids)
+    end
+  end
+
+  defp fetch_managed_project_groups(state, ids) do
+    ids
+    |> Enum.group_by(fn id -> get_in(state.managed.data, [:assignments, id, :project_id]) end)
+    |> Enum.reduce_while({:ok, []}, fn {project_id, project_ids}, {:ok, all} ->
+      binding = get_in(state.managed.data, [:projects, project_id])
+
+      case fetch_managed_project_group(binding, project_ids) do
+        {:ok, issues} -> {:cont, {:ok, all ++ issues}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp fetch_managed_project_group(binding, ids) when is_map(binding), do: Client.fetch_project_issues(binding, ids)
+  defp fetch_managed_project_group(_binding, _ids), do: {:error, :managed_project_not_bound}
 
   defp managed_reconcile_source_issue(%State{} = state, assignment, %Issue{} = issue) do
     with :ok <- managed_source_identity_matches?(assignment, issue),
@@ -1532,8 +1900,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp recover_managed_reviews(state), do: state
 
   defp recover_managed_review_intent({_request_id, intent}, state) do
-    case Rules.prepare_review(state.managed.data, intent.request) do
-      {:ok, prepared} -> recover_prepared_managed_review(state, prepared)
+    case prepare_managed_review(state, intent.request, intent[:principal_context] || %{}) do
+      {:ok, prepared} -> recover_prepared_managed_review(state, Map.put(prepared, :binding, intent[:binding]))
       {:duplicate, _response} -> recover_duplicate_managed_review(state, intent)
       {:error, _code, _details} -> state
     end
@@ -1712,9 +2080,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp managed_validate_binding(%State{} = _state, envelope) do
     args = map_value(envelope, :args) || %{}
     requested = map_value(args, :project) || args
+    project_id = map_value(requested, :project_id)
+    projection_field_id = map_value(requested, :projection_field_id)
 
-    with {:ok, configured} <- Client.fetch_configured_binding(),
-         :ok <- compare_managed_binding(requested, configured) do
+    with {:ok, configured} <- Client.fetch_project_binding(project_id),
+         :ok <- compare_managed_binding(requested, configured),
+         :ok <- Client.validate_projection_field(project_id, projection_field_id) do
       :ok
     else
       {:error, code, details} -> {:error, code, details}
@@ -1761,10 +2132,20 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp transition_target(envelope) do
     case Map.get(envelope, :operation, Map.get(envelope, "operation")) do
-      operation when operation in [:revise, "revise"] -> :ready
-      operation when operation in [:interrupt, "interrupt"] -> :waiting
-      operation when operation in [:cancel, "cancel"] -> :cancelled
-      _ -> nil
+      operation when operation in [:revise, "revise"] ->
+        :ready
+
+      operation when operation in [:interrupt, "interrupt"] ->
+        :waiting
+
+      operation when operation in [:cancel, "cancel"] ->
+        :cancelled
+
+      operation when operation in [:review, "review"] ->
+        if map_value(map_value(envelope, :args) || %{}, :disposition) in [:rework, "rework"], do: :ready, else: :waiting
+
+      _ ->
+        nil
     end
   end
 
@@ -1799,7 +2180,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp completed_managed_transition_response(state, envelope, request_id) do
-    case Rules.apply(state.managed.data, envelope, %{stop_reconciled: true}) do
+    case apply_managed_rules(state, envelope, %{stop_reconciled: true}) do
       {:duplicate, response} -> {:reply, {:ok, Map.put(response, :duplicate, true)}, state}
       {:error, code, details} -> {:reply, {:error, code, details}, state}
       {:ok, _data, _response} -> {:reply, {:error, :request_id_conflict, %{request_id: request_id}}, state}
@@ -1810,7 +2191,7 @@ defmodule SymphonyElixir.Orchestrator do
     # The preview validates the request. Its phase mutation is kept out of the
     # journal until the owned process has stopped and the provider effect has
     # reconciled.
-    case Rules.apply(state.managed.data, envelope, %{stop_reconciled: true}) do
+    case apply_managed_rules(state, envelope, %{stop_reconciled: true}) do
       {:duplicate, response} ->
         {:reply, {:ok, Map.put(response, :duplicate, true)}, state}
 
@@ -1819,7 +2200,14 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:ok, _preview, response} ->
         running? = Map.has_key?(state.running, assignment_id)
-        intent = managed_transition_intent(envelope, assignment_id, target, request_id, running?)
+
+        intent =
+          managed_transition_intent(envelope, assignment_id, target, request_id, running?)
+          |> Map.update!(:context, &Map.merge(managed_principal_context(state), &1))
+          |> Map.put(:principal_context, managed_principal_context(state))
+          |> Map.put(:binding, managed_assignment_binding(state, assignment))
+          |> Map.put(:ownership_revision, get_in(assignment, [:ownership, :ownership_revision]))
+
         persist_managed_transition_intent(state, assignment, intent, response, running?)
     end
   end
@@ -1883,17 +2271,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp execute_managed_transition(%State{} = state, assignment, intent, _response) do
-    with {:ok, provider_assignment} <- managed_transition_provider_assignment(state, assignment, intent),
+    with :ok <- managed_binding_unchanged(state, assignment, intent[:binding]),
+         {:ok, provider_assignment} <- managed_transition_provider_assignment(state, assignment, intent),
          {:ok, reconciled_state} <- managed_apply_provider_transition(state, provider_assignment, intent.target) do
       commit_managed_transition(reconciled_state, intent)
     else
-      {:error, failed_state, reason} -> fail_managed_transition(failed_state, intent, reason)
+      {:error, %State{} = failed_state, reason} -> fail_managed_transition(failed_state, intent, reason)
       {:error, reason} -> fail_managed_transition(state, intent, reason)
+      {:error, code, details} -> fail_managed_transition(state, intent, {code, details})
     end
   end
 
-  defp managed_transition_provider_assignment(state, assignment, %{request: request, assignment_id: assignment_id}) do
-    case Rules.apply(state.managed.data, request, %{stop_reconciled: true}) do
+  defp managed_transition_provider_assignment(state, assignment, %{request: request, assignment_id: assignment_id} = intent) do
+    context = Map.put(intent[:principal_context] || %{}, :stop_reconciled, true)
+
+    case apply_managed_rules(state, request, context) do
       {:ok, preview, _response} ->
         if map_value(request, :operation) in [:revise, "revise"],
           do: {:ok, Map.fetch!(preview.assignments, assignment_id)},
@@ -1911,7 +2303,7 @@ defmodule SymphonyElixir.Orchestrator do
     context =
       Map.put(intent.context, :stop_reconciled, managed_process_stopped_for_envelope?(state, intent.request))
 
-    case Rules.apply(state.managed.data, intent.request, context) do
+    case apply_managed_rules(state, intent.request, context) do
       {:ok, committed_data, committed_response} ->
         persist_committed_managed_transition(state, intent, committed_data, committed_response)
 
@@ -1929,6 +2321,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> put_in([:effect_intents, intent.request_id, :status], :committed)
       |> put_in([:effect_intents, intent.request_id, :committed_at], DateTime.utc_now())
       |> retire_obsolete_managed_auto_intents(intent)
+      |> complete_legacy_reconciliation(intent.assignment_id, intent.request_id)
       |> append_managed_event(%{
         operation: :provider_transition_committed,
         request_id: intent.request_id,
@@ -1943,6 +2336,31 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
     end
+  end
+
+  defp complete_legacy_reconciliation(data, assignment_id, request_id) do
+    assignment = get_in(data, [:assignments, assignment_id])
+    legacy_resources = Enum.any?(assignment[:resources] || [], &(map_value(&1, :authority) == "legacy"))
+
+    if assignment[:operator_reconciliation_required] == true and not legacy_resources do
+      data
+      |> put_in([:assignments, assignment_id, :operator_reconciliation_required], false)
+      |> Map.update(:effect_intents, %{}, &retire_legacy_intents(&1, assignment_id, request_id))
+      |> Map.update(:review_intents, %{}, &retire_legacy_intents(&1, assignment_id, request_id))
+    else
+      data
+    end
+  end
+
+  defp retire_legacy_intents(intents, assignment_id, request_id) do
+    Map.new(intents, fn {id, intent} ->
+      if intent[:assignment_id] == assignment_id and intent[:legacy_intent] == true and
+           intent[:status] == :needs_operator_reconciliation do
+        {id, Map.merge(intent, %{status: :superseded, reconciled_by: request_id})}
+      else
+        {id, intent}
+      end
+    end)
   end
 
   defp retire_obsolete_managed_auto_intents(data, %{request: request, assignment_id: assignment_id})
@@ -2027,12 +2445,12 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp apply_managed_control(%State{managed: %{journal: journal, data: data}} = state, envelope, context) do
-    case Rules.apply(data, envelope, context) do
+  defp apply_managed_control(%State{} = state, envelope, context) do
+    case apply_managed_rules(state, envelope, context) do
       {:ok, next_data, response} ->
-        case Journal.append(journal, next_data) do
-          :ok ->
-            {:reply, {:ok, response}, %{state | managed: %{state.managed | data: next_data}}}
+        case persist_managed_data(state, next_data) do
+          {:ok, next_state} ->
+            {:reply, {:ok, response}, next_state}
 
           {:error, reason} ->
             {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
@@ -2047,7 +2465,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_managed_review_control(%State{} = state, envelope) do
-    case Rules.prepare_review(state.managed.data, envelope) do
+    case prepare_managed_review(state, envelope) do
       {:duplicate, response} ->
         {:reply, {:ok, Map.put(response, :duplicate, true)}, state}
 
@@ -2055,7 +2473,7 @@ defmodule SymphonyElixir.Orchestrator do
         {:reply, {:error, code, details}, state}
 
       {:ok, %{requires_effects: false}} ->
-        apply_managed_control(state, envelope, %{})
+        handle_managed_transition_control(state, envelope)
 
       {:ok, intent} ->
         begin_managed_review(state, intent)
@@ -2075,40 +2493,53 @@ defmodule SymphonyElixir.Orchestrator do
         apply_managed_control(state, request, %{})
 
       true ->
-        data =
-          state.managed.data
-          |> Map.put(
-            :review_intents,
-            Map.put(state.managed.data[:review_intents] || %{}, request_id, %{
-              request_id: request_id,
-              canonical: intent.canonical,
-              request: request,
-              assignment_id: request.args.assignment_id,
-              revision: intent.assignment.revision,
-              status: :pending,
-              at: DateTime.utc_now()
-            })
-          )
-          |> append_managed_event(%{
-            operation: :review_intent,
-            request_id: request_id,
-            assignment_id: request.args.assignment_id,
-            revision: intent.assignment.revision,
-            phase: :review_pending
-          })
+        persist_new_managed_review(state, intent, request, request_id)
+    end
+  end
 
-        case persist_managed_data(state, data) do
-          {:ok, intent_state} ->
-            execute_managed_review(intent_state, intent)
+  defp persist_new_managed_review(state, intent, request, request_id) do
+    data =
+      state.managed.data
+      |> Map.put(
+        :review_intents,
+        Map.put(state.managed.data[:review_intents] || %{}, request_id, %{
+          request_id: request_id,
+          canonical: intent.canonical,
+          request: request,
+          assignment_id: request.args.assignment_id,
+          revision: intent.assignment.revision,
+          ownership_revision: get_in(intent.assignment, [:ownership, :ownership_revision]),
+          principal_context: intent[:principal_context] || managed_principal_context(state),
+          binding: managed_assignment_binding(state, intent.assignment),
+          status: :pending,
+          at: DateTime.utc_now()
+        })
+      )
+      |> append_managed_event(%{
+        operation: :review_intent,
+        request_id: request_id,
+        assignment_id: request.args.assignment_id,
+        revision: intent.assignment.revision,
+        phase: :review_pending
+      })
 
-          {:error, reason} ->
-            {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
-        end
+    case persist_managed_data(state, data) do
+      {:ok, intent_state} ->
+        execute_managed_review(intent_state, intent)
+
+      {:error, reason} ->
+        {:reply, {:error, :managed_journal_write_failed, %{reason: inspect(reason)}}, state}
     end
   end
 
   defp execute_managed_review(%State{} = state, intent) do
-    case managed_review_effects(state, intent) do
+    result =
+      with :ok <- managed_binding_unchanged(state, intent.assignment, intent[:binding]),
+           :ok <- Rules.authorize(state.managed.data, intent.request, intent[:principal_context] || %{}) do
+        managed_review_effects(state, intent)
+      end
+
+    case result do
       {:ok, facts} ->
         commit_managed_review(state, intent, facts)
 
@@ -2126,7 +2557,8 @@ defmodule SymphonyElixir.Orchestrator do
     with {:ok, reconciled_data, _reconcile_response} <-
            record_managed_reconciliation(state.managed.data, intent.assignment.assignment_id, facts),
          {:ok, reconciled_state} <- persist_managed_data(state, reconciled_data),
-         {:ok, next_data, response} <- Rules.apply(reconciled_data, intent.request, facts) do
+         {:ok, next_data, response} <-
+           apply_managed_rules(reconciled_state, intent.request, Map.merge(intent[:principal_context] || %{}, facts)) do
       complete_and_persist_managed_review(reconciled_state, next_data, intent, response)
     else
       {:duplicate, response} -> {:reply, {:ok, Map.put(response, :duplicate, true)}, state}
@@ -2136,7 +2568,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp complete_and_persist_managed_review(state, data, intent, response) do
-    completed_data = complete_managed_review_intent(data, intent.request.request_id)
+    completed_data =
+      data
+      |> complete_managed_review_intent(intent.request.request_id)
+      |> complete_legacy_reconciliation(intent.assignment.assignment_id, intent.request.request_id)
 
     case persist_managed_data(state, completed_data) do
       {:ok, final_state} ->
@@ -2147,10 +2582,10 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp managed_review_effects(%State{managed: %{effects: module, data: data}} = state, intent)
+  defp managed_review_effects(%State{managed: %{effects: module}} = state, intent)
        when is_atom(module) do
     if managed_review_available?(module) do
-      call_managed_review_effect(state, module, data, intent)
+      call_managed_review_effect(state, module, intent)
     else
       {:error, :managed_review_effects_unavailable, %{}}
     end
@@ -2163,11 +2598,11 @@ defmodule SymphonyElixir.Orchestrator do
       (function_exported?(module, :review, 3) or function_exported?(module, :review, 2))
   end
 
-  defp call_managed_review_effect(state, module, data, intent) do
+  defp call_managed_review_effect(state, module, intent) do
     result =
       if function_exported?(module, :review, 3) do
         module.review(intent.assignment, intent.request.args, %{
-          binding: data[:binding],
+          binding: intent[:binding],
           process_stopped: not Map.has_key?(state.running, intent.assignment.assignment_id)
         })
       else
@@ -2240,9 +2675,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp persist_managed_data(%State{managed: %{journal: journal}} = state, data) do
-    case Journal.append(journal, data) do
-      :ok -> {:ok, %{state | managed: %{state.managed | data: data}}}
-      {:error, reason} -> {:error, reason}
+    updated = Projection.mark_changes(state.managed.data, data)
+
+    case Journal.append(journal, updated) do
+      :ok ->
+        if updated != data, do: send(self(), :sync_managed_projections)
+        {:ok, %{state | managed: %{state.managed | data: updated}}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -2319,7 +2760,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     updated =
       assignment
-      |> Map.merge(%{phase: phase, board_state: board_state, pending_effect: pending_effect})
+      |> Map.merge(%{phase: phase, board_state: board_state, pending_effect: pending_effect, worker_active: false})
       |> maybe_put_managed(
         :retry_count,
         if(retrying?, do: (assignment[:retry_count] || 0) + 1, else: assignment[:retry_count])
@@ -2329,6 +2770,7 @@ defmodule SymphonyElixir.Orchestrator do
         input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
         output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
         total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+        telemetry_complete: Map.get(running_entry, :codex_usage_complete),
         seconds_running: running_seconds(Map.get(running_entry, :started_at), DateTime.utc_now())
       })
       |> maybe_put_managed(:stop_pending, stop_pending)
@@ -2629,7 +3071,7 @@ defmodule SymphonyElixir.Orchestrator do
     if running_ids == [] do
       state
     else
-      case Tracker.fetch_issues_by_ids(running_ids) do
+      case fetch_issues_for_state(state, running_ids) do
         {:ok, issues} ->
           issues
           |> reconcile_running_issue_states(
@@ -2653,7 +3095,7 @@ defmodule SymphonyElixir.Orchestrator do
     if blocked_ids == [] do
       state
     else
-      case Tracker.fetch_issues_by_ids(blocked_ids) do
+      case fetch_issues_for_state(state, blocked_ids) do
         {:ok, issues} ->
           issues
           |> reconcile_blocked_issue_states(
@@ -3326,10 +3768,10 @@ defmodule SymphonyElixir.Orchestrator do
     error -> {:error, {:managed_checkout_configuration_invalid, Exception.message(error)}}
   end
 
-  defp managed_run_options(%State{managed: %{data: data}} = _state, %Issue{id: issue_id} = issue) do
+  defp managed_run_options(%State{managed: %{data: data}} = state, %Issue{id: issue_id} = issue) do
     case managed_attempt_for_issue(%State{managed: %{data: data}}, issue_id) do
       %{assignment_id: ^issue_id} = attempt ->
-        build_managed_run_options(data, issue, attempt)
+        build_managed_run_options(state, issue, attempt)
 
       _ ->
         []
@@ -3338,7 +3780,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp managed_run_options(_state, _issue), do: []
 
-  defp build_managed_run_options(data, issue, attempt) do
+  defp build_managed_run_options(%State{managed: %{data: data}} = state, issue, attempt) do
     owner = self()
     assignment = get_in(data, [:assignments, issue.id])
     checkout_options = managed_checkout_options_or_empty()
@@ -3353,10 +3795,25 @@ defmodule SymphonyElixir.Orchestrator do
         effort: attempt[:effort],
         escalation_reason: attempt[:escalation_reason],
         workspace_preparer: workspace_preparer,
+        issue_state_fetcher: managed_issue_state_fetcher(state, assignment),
         on_session: fn info -> managed_callback_call(owner, {:managed_session, attempt, info}) end,
         before_turn: fn context -> managed_callback_call(owner, {:managed_before_turn, context}) end,
         report_callback: fn payload -> managed_callback_call(owner, {:managed_report, payload}) end
       ]
+  end
+
+  defp managed_issue_state_fetcher(state, assignment) do
+    cond do
+      is_function(state.managed[:source_fetcher], 1) ->
+        state.managed.source_fetcher
+
+      managed_source_fetch_enabled?() ->
+        binding = managed_assignment_binding(state, assignment)
+        fn ids -> Client.fetch_project_issues(binding, ids) end
+
+      true ->
+        &Tracker.fetch_issues_by_ids/1
+    end
   end
 
   defp managed_checkout_options_or_empty do
@@ -3536,7 +3993,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_issues_by_ids([issue_id]) do
+    case fetch_issues_for_state(state, [issue_id]) do
       {:ok, issues} ->
         issues
         |> find_issue_by_id(issue_id)
@@ -3624,7 +4081,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     if enabled do
       with {:ok, journal, loaded} <- Journal.open(config.managed.journal_path),
-           {:ok, data} <- managed_data(loaded, config) do
+           {:ok, data} <- managed_data(loaded, config),
+           :ok <- persist_managed_migration(journal, loaded, data) do
         effects =
           Keyword.get(
             opts,
@@ -3636,7 +4094,7 @@ defmodule SymphonyElixir.Orchestrator do
           Keyword.get(
             opts,
             :managed_source_fetcher,
-            Application.get_env(:symphony_elixir, :managed_source_fetcher, &Tracker.fetch_issues_by_ids/1)
+            Application.get_env(:symphony_elixir, :managed_source_fetcher)
           )
 
         {:ok, %{state | managed: %{journal: journal, data: data, effects: effects, source_fetcher: source_fetcher}}}
@@ -3650,18 +4108,23 @@ defmodule SymphonyElixir.Orchestrator do
     {:ok, Rules.new(usage_limit_tokens: config.managed.usage_limit_tokens)}
   end
 
-  defp managed_data(%{version: version} = data, config) do
-    if version == Rules.version() do
-      defaults = Rules.new(usage_limit_tokens: config.managed.usage_limit_tokens)
-      merged = Map.merge(defaults, data)
-      usage_limit = config.managed.usage_limit_tokens || merged[:usage_limit_tokens]
-      {:ok, Map.put(merged, :usage_limit_tokens, usage_limit) |> normalize_managed_usage()}
-    else
-      {:error, :managed_journal_schema_mismatch}
+  defp managed_data(%{version: version} = data, config) when version in [1, 2] do
+    case Migration.migrate(data) do
+      {:ok, migrated} ->
+        defaults = Rules.new(usage_limit_tokens: config.managed.usage_limit_tokens)
+        merged = Map.merge(defaults, migrated)
+        usage_limit = config.managed.usage_limit_tokens || merged[:usage_limit_tokens]
+        {:ok, Map.put(merged, :usage_limit_tokens, usage_limit) |> normalize_managed_usage()}
+
+      {:error, code, details} ->
+        {:error, {code, details}}
     end
   end
 
   defp managed_data(_data, _config), do: {:error, :managed_journal_schema_mismatch}
+
+  defp persist_managed_migration(journal, %{version: 1}, %{version: 2} = data), do: Journal.append(journal, data)
+  defp persist_managed_migration(_journal, _loaded, _data), do: :ok
 
   defp normalize_managed_usage(%{usage: usage} = data) when is_map(usage) do
     normalized = %{
@@ -4039,6 +4502,7 @@ defmodule SymphonyElixir.Orchestrator do
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
         codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
+        codex_usage_complete: usage_completion_for_update(running_entry, event),
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
@@ -4047,6 +4511,10 @@ defmodule SymphonyElixir.Orchestrator do
       token_delta
     }
   end
+
+  defp usage_completion_for_update(_entry, :final_usage_complete), do: true
+  defp usage_completion_for_update(_entry, :final_usage_incomplete), do: false
+  defp usage_completion_for_update(entry, _event), do: Map.get(entry, :codex_usage_complete)
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
        when is_binary(pid),

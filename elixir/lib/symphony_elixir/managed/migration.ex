@@ -27,7 +27,11 @@ defmodule SymphonyElixir.Managed.Migration do
 
   @spec migrate(map(), keyword()) :: {:ok, map()} | {:error, atom(), map()}
   def migrate(state, opts) when is_map(state) do
-    if migrated?(state), do: {:ok, state}, else: migrate_v1(state, opts)
+    case get(state, :version) do
+      @version -> {:ok, state}
+      1 -> migrate_v1(state, opts)
+      _ -> {:error, :managed_journal_schema_mismatch, %{}}
+    end
   end
 
   def migrate(_state, _opts), do: {:error, :managed_state_invalid, %{}}
@@ -101,29 +105,40 @@ defmodule SymphonyElixir.Managed.Migration do
   defp migrate_assignments(assignments, project_id, opts) when is_map(assignments) do
     allow_legacy = Keyword.get(opts, :allow_legacy_resources, true)
 
-    Enum.reduce_while(assignments, {:ok, %{}, []}, fn {id, assignment}, {:ok, acc, conflicts} ->
-      case migrate_assignment(id, assignment, project_id, allow_legacy) do
-        {:ok, migrated, identity} ->
-          conflict_ids =
-            if identity && Enum.any?(acc, fn {_existing_id, existing} -> canonical_identity(existing) == identity end),
-              do: [to_string(id)],
-              else: []
-
-          {:cont, {:ok, Map.put(acc, id, migrated), conflicts ++ conflict_ids}}
-
-        {:error, code, details} ->
-          {:halt, {:error, code, Map.put(details, :assignment_id, id)}}
-      end
+    Enum.reduce_while(assignments, {:ok, %{}, []}, fn {id, assignment}, acc ->
+      migrate_assignment_entry(id, assignment, project_id, allow_legacy, acc)
     end)
   end
 
   defp migrate_assignments(_assignments, _project_id, _opts), do: {:error, :assignments_invalid, %{}}
 
+  defp migrate_assignment_entry(id, assignment, project_id, allow_legacy, {:ok, acc, conflicts}) do
+    case migrate_assignment(id, assignment, project_id, allow_legacy) do
+      {:ok, migrated, identity} ->
+        conflicts = append_identity_conflict(acc, conflicts, id, identity)
+        {:cont, {:ok, Map.put(acc, id, migrated), conflicts}}
+
+      {:error, code, details} ->
+        {:halt, {:error, code, Map.put(details, :assignment_id, id)}}
+    end
+  end
+
+  defp append_identity_conflict(_assignments, conflicts, _id, nil), do: conflicts
+
+  defp append_identity_conflict(assignments, conflicts, id, identity) do
+    if Enum.any?(assignments, fn {_existing_id, existing} -> canonical_identity(existing) == identity end) do
+      conflicts ++ [to_string(id)]
+    else
+      conflicts
+    end
+  end
+
   defp migrate_assignment(id, assignment, project_id, allow_legacy) when is_map(assignment) do
     assignment_project_id = text(assignment, :project_id) || project_id
     resources = get(assignment, :resources, [])
 
-    with {:ok, normalized_resources} <- Resources.normalize_all(resources, allow_legacy: allow_legacy) do
+    with :ok <- assignment_key_matches(id, assignment),
+         {:ok, normalized_resources} <- Resources.normalize_all(resources, allow_legacy: allow_legacy) do
       identity = canonical_identity(assignment)
 
       migrated =
@@ -133,6 +148,7 @@ defmodule SymphonyElixir.Managed.Migration do
         |> maybe_put(:project_id, assignment_project_id)
         |> Map.put(:resources, normalized_resources)
         |> Map.put(:ownership, Ownership.needs_claim())
+        |> Map.put(:operator_reconciliation_required, legacy_resources_require_reconciliation?(assignment, resources))
         |> maybe_put(:underlying_identity, identity_map(assignment, identity))
 
       {:ok, migrated, identity}
@@ -141,64 +157,106 @@ defmodule SymphonyElixir.Managed.Migration do
 
   defp migrate_assignment(_id, _assignment, _project_id, _allow_legacy), do: {:error, :assignment_invalid, %{}}
 
-  defp canonical_identity(assignment) when is_map(assignment) do
-    provider = text(assignment, :provider) || "github"
-    repository = text(assignment, :repository)
-    native_repository_id = text(assignment, :native_repository_id) || text(assignment, :repository_id) || text(assignment, :repository_node_id)
-    native_issue_id = text(assignment, :native_issue_id) || text(assignment, :issue_id) || text(assignment, :issue_node_id)
-    issue_number = get(assignment, :issue_number)
+  defp assignment_key_matches(id, assignment) do
+    embedded_id = text(assignment, :assignment_id)
 
-    cond do
-      is_binary(native_issue_id) -> {provider, native_repository_id || repository || "", native_issue_id}
-      is_binary(repository) and is_integer(issue_number) -> {provider, String.downcase(repository), issue_number}
-      true -> nil
+    if is_binary(id) and embedded_id in [nil, id],
+      do: :ok,
+      else: {:error, :assignment_identity_mismatch, %{}}
+  end
+
+  defp legacy_resources_require_reconciliation?(assignment, resources) do
+    get(assignment, :phase) not in [:accepted, :cancelled, "accepted", "cancelled"] and
+      Enum.any?(resources, &is_binary/1)
+  end
+
+  defp canonical_identity(assignment) when is_map(assignment) do
+    provider = value_or_default(text(assignment, :provider), "github")
+    repository = text(assignment, :repository)
+    issue_number = get(assignment, :issue_number)
+    native_issue_id = first_text(assignment, [:native_issue_id, :issue_id, :issue_node_id])
+
+    if is_binary(native_issue_id) do
+      native_repository_id =
+        value_or_default(
+          first_text(assignment, [:native_repository_id, :repository_id, :repository_node_id]),
+          value_or_default(repository, "")
+        )
+
+      {provider, native_repository_id, native_issue_id}
+    else
+      canonical_issue_identity(provider, repository, issue_number)
     end
   end
 
-  defp canonical_identity(_assignment), do: nil
+  defp canonical_issue_identity(provider, repository, issue_number)
+       when is_binary(repository) and is_integer(issue_number) do
+    {provider, String.downcase(repository), issue_number}
+  end
+
+  defp canonical_issue_identity(_provider, _repository, _issue_number), do: nil
 
   defp identity_map(_assignment, nil), do: nil
 
   defp identity_map(assignment, {provider, repository, issue}) do
-    native_issue_id = text(assignment, :native_issue_id) || text(assignment, :issue_id) || text(assignment, :issue_node_id)
-    native_repository_id = text(assignment, :native_repository_id) || text(assignment, :repository_id) || text(assignment, :repository_node_id)
+    native_issue_id = first_text(assignment, [:native_issue_id, :issue_id, :issue_node_id])
+    native_repository_id = first_text(assignment, [:native_repository_id, :repository_id, :repository_node_id])
 
     if native_issue_id do
-      %{provider: provider, repository: text(assignment, :repository) || repository, native_repository_id: native_repository_id, native_issue_id: native_issue_id}
+      %{
+        provider: provider,
+        repository: value_or_default(text(assignment, :repository), repository),
+        native_repository_id: native_repository_id,
+        native_issue_id: native_issue_id
+      }
     else
       %{provider: provider, repository: repository, issue_number: issue}
     end
   end
 
   defp migrate_intents(intents, projects, assignments) when is_map(intents) do
-    Enum.reduce(intents, {%{}, []}, fn {request_id, raw_intent}, {acc, reconciliation_ids} ->
-      # Keep the persisted request map byte-shape intact. Helpers below read
-      # atom and string keys without normalizing the request or canonical.
-      intent = if is_map(raw_intent), do: raw_intent, else: %{intent: raw_intent}
-      assignment_id = text(intent, :assignment_id) || request_assignment_id(intent)
-      assignment = Map.get(assignments, assignment_id) || Map.get(assignments, to_string(assignment_id || ""))
-      project_id = text(intent, :project_id) || (assignment && text(assignment, :project_id))
-      binding = project_id && Map.get(projects, project_id)
-      ownership_revision = assignment && Ownership.ownership(assignment).ownership_revision
-
-      migrated =
-        intent
-        |> Map.put(:legacy_intent, true)
-        |> Map.put(:provenance, :legacy_intent)
-        |> Map.put(:principal_context, @legacy_operator)
-        |> maybe_put(:assignment_id, assignment_id)
-        |> maybe_put(:project_id, project_id)
-        |> maybe_put(:ownership_revision, ownership_revision)
-        |> maybe_put(:binding, binding)
-
-      needs_reconciliation? = raw_intent_pending?(intent)
-      migrated = if needs_reconciliation?, do: Map.put(migrated, :status, :needs_operator_reconciliation), else: migrated
-      next_ids = if needs_reconciliation?, do: [to_string(request_id) | reconciliation_ids], else: reconciliation_ids
-      {Map.put(acc, request_id, migrated), next_ids}
+    Enum.reduce(intents, {%{}, []}, fn {request_id, raw_intent}, acc ->
+      migrate_intent_entry(request_id, raw_intent, projects, assignments, acc)
     end)
   end
 
   defp migrate_intents(_intents, _projects, _assignments), do: {%{}, []}
+
+  defp migrate_intent_entry(request_id, raw_intent, projects, assignments, {acc, reconciliation_ids}) do
+    intent = if is_map(raw_intent), do: raw_intent, else: %{intent: raw_intent}
+    assignment_id = text(intent, :assignment_id) || request_assignment_id(intent)
+    assignment = Map.get(assignments, assignment_id) || Map.get(assignments, to_string(assignment_id || ""))
+    project_id = text(intent, :project_id) || (assignment && text(assignment, :project_id))
+    binding = project_id && Map.get(projects, project_id)
+    ownership_revision = assignment && Ownership.ownership(assignment).ownership_revision
+
+    migrated =
+      intent
+      |> Map.put(:legacy_intent, true)
+      |> Map.put(:provenance, :legacy_intent)
+      |> Map.put(:principal_context, @legacy_operator)
+      |> maybe_put(:assignment_id, assignment_id)
+      |> maybe_put(:project_id, project_id)
+      |> maybe_put(:ownership_revision, ownership_revision)
+      |> maybe_put(:binding, binding)
+      |> maybe_mark_intent_reconciliation(intent)
+
+    reconciliation_ids =
+      append_reconciliation_id(reconciliation_ids, request_id, raw_intent_pending?(intent))
+
+    {Map.put(acc, request_id, migrated), reconciliation_ids}
+  end
+
+  defp maybe_mark_intent_reconciliation(intent, raw_intent) do
+    if raw_intent_pending?(raw_intent) do
+      Map.put(intent, :status, :needs_operator_reconciliation)
+    else
+      intent
+    end
+  end
+
+  defp append_reconciliation_id(ids, request_id, true), do: [to_string(request_id) | ids]
+  defp append_reconciliation_id(ids, _request_id, false), do: ids
 
   defp raw_intent_pending?(intent), do: get(intent, :status) in @replayable_statuses
 
@@ -225,8 +283,6 @@ defmodule SymphonyElixir.Managed.Migration do
     |> Enum.filter(&is_binary/1)
   end
 
-  defp reconciliation_assignment_ids(_intents), do: []
-
   defp migrate_principals(principals) when is_map(principals) do
     Map.put_new(principals, "operator", %{principal_id: "operator", role: :operator, project_scope: :all, legacy: true})
   end
@@ -240,31 +296,29 @@ defmodule SymphonyElixir.Managed.Migration do
     requests = get(state, :requests, %{})
 
     if is_map(requests) do
-      migrated =
-        Map.new(requests, fn {request_id, record} ->
-          value =
-            if is_map(record) do
-              record
-              |> Map.put_new(:principal_id, "operator")
-              |> Map.put_new(:capability_id, nil)
-              |> Map.put(:legacy_request, true)
-            else
-              record
-            end
-
-          {request_id, value}
-        end)
-
-      Map.put(state, :requests, migrated)
+      Map.put(state, :requests, Map.new(requests, &migrate_request_record/1))
     else
       state
     end
   end
 
+  defp migrate_request_record({request_id, record}) when is_map(record) do
+    value =
+      record
+      |> Map.put_new(:principal_id, "operator")
+      |> Map.put_new(:capability_id, nil)
+      |> Map.put(:legacy_request, true)
+
+    {request_id, value}
+  end
+
+  defp migrate_request_record(entry), do: entry
+
   defp normalize_known_keys(map) when is_map(map) do
     Map.new(map, fn {key, value} -> {known_key(key), normalize_known_value(value)} end)
   end
 
+  defp normalize_known_value(%_{} = value), do: value
   defp normalize_known_value(value) when is_map(value), do: normalize_known_keys(value)
   defp normalize_known_value(value) when is_list(value), do: Enum.map(value, &normalize_known_value/1)
   defp normalize_known_value(value), do: value
@@ -349,7 +403,10 @@ defmodule SymphonyElixir.Managed.Migration do
     Map.get(map, key, Map.get(map, Atom.to_string(key), default))
   end
 
-  defp get(_map, _key, default), do: default
+  defp first_text(map, keys), do: Enum.find_value(keys, &text(map, &1))
+
+  defp value_or_default(nil, default), do: default
+  defp value_or_default(value, _default), do: value
 
   defp text(map, key) when is_map(map) do
     case get(map, key) do

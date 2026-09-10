@@ -22,11 +22,11 @@ defmodule SymphonyElixir.ManagedControlTestServer do
     {:reply, {:ok, [%{after_cursor: after_cursor, limit: limit}]}, state}
   end
 
-  def handle_call({:managed_control, _envelope}, _from, :triple_error) do
+  def handle_call({:managed_control, _envelope, _principal}, _from, :triple_error) do
     {:reply, {:error, :invalid_argument, %{field: :envelope}}, :triple_error}
   end
 
-  def handle_call({:managed_control, _envelope}, _from, state) do
+  def handle_call({:managed_control, _envelope, _principal}, _from, state) do
     {:reply, {:ok, %{accepted: true}}, state}
   end
 

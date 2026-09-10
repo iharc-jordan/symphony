@@ -2338,3 +2338,28 @@ Extension config:
 - Cleanup and observability:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
+
+
+## Appendix B. Optional managed PM control profile
+
+An implementation MAY expose a managed control plane in addition to tracker polling.
+This profile MUST preserve the single authoritative orchestrator and its durable journal.
+Each registered Project binding identifies allowed repositories and provider field identities;
+managed reads and writes MUST use that assignment's binding rather than a mutable default.
+
+PM mutations MUST carry a server-authenticated principal, explicit Project scope, and the
+applicable work and ownership revisions. An assignment has at most one responsible PM.
+Explicit handoff changes ownership without replacing a healthy worker or its attempt identity.
+Assignment-scoped pause prevents new dispatch without invalidating a running worker's report.
+Operator-level service controls are distinct from PM controls.
+
+Enrollment MUST verify the provider item and its ready state and prevent duplicate underlying
+issue enrollment across Project cards. Resource claims MUST use canonical references and
+preserve write conflicts. Pending external effects MUST retain their originating identity,
+binding, and revision fences across restart. Migrated legacy state MUST be visibly unclaimed;
+legacy pending effects MUST require explicit reconciliation before they can permit dispatch.
+
+Optional Project card summaries are derived projections of journal state. Projection failures
+MUST be visible and MUST NOT be reported as synchronized. Summary writes MUST NOT replace issue
+requirements or workflow status. A terminal worker report revokes further tool execution;
+a bounded drain MAY collect final usage, with incomplete accounting explicitly marked.

@@ -33,6 +33,28 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
 
   @type service_context :: %{optional(:binding) => map(), optional(:process_stopped) => boolean()}
 
+  @doc "Update only the configured operational text field on an assignment's Project card."
+  @spec project_summary(map(), map(), String.t()) :: :ok | {:error, term()}
+  def project_summary(assignment, binding, summary) when is_map(assignment) and is_map(binding) and is_binary(summary) do
+    query = """
+    mutation SymphonyManagedSummary($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
+      updateProjectV2ItemFieldValue(input: {projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: {text: $text}}) {
+        projectV2Item { id }
+      }
+    }
+    """
+
+    item_id = assignment[:project_item_id] || assignment[:assignment_id]
+
+    with true <- assignment[:project_id] == binding[:project_id] and is_binary(binding[:projection_field_id]),
+         {:ok, body} <- graphql(query, %{"projectId" => binding.project_id, "itemId" => item_id, "fieldId" => binding.projection_field_id, "text" => String.slice(summary, 0, 1024)}),
+         :ok <- status_response_ok(body, item_id) do
+      :ok
+    else
+      _ -> {:error, :managed_projection_unconfirmed}
+    end
+  end
+
   @doc """
   Apply the accepted review effects in order: verify, set board ACCEPTED,
   close the native issue, then refetch both provider states for reconciliation.
@@ -41,15 +63,15 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
   def review(assignment, _args, context \\ %{}) when is_map(assignment) and is_map(context) do
     with :ok <- provider_kind_ok(),
          :ok <- process_stopped(context),
-         {:ok, before} <- fetch_exact_assignment(assignment),
+         {:ok, before} <- fetch_exact_assignment(assignment, context),
          :ok <- verify_material(before, assignment),
          :ok <- native_issue_only(before),
          :ok <- ensure_project_accepted(before, context),
-         {:ok, status_check} <- fetch_exact_assignment(assignment),
+         {:ok, status_check} <- fetch_exact_assignment(assignment, context),
          :ok <- verify_material(status_check, assignment),
          :ok <- provider_status_is(status_check, :accepted),
          :ok <- close_native_item(status_check),
-         {:ok, after_close} <- fetch_exact_assignment(assignment),
+         {:ok, after_close} <- fetch_exact_assignment(assignment, context),
          :ok <- verify_material(after_close, assignment),
          :ok <- provider_status_is(after_close, :accepted),
          :ok <- native_state_is_closed(after_close) do
@@ -70,12 +92,12 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
   @spec transition(map(), atom(), service_context()) :: {:ok, map()} | {:error, atom(), map()}
   def transition(assignment, target, context \\ %{}) when is_map(assignment) and is_atom(target) do
     with :ok <- provider_kind_ok(),
-         {:ok, issue} <- fetch_exact_assignment(assignment),
+         :ok <- transition_process_precondition(context, target),
+         {:ok, issue} <- fetch_exact_assignment(assignment, context),
          :ok <- verify_material(issue, assignment),
          :ok <- native_issue_only(issue),
-         :ok <- transition_process_precondition(context, target),
          :ok <- ensure_project_status(issue, context, target),
-         {:ok, observed} <- fetch_exact_assignment(assignment),
+         {:ok, observed} <- fetch_exact_assignment(assignment, context),
          :ok <- verify_material(observed, assignment),
          :ok <- provider_status_is(observed, target) do
       {:ok, %{provider_state: target, reconciled: true, external_effects: %{status: :ok}}}
@@ -125,20 +147,36 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
   defp process_stopped(%{process_stopped: true}), do: :ok
   defp process_stopped(_), do: {:error, :managed_process_not_stopped, %{}}
 
-  defp fetch_exact_assignment(assignment) do
+  defp fetch_exact_assignment(assignment, context) do
     item_id = text(assignment, :assignment_id)
 
     with true <- is_binary(item_id),
-         {:ok, [issue]} <- Client.fetch_issues_by_ids([item_id]),
+         {:ok, binding} <- provider_binding(context),
+         {:ok, [issue]} <- Client.fetch_project_issues(binding, [item_id]),
          :ok <- exact_identity(issue, assignment) do
       {:ok, issue}
     else
-      false -> {:error, :invalid_assignment_identity, %{}}
-      {:ok, []} -> {:error, :managed_native_item_not_found, %{}}
-      {:error, reason} -> {:error, :managed_native_fetch_failed, %{reason: inspect(reason)}}
-      {:error, code, details} -> {:error, code, details}
+      false ->
+        {:error, :invalid_assignment_identity, %{}}
+
+      {:ok, []} ->
+        {:error, :managed_native_item_not_found, %{}}
+
+      {:error, :github_projects_missing_item_status} ->
+        {:error, :managed_project_status_required, %{assignment_id: item_id}}
+
+      {:error, reason} ->
+        {:error, :managed_native_fetch_failed, %{reason: inspect(reason)}}
+
+      {:error, code, details} ->
+        {:error, code, details}
     end
   end
+
+  defp provider_binding(%{binding: %{project_id: project_id, status_field_id: field_id} = binding})
+       when is_binary(project_id) and is_binary(field_id), do: {:ok, binding}
+
+  defp provider_binding(_context), do: {:error, :managed_project_status_identity_missing, %{}}
 
   defp exact_identity(issue, assignment) do
     repository = get_in(issue.native_ref || %{}, ["repository", "name_with_owner"])
@@ -245,12 +283,12 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
     item_id = native_value(issue, :project_item_id)
     field_id = get_in(context, [:binding, :status_field_id])
 
-    with true <- Enum.all?([project_id, item_id, field_id, option_id], &is_binary/1),
-         {:ok, body} <- graphql(@status_mutation, %{"projectId" => project_id, "itemId" => item_id, "fieldId" => field_id, "optionId" => option_id}),
+    # The exact-item read, binding validation and status option lookup have
+    # already validated all four provider identifiers before this write.
+    with {:ok, body} <- graphql(@status_mutation, %{"projectId" => project_id, "itemId" => item_id, "fieldId" => field_id, "optionId" => option_id}),
          :ok <- status_response_ok(body, item_id) do
       :ok
     else
-      false -> {:error, :managed_project_status_identity_missing, %{}}
       {:error, reason} -> {:error, :managed_project_status_failed, %{reason: inspect(reason)}}
       {:error, code, details} -> {:error, code, details}
     end

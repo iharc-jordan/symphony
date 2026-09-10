@@ -223,10 +223,38 @@ codex:
 ### Managed control plane
 
 Managed mode is an opt in control plane for GitHub Projects assignments. It journals
-control requests and provider effects, requires a service owned control token, and
-prepares each worker workspace through the configured trusted checkout helper. See
-[managed checkout preparation](docs/managed-checkout.md) for the private policy file,
-path boundaries, and per-attempt input contract.
+control requests and provider effects and prepares workers through the configured trusted
+checkout helper. See [managed checkout preparation](docs/managed-checkout.md) for the private
+policy file, path boundaries, and per-attempt input contract.
+
+The version two control contract has these boundaries:
+
+- The loopback HTTP boundary authenticates an operator credential or a task-specific PM
+  capability. The native MCP bridge derives the PM capability from Codex's per-call thread
+  identity; caller-supplied PM IDs do not authorize mutations.
+- Operators register each Project binding and its permitted repositories. PM controls name
+  their Project explicitly. One PM can manage several Projects and repositories; several PMs
+  can share a Project while each assignment has exactly one responsible PM.
+- Assignment changes compare both the work revision and ownership revision. Handoff and
+  assignment pause/resume accept an exact `assignments` list containing `assignment_id`,
+  `expected_revision`, and `expected_ownership_revision`. Ownership transfer preserves the
+  active attempt and worker task; pausing prevents new dispatch and lets active work finish.
+- Enrollment verifies the live Project item, READY status, repository, and issue identity.
+  Resources are typed `{kind, authority, identity, access}` references. GitHub's native issue
+  and repository IDs prevent enrollment of a second card for the same underlying issue.
+- Pending provider effects retain their originating principal and Project binding. Recovery
+  revalidates those fences before a write. A version one journal upgrades in place while
+  retaining history; assignments require an explicit operator takeover. Legacy pending
+  effects require operator reconciliation rather than automatic replay under a new owner.
+- A binding may specify `projection_field_id`, an existing text field belonging to that
+  Project. Summary updates run outside the control request, expose pending/failed/synced
+  status, and never replace issue requirements or the workflow Status field.
+- A terminal worker report ends permission to execute tools. The runtime interrupts the
+  turn and briefly drains final usage notifications; incomplete telemetry is marked explicitly.
+
+Project bindings and ownership belong to the journal, not to a second scheduler or database.
+The workflow's tracker credentials remain the provider credential authority. Keep the control
+secret, journal, checkout policy, and stable checkout helper outside the plugin cache.
 
 ### Linear adapter profile
 
@@ -418,6 +446,12 @@ SYMPHONY_RUN_GITLAB_LIVE_E2E=1 mix test test/symphony_elixir/gitlab_live_e2e_tes
 ```
 
 ## FAQ
+
+Managed review with disposition `rework` or `waiting` reconciles the corresponding
+GitHub Project status through the existing durable transition path before the
+local phase changes. A failed provider update retains the prior phase and pending
+intent. `resume` removes a dispatch pause; use `rework` after resolving a WAITING
+failure to continue the retained assignment.
 
 ### Why Elixir?
 

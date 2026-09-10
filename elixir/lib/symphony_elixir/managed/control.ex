@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Managed.Control do
   orchestrator GenServer.
   """
 
-  alias SymphonyElixir.Managed.Rules
+  alias SymphonyElixir.Managed.{Principal, Rules}
 
   @spec state(GenServer.server(), timeout()) :: {:ok, map()} | {:error, term()}
   def state(orchestrator \\ SymphonyElixir.Orchestrator, timeout \\ 15_000) do
@@ -23,7 +23,15 @@ defmodule SymphonyElixir.Managed.Control do
           {:ok, map()} | {:error, term()} | {:error, atom(), map()}
   def submit(orchestrator \\ SymphonyElixir.Orchestrator, envelope, timeout \\ 15_000)
       when is_map(envelope) do
-    call(orchestrator, {:managed_control, envelope}, timeout)
+    submit_authorized(orchestrator, envelope, Principal.operator(), timeout)
+  end
+
+  @doc "Submit with service-authenticated authority, separate from model arguments."
+  @spec submit_authorized(GenServer.server(), map(), map(), timeout()) ::
+          {:ok, map()} | {:error, term()} | {:error, atom(), map()}
+  def submit_authorized(orchestrator, envelope, principal, timeout \\ 15_000)
+      when is_map(envelope) and is_map(principal) do
+    call(orchestrator, {:managed_control, envelope, principal}, timeout)
   end
 
   @doc false

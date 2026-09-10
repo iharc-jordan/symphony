@@ -239,6 +239,25 @@ defmodule SymphonyElixir.ManagedRulesTest do
              Rules.canonical_input(%{request_id: "r", operation: :enroll, args: changed_body})
   end
 
+  test "enrollment keeps trusted source title and URL metadata outside the request" do
+    state = bound_state()
+    request = envelope("enroll-source-metadata", :enroll, enrollment_args("issue-1", 1))
+    canonical = Rules.canonical_input(request)
+
+    context = %{
+      source_identity: %{
+        title: "Authoritative title",
+        issue_url: "https://github.com/acme/example/issues/12"
+      }
+    }
+
+    assert {:ok, enrolled, _response} = apply_request(state, request, context)
+    assignment = enrolled.assignments["issue-1"]
+    assert assignment.title == "Authoritative title"
+    assert assignment.issue_url == "https://github.com/acme/example/issues/12"
+    assert Rules.canonical_input(request) == canonical
+  end
+
   test "review acceptance requires provider and reconciled effect facts from service context" do
     state =
       enrolled_state("issue-1")
@@ -285,6 +304,30 @@ defmodule SymphonyElixir.ManagedRulesTest do
 
     assert revised.assignments["issue-1"].phase == :ready
     assert revised.assignments["issue-1"].revision == 3
+  end
+
+  test "service stop reconciliation clears interrupt and cancel stop_pending" do
+    for operation <- [:interrupt, :cancel] do
+      state =
+        enrolled_state("issue-1")
+        |> put_in([:assignments, "issue-1", :phase], :active)
+        |> put_in([:assignments, "issue-1", :board_state], :active)
+
+      request =
+        envelope("stop-#{operation}", operation, %{
+          assignment_id: "issue-1",
+          expected_revision: 1,
+          reason: "operator stop"
+        })
+
+      assert {:ok, pending, _response} = apply_request(state, request)
+      assert pending.assignments["issue-1"].stop_pending == true
+
+      assert {:ok, reconciled, _response} =
+               apply_request(state, request, %{stop_reconciled: true})
+
+      assert reconciled.assignments["issue-1"].stop_pending == false
+    end
   end
 
   test "revision whitelists editable fields and rejects runtime or proof fields" do
@@ -684,6 +727,210 @@ defmodule SymphonyElixir.ManagedRulesTest do
     assert {:ok, same, _} = apply_request(state, envelope("same-route", :revise, same_route), %{stop_reconciled: true})
     assert same.assignments["issue-1"].thread_id == "old-thread"
     assert same.assignments["issue-1"].resume_ready
+  end
+
+  test "strict authorization and defensive lifecycle branches are explicit" do
+    state = bound_state()
+    bind_request = envelope("auth-bind", :bind_project, binding_args())
+
+    assert {:error, :principal_required, %{}} = Rules.authorize(state, bind_request, nil)
+    assert {:error, :principal_required, %{}} = Rules.apply(state, bind_request)
+    assert {:error, :principal_required, %{}} = Rules.prepare_review(state, bind_request)
+    assert {:error, :principal_required, %{}} = Rules.apply(state, bind_request, %{})
+    assert :ok = Rules.authorize(state, bind_request, %{principal_context: @operator})
+    assert :ok = Rules.authorize(state, bind_request, %{"principal_context" => @operator})
+    assert {:error, :principal_required, %{}} = Rules.authorize(state, bind_request, %{principal_context: %{}})
+
+    assert {:error, :operator_required, %{operation: :bind_project}} =
+             Rules.apply(Rules.new(), bind_request, %{principal: @pm})
+
+    assert {:error, :operator_required, %{operation: :operator_takeover}} =
+             Rules.apply(
+               state,
+               envelope("takeover-denied", :operator_takeover, %{}),
+               %{principal: @pm}
+             )
+
+    assert {:error, :pm_required, %{}} =
+             Rules.apply(
+               state,
+               envelope("register-denied", :register_pm, %{}),
+               %{principal: @operator}
+             )
+
+    assert {:error, :pm_required, %{}} =
+             Rules.apply(
+               state,
+               envelope("enroll-denied", :enroll, enrollment_args("denied", 1)),
+               %{principal: @operator}
+             )
+
+    enrolled = enrolled_state("issue-1")
+    claim_args = %{project_id: "PVT_kwDO", assignment_id: "issue-1", expected_revision: 1, expected_ownership_revision: 1}
+
+    assert {:error, :operator_takeover_required, %{assignment_id: "issue-1"}} =
+             Rules.apply(
+               enrolled,
+               envelope("claim-owned", :claim, claim_args),
+               %{principal: @pm}
+             )
+
+    assert {:error, :operator_required, %{scope: :service}} =
+             Rules.apply(
+               enrolled,
+               envelope("pause-denied", :pause, %{expected_revision: 1}),
+               %{principal: @pm}
+             )
+
+    assert {:error, :invalid_scope, %{scope: "unknown"}} =
+             Rules.apply(
+               enrolled,
+               envelope("pause-scope", :pause, %{scope: "unknown", expected_revision: 1}),
+               %{principal: @operator}
+             )
+
+    assert {:error, :project_required, %{}} =
+             Rules.apply(
+               enrolled,
+               envelope("cancel-project-nil", :cancel, %{claim_args | project_id: nil}),
+               %{principal: @pm}
+             )
+
+    assert {:error, :project_required, %{}} =
+             Rules.apply(
+               enrolled,
+               envelope("cancel-project-empty", :cancel, %{claim_args | project_id: ""}),
+               %{principal: @pm}
+             )
+
+    assert {:error, :invalid_argument, %{argument: :assignments}} =
+             Rules.apply(
+               enrolled,
+               envelope("handoff-empty", :handoff, %{project_id: "PVT_kwDO", assignments: []}),
+               %{principal: @pm}
+             )
+
+    assert {:error, :invalid_argument, %{argument: :assignments}} =
+             Rules.apply(
+               enrolled,
+               envelope("handoff-nonlist", :handoff, %{project_id: "PVT_kwDO", assignments: :bad}),
+               %{principal: @pm}
+             )
+
+    assert {:error, :invalid_argument, %{argument: :assignments}} =
+             Rules.apply(
+               enrolled,
+               envelope("handoff-nonmap", :handoff, %{project_id: "PVT_kwDO", assignments: [:bad]}),
+               %{principal: @pm}
+             )
+
+    assert {:error, :invalid_argument, %{argument: :assignments}} =
+             Rules.apply(
+               enrolled,
+               envelope("handoff-no-id", :handoff, %{project_id: "PVT_kwDO", assignments: [%{}]}),
+               %{principal: @pm}
+             )
+
+    duplicate_fence = [%{assignment_id: "issue-1"}, %{assignment_id: "issue-1"}]
+
+    assert {:error, :duplicate_assignment, %{assignment_id: "issue-1"}} =
+             Rules.apply(
+               enrolled,
+               envelope("handoff-duplicate", :handoff, %{project_id: "PVT_kwDO", assignments: duplicate_fence}),
+               %{principal: @pm}
+             )
+
+    principal_conflict_request = envelope("principal-conflict", :enroll, enrollment_args("conflict", 1))
+    {:ok, enrolled_once, _} = Rules.apply(state, principal_conflict_request, %{principal: %{principal_id: "pm-a", role: :pm, project_scope: :all}})
+
+    assert {:error, :request_principal_conflict, %{request_id: "principal-conflict"}} =
+             Rules.apply(enrolled_once, principal_conflict_request, %{principal: %{principal_id: "pm-b", role: :pm, project_scope: :all}})
+  end
+
+  test "handoff and takeover defensive branches preserve ownership fences" do
+    enrolled = enrolled_state("handoff")
+    target = %{principal_id: "target", role: :pm, project_scope: :all}
+
+    handoff_args = %{
+      project_id: "PVT_kwDO",
+      destination_pm_id: "target",
+      assignments: [%{assignment_id: "handoff", expected_revision: 1, expected_ownership_revision: 1}],
+      reason: "handoff"
+    }
+
+    assert {:error, :invalid_argument, %{argument: :destination_pm_id}} =
+             Rules.apply(
+               enrolled,
+               envelope("handoff-no-target", :handoff, Map.delete(handoff_args, :destination_pm_id)),
+               %{principal: @pm}
+             )
+
+    assert {:error, :target_principal_not_registered, %{principal_id: "target"}} =
+             Rules.apply(
+               enrolled,
+               envelope("handoff-unregistered", :handoff, handoff_args),
+               %{principal: @pm}
+             )
+
+    {:ok, registered, _} =
+      Rules.apply(enrolled, envelope("register-target", :register_pm, %{}), %{principal: target})
+
+    same_source = %{handoff_args | destination_pm_id: "pm"}
+
+    assert {:error, :target_principal_same_as_source, %{}} =
+             Rules.apply(
+               registered,
+               envelope("handoff-same-source", :handoff, same_source),
+               %{principal: @pm}
+             )
+
+    missing_fence = %{assignment_id: "missing", expected_revision: 1, expected_ownership_revision: 1}
+    missing_assignment = %{handoff_args | assignments: [missing_fence]}
+
+    assert {:error, :assignment_not_found, %{}} =
+             Rules.apply(
+               registered,
+               envelope("handoff-missing", :handoff, missing_assignment),
+               %{principal: @pm}
+             )
+
+    pending = %{principal_context: %{principal_id: "pm"}, status: :pending, assignment_id: "handoff"}
+
+    with_intents =
+      registered
+      |> put_in([:effect_intents, "effect"], pending)
+      |> put_in([:review_intents, "review"], pending)
+
+    assert {:ok, transferred, _} =
+             Rules.apply(
+               with_intents,
+               envelope("handoff-effects-reconciled", :handoff, handoff_args),
+               %{principal: @pm, effects_reconciled: true}
+             )
+
+    assert transferred.effect_intents["effect"].status == :stale_owner
+    assert transferred.review_intents["review"].status == :stale_owner
+
+    unassigned =
+      registered
+      |> put_in([:assignments, "handoff", :ownership], %{
+        status: :unassigned,
+        pm_id: nil,
+        capability_id: nil,
+        ownership_revision: 0
+      })
+
+    unowned_fence = %{assignment_id: "handoff", expected_revision: 1, expected_ownership_revision: 0}
+    takeover_args = %{handoff_args | assignments: [unowned_fence]}
+
+    assert {:ok, taken, _} =
+             Rules.apply(
+               unassigned,
+               envelope("operator-takeover", :operator_takeover, takeover_args),
+               %{principal: @operator}
+             )
+
+    assert taken.assignments["handoff"].ownership.pm_id == "target"
   end
 
   test "request history remains bounded after many valid operations" do

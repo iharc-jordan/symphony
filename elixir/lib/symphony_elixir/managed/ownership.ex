@@ -48,7 +48,14 @@ defmodule SymphonyElixir.Managed.Ownership do
 
   @spec assigned(principal(), non_neg_integer()) :: ownership()
   def assigned(principal, revision \\ 1) when is_map(principal) and is_integer(revision) and revision >= 0 do
-    %{unassigned() | status: :owned, pm_id: principal.principal_id, capability_id: principal.capability_id, ownership_revision: revision, changed_at: DateTime.utc_now()}
+    %{
+      unassigned()
+      | status: :owned,
+        pm_id: principal.principal_id,
+        capability_id: principal.capability_id,
+        ownership_revision: revision,
+        changed_at: DateTime.utc_now()
+    }
   end
 
   @spec project_allowed?(principal(), String.t() | nil) :: boolean()
@@ -148,7 +155,14 @@ defmodule SymphonyElixir.Managed.Ownership do
        Map.put(
          assignment,
          :ownership,
-         %{current | pm_id: target.principal_id, capability_id: target.capability_id, ownership_revision: current.ownership_revision + 1, changed_at: DateTime.utc_now(), last_handoff_id: handoff_id}
+         %{
+           current
+           | pm_id: target.principal_id,
+             capability_id: target.capability_id,
+             ownership_revision: current.ownership_revision + 1,
+             changed_at: DateTime.utc_now(),
+             last_handoff_id: handoff_id
+         }
        )}
     else
       {:error, :assignment_not_owned, %{assignment_id: Map.get(assignment, :assignment_id)}}

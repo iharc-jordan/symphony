@@ -201,6 +201,68 @@ defmodule SymphonyElixir.GitHubProjects.Client do
     error -> {:error, {:github_projects_binding_fetch_failed, Exception.message(error)}}
   end
 
+  @doc "Read a named Project's binding using the configured provider credentials."
+  @spec fetch_project_binding(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def fetch_project_binding(project_id, opts \\ []) when is_binary(project_id) do
+    tracker = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
+    request_fun = Keyword.get(opts, :request_fun, &perform_request/2)
+    query = "query SymphonyManagedProject($id: ID!) { node(id: $id) { ... on ProjectV2 { id number } } }"
+
+    with {:ok, settings} <- settings(tracker),
+         {:ok, %{"data" => %{"node" => %{"id" => ^project_id, "number" => number}}}} <-
+           call_graphql(query, %{"id" => project_id}, settings, request_fun),
+         {:ok, status_field} <- fetch_status_field(settings, project_id, request_fun) do
+      {:ok,
+       %{
+         project_id: project_id,
+         project_number: number,
+         status_field_id: status_field.id,
+         status_options: Map.new(status_field.options, fn {id, name} -> {name, id} end)
+       }}
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :github_projects_project_not_found}
+    end
+  end
+
+  @doc "Fetch cards from an explicit, previously validated Project binding."
+  @spec fetch_project_issues(map(), [String.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_project_issues(binding, ids, opts \\ []) when is_map(binding) and is_list(ids) do
+    tracker = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
+    request_fun = Keyword.get(opts, :request_fun, &perform_request/2)
+    project_id = binding[:project_id]
+
+    with true <- present_string?(project_id),
+         {:ok, settings} <- settings(tracker),
+         {:ok, field} <- fetch_status_field(settings, project_id, request_fun),
+         true <- field.id == binding[:status_field_id],
+         {:ok, items} <- fetch_items_by_ids(settings, field, Enum.uniq(ids), request_fun),
+         {:ok, hydrated} <- hydrate_items(items, settings, request_fun),
+         {:ok, issues} <- normalize_items(hydrated, project_id, field, :refresh) do
+      {:ok, issues}
+    else
+      false -> {:error, :github_projects_binding_changed}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "Verify that the optional summary field is a text field in the selected Project."
+  def validate_projection_field(project_id, field_id, opts \\ [])
+  @spec validate_projection_field(String.t(), String.t() | nil, keyword()) :: :ok | {:error, term()}
+  def validate_projection_field(_project_id, nil, _opts), do: :ok
+
+  def validate_projection_field(project_id, field_id, opts) when is_binary(project_id) and is_binary(field_id) do
+    query = "query SymphonyProjectionField($id: ID!) { node(id: $id) { ... on ProjectV2Field { id dataType project { id } } } }"
+
+    case graphql(query, %{"id" => field_id}, opts) do
+      {:ok, %{"data" => %{"node" => %{"id" => ^field_id, "dataType" => "TEXT", "project" => %{"id" => ^project_id}}}}} -> :ok
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :github_projects_projection_field_invalid}
+    end
+  end
+
+  def validate_projection_field(_project_id, _field_id, _opts), do: {:error, :github_projects_projection_field_invalid}
+
   @spec graphql(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def graphql(query, variables \\ %{}, opts \\ [])
       when is_binary(query) and is_map(variables) and is_list(opts) do

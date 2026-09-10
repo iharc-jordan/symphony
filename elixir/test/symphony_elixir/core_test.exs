@@ -377,6 +377,10 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     on_exit(fn ->
+      if File.exists?(hook_fifo) do
+        File.write!(hook_fifo, "\n\n")
+      end
+
       if pid = Process.whereis(runtime_supervisor_name) do
         GenServer.stop(pid)
       end
