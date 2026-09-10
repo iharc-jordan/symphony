@@ -626,8 +626,24 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       },
       events: [
-        %{cursor: 12, at: now, operation: :handoff, source_id: "pm-one", destination_id: "pm-two", assignment_ids: ["assign-active"], reason: "capacity"},
-        %{cursor: 11, at: now, operation: :operator_takeover, source_id: "operator", destination_id: "pm-one", assignment_id: "assign-review", reason: "review owner absent"}
+        %{
+          cursor: 12,
+          at: now,
+          operation: :handoff,
+          source_pm_id: "pm-one",
+          destination_pm_id: "pm-two",
+          assignment_ids: ["assign-active"],
+          reason: "capacity"
+        },
+        %{
+          cursor: 11,
+          at: now,
+          operation: :operator_takeover,
+          source_pm_id: "operator",
+          destination_pm_id: "pm-one",
+          assignment_id: "assign-review",
+          reason: "review owner absent"
+        }
       ]
     }
 
