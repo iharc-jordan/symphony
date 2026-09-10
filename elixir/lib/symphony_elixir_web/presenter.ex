@@ -4,6 +4,8 @@ defmodule SymphonyElixirWeb.Presenter do
   """
 
   alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, Workspace}
+  alias SymphonyElixir.Managed.Control
+  @projection_stale_after_seconds 300
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -24,12 +26,19 @@ defmodule SymphonyElixirWeb.Presenter do
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
+        |> maybe_put_managed(managed_payload(orchestrator, snapshot_timeout_ms, snapshot))
 
       :timeout ->
-        %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
+        %{
+          generated_at: generated_at,
+          error: %{code: "snapshot_timeout", message: "Snapshot timed out"}
+        }
 
       :unavailable ->
-        %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
+        %{
+          generated_at: generated_at,
+          error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}
+        }
     end
   end
 
@@ -62,6 +71,479 @@ defmodule SymphonyElixirWeb.Presenter do
         {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
     end
   end
+
+  defp maybe_put_managed(payload, nil), do: payload
+  defp maybe_put_managed(payload, managed), do: Map.put(payload, :managed, managed)
+
+  defp managed_payload(orchestrator, snapshot_timeout_ms, snapshot) do
+    case value(snapshot, :managed) do
+      managed when is_map(managed) ->
+        managed_state_payload(managed)
+
+      _ ->
+        case Control.state(orchestrator, snapshot_timeout_ms) do
+          {:ok, state} when is_map(state) -> managed_state_payload(state)
+          _ -> nil
+        end
+    end
+  end
+
+  defp managed_state_payload(state) do
+    binding = value(state, :binding) || %{}
+    projects = sanitize_projects(value(state, :projects) || binding)
+    principals = sanitize_principals(value(state, :principals) || %{})
+    assignments = sanitize_assignments(value(state, :assignments) || %{}, principals, binding)
+
+    %{
+      status: "available",
+      revision: integer_or_zero(value(state, :revision) || value(state, :control_revision)),
+      cursor: integer_or_zero(value(state, :cursor) || value(state, :event_cursor)),
+      paused: value(state, :paused) == true,
+      disabled: value(state, :disabled) == true,
+      dispatch_paused: value(state, :paused) == true or value(state, :disabled) == true,
+      projects: projects,
+      principals: principals,
+      assignments: assignments,
+      counts: managed_counts(assignments),
+      handoffs: handoff_history(value(state, :events) || []),
+      projection: projection_summary(assignments)
+    }
+  end
+
+  defp sanitize_projects(projects) when is_map(projects) do
+    Enum.reduce(projects, %{}, fn {key, project}, acc ->
+      project = if is_map(project), do: project, else: %{}
+      project_id = text_value(value(project, :project_id) || key)
+
+      if project_id do
+        Map.put(
+          acc,
+          project_id,
+          compact(%{
+            project_id: project_id,
+            project_number: value(project, :project_number),
+            status_field_id: text_value(value(project, :status_field_id)),
+            status_field_name: text_value(value(project, :status_field_name)),
+            owner: text_value(value(project, :owner)),
+            owner_type: text_value(value(project, :owner_type)),
+            repositories: safe_repositories(value(project, :repositories)),
+            status_options: safe_status_options(value(project, :status_options)),
+            revision: integer_or_zero(value(project, :revision))
+          })
+        )
+      else
+        acc
+      end
+    end)
+  end
+
+  defp sanitize_projects(projects) when is_list(projects) do
+    sanitize_projects(Map.new(projects, fn project -> {value(project, :project_id), project} end))
+  end
+
+  defp sanitize_projects(_projects), do: %{}
+
+  defp sanitize_principals(principals) when is_map(principals) do
+    Enum.reduce(principals, %{}, fn {key, principal}, acc ->
+      principal = if is_map(principal), do: principal, else: %{}
+      source_id = text_value(value(principal, :principal_id) || key)
+      task_id = text_value(value(principal, :task_id) || value(principal, :task_uuid))
+      principal_id = task_id || source_id
+
+      if principal_id do
+        display_name = text_value(value(principal, :display_name) || value(principal, :name) || value(principal, :title))
+
+        Map.put(
+          acc,
+          principal_id,
+          %{
+            principal_id: source_id || principal_id,
+            display_name: display_name || principal_id,
+            role: text_value(value(principal, :role)),
+            task_id: task_id || principal_id,
+            title: text_value(value(principal, :title)),
+            codex_link: verified_codex_link(principal)
+          }
+        )
+      else
+        acc
+      end
+    end)
+  end
+
+  defp sanitize_principals(_principals), do: %{}
+
+  defp principal_display_name(principals, principal_id) do
+    get_in(principals, [principal_id, :display_name]) ||
+      Enum.find_value(principals, fn {_task_id, principal} ->
+        if Map.get(principal, :principal_id) == principal_id, do: Map.get(principal, :display_name)
+      end)
+  end
+
+  defp sanitize_assignments(assignments, principals, binding) when is_map(assignments) do
+    project_id = text_value(value(binding, :project_id))
+
+    Enum.reduce(assignments, %{}, fn {key, assignment}, acc ->
+      assignment = if is_map(assignment), do: assignment, else: %{}
+      assignment_id = text_value(value(assignment, :assignment_id) || key)
+
+      if assignment_id do
+        Map.put(acc, assignment_id, assignment_payload(assignment, assignment_id, project_id, principals))
+      else
+        acc
+      end
+    end)
+  end
+
+  defp sanitize_assignments(assignments, principals, binding) when is_list(assignments) do
+    sanitize_assignments(
+      Map.new(assignments, fn assignment -> {value(assignment, :assignment_id), assignment} end),
+      principals,
+      binding
+    )
+  end
+
+  defp sanitize_assignments(_assignments, _principals, _binding), do: %{}
+
+  defp assignment_payload(assignment, assignment_id, default_project_id, principals) do
+    ownership_raw = value(assignment, :ownership) || %{}
+    owner_raw = value(assignment, :owner) || %{}
+    pm_id = text_value(value(ownership_raw, :pm_id) || value(owner_raw, :pm_id) || value(owner_raw, :principal_id))
+    projection = projection_payload(value(assignment, :projection))
+    phase = phase_name(value(assignment, :phase) || value(assignment, :board_state) || value(assignment, :status))
+    status = text_value(value(assignment, :status) || value(assignment, :board_state) || value(assignment, :phase)) || "unknown"
+    task_id = text_value(value(assignment, :task_uuid) || value(assignment, :task_id) || value(assignment, :thread_id) || value(assignment, :session_id))
+    owner_name = pm_id && principal_display_name(principals, pm_id)
+
+    ownership_status =
+      text_value(value(ownership_raw, :status)) ||
+        if(
+          value(ownership_raw, :needs_claim) == true,
+          do: "needs_claim",
+          else: if(pm_id, do: "owned", else: "unassigned")
+        )
+
+    title = text_value(value(assignment, :title) || value(assignment, :task_title) || value(assignment, :issue_title))
+
+    compact(%{
+      assignment_id: assignment_id,
+      project_id: text_value(value(assignment, :project_id)) || default_project_id,
+      repository: text_value(value(assignment, :repository)),
+      issue_number: value(assignment, :issue_number),
+      title: title,
+      task: %{id: task_id, title: title, codex_link: verified_codex_link(assignment)},
+      phase: phase,
+      status: status,
+      board_state: text_value(value(assignment, :board_state)),
+      ownership: %{
+        pm_id: pm_id,
+        display_name: owner_name || text_value(value(owner_raw, :display_name) || value(owner_raw, :name)),
+        status: ownership_status,
+        ownership_revision: integer_or_nil(value(ownership_raw, :ownership_revision) || value(ownership_raw, :revision))
+      },
+      dispatch_paused: value(assignment, :dispatch_paused) == true,
+      operator_reconciliation_required: value(assignment, :operator_reconciliation_required) == true,
+      worker: safe_worker(assignment),
+      projection: projection,
+      reports: safe_reports(value(assignment, :reports) || value(assignment, :report)),
+      usage: safe_usage(value(assignment, :usage)),
+      attempt: safe_attempt(value(assignment, :attempt)),
+      thread: safe_thread(assignment),
+      workspace: safe_workspace(assignment)
+    })
+  end
+
+  defp projection_payload(nil), do: %{status: "unknown", revision: nil, updated_at: nil, synced_at: nil, retry_at: nil, error: nil, stale: true}
+
+  defp projection_payload(projection) when is_map(projection) do
+    status = projection_status(value(projection, :status))
+    updated_at = iso8601(value(projection, :updated_at))
+    synced_at = iso8601(value(projection, :synced_at))
+    retry_at = iso8601(value(projection, :retry_at))
+
+    %{
+      status: status,
+      revision: integer_or_nil(value(projection, :revision)),
+      updated_at: updated_at,
+      synced_at: synced_at,
+      retry_at: retry_at,
+      error: safe_text(value(projection, :error)),
+      stale: projection_stale?(status, updated_at)
+    }
+  end
+
+  defp projection_payload(_projection), do: projection_payload(nil)
+
+  defp projection_status(status) do
+    case status |> text_value() |> to_string() |> String.downcase() do
+      "synced" -> "synced"
+      "pending" -> "pending"
+      "failed" -> "failed"
+      _ -> "unknown"
+    end
+  end
+
+  defp projection_stale?(status, updated_at) do
+    status != "synced" or is_nil(updated_at) or
+      case DateTime.from_iso8601(updated_at) do
+        {:ok, timestamp, _offset} ->
+          DateTime.diff(DateTime.utc_now(), timestamp, :second) > @projection_stale_after_seconds
+
+        _ ->
+          true
+      end
+  end
+
+  defp safe_reports(nil), do: []
+
+  defp safe_reports(reports) when is_list(reports) do
+    Enum.map(reports, fn report ->
+      if is_map(report) do
+        compact(%{
+          kind: text_value(value(report, :kind) || value(report, :type)),
+          status: text_value(value(report, :status)),
+          updated_at: iso8601(value(report, :updated_at)),
+          count: value(report, :count),
+          url: safe_external_url(value(report, :url))
+        })
+      else
+        %{status: "available"}
+      end
+    end)
+  end
+
+  defp safe_reports(report) when is_map(report), do: safe_reports([report])
+  defp safe_reports(_reports), do: []
+
+  defp safe_usage(nil), do: %{}
+
+  defp safe_usage(usage) when is_map(usage) do
+    usage
+    |> Map.take([:baseline_tokens, :cumulative_tokens, :inflight_tokens, :overshoot_tokens, :cap_reached, :limit_tokens, :input_tokens, :output_tokens, :total_tokens])
+    |> Enum.reduce(%{}, fn {key, val}, acc ->
+      if is_integer(val) or is_float(val) or is_boolean(val), do: Map.put(acc, key, val), else: acc
+    end)
+  end
+
+  defp safe_usage(_usage), do: %{}
+
+  defp safe_attempt(nil), do: %{}
+
+  defp safe_attempt(attempt) when is_map(attempt) do
+    attempt
+    |> Map.take([:id, :number, :attempt, :status, :started_at, :completed_at, :retry_count, :turn_count])
+    |> Enum.reduce(%{}, fn {key, val}, acc ->
+      value = if key in [:started_at, :completed_at], do: iso8601(val), else: val
+      if is_binary(value) or is_integer(value) or is_boolean(value), do: Map.put(acc, key, value), else: acc
+    end)
+  end
+
+  defp safe_attempt(attempt) when is_integer(attempt), do: %{number: attempt}
+  defp safe_attempt(_attempt), do: %{}
+
+  defp safe_worker(assignment) do
+    worker = value(assignment, :worker) || %{}
+
+    %{
+      id: text_value(value(assignment, :worker_id) || value(assignment, :agent_id) || value(worker, :id) || value(worker, :worker_id)),
+      active: value(assignment, :worker_active) || value(worker, :active),
+      activity: text_value(value(assignment, :worker_activity) || value(assignment, :activity) || value(worker, :activity))
+    }
+  end
+
+  defp safe_thread(assignment) do
+    thread = value(assignment, :thread) || %{}
+
+    %{
+      id: text_value(value(assignment, :thread_id) || value(assignment, :session_id) || value(assignment, :task_uuid) || value(thread, :id) || value(thread, :thread_id)),
+      title: text_value(value(assignment, :title) || value(assignment, :task_title) || value(thread, :title)),
+      codex_link: verified_codex_link(assignment)
+    }
+  end
+
+  defp safe_workspace(assignment) do
+    workspace = value(assignment, :workspace)
+
+    compact(%{
+      present: not is_nil(workspace) or not is_nil(value(assignment, :workspace_path)),
+      status: if(is_map(workspace), do: text_value(value(workspace, :status)), else: nil),
+      branch: if(is_map(workspace), do: text_value(value(workspace, :branch)), else: nil)
+    })
+  end
+
+  defp managed_counts(assignments) do
+    values = Map.values(assignments)
+
+    %{
+      running: Enum.count(values, &(Map.get(&1, :phase) == "active")),
+      queued: Enum.count(values, &(Map.get(&1, :phase) in ["bound", "ready", "queued"])),
+      review: Enum.count(values, &(Map.get(&1, :phase) == "review")),
+      waiting: Enum.count(values, &(Map.get(&1, :phase) in ["waiting", "rework"])),
+      blocked:
+        Enum.count(values, fn assignment ->
+          Map.get(assignment, :dispatch_paused) == true or
+            get_in(assignment, [:projection, :status]) in ["failed", "unknown"] or
+            get_in(assignment, [:ownership, :status]) == "needs_claim" or
+            Map.get(assignment, :operator_reconciliation_required) == true or
+            String.downcase(Map.get(assignment, :status, "")) in ["blocked", "failed", "error"]
+        end)
+    }
+  end
+
+  defp projection_summary(assignments) do
+    values = Map.values(assignments)
+
+    errors =
+      values
+      |> Enum.filter(&(get_in(&1, [:projection, :status]) == "failed"))
+      |> Enum.map(fn assignment ->
+        %{assignment_id: assignment.assignment_id, error: get_in(assignment, [:projection, :error]) || "Projection failed"}
+      end)
+
+    stale = Enum.any?(values, &get_in(&1, [:projection, :stale]))
+
+    status =
+      cond do
+        errors != [] -> "failed"
+        stale -> "stale"
+        Enum.any?(values, &(get_in(&1, [:projection, :status]) == "pending")) -> "pending"
+        true -> "synced"
+      end
+
+    %{status: status, stale: stale, errors: errors}
+  end
+
+  defp handoff_history(events) when is_list(events) do
+    events
+    |> Enum.filter(fn event -> event_operation(event) in ["handoff", "operator_takeover"] end)
+    |> Enum.take(20)
+    |> Enum.map(fn event ->
+      %{
+        cursor: value(event, :cursor),
+        at: iso8601(value(event, :at)),
+        operation: event_operation(event),
+        source_id: text_value(value(event, :source_id) || value(event, :source_pm_id) || value(event, :from)),
+        destination_id: text_value(value(event, :destination_id) || value(event, :destination_pm_id) || value(event, :to)),
+        assignment_id: text_value(value(event, :assignment_id)),
+        assignment_ids: safe_id_list(value(event, :assignment_ids)),
+        reason: safe_text(value(event, :reason))
+      }
+    end)
+  end
+
+  defp handoff_history(_events), do: []
+
+  defp event_operation(event) when is_map(event), do: text_value(value(event, :operation))
+  defp event_operation(_event), do: nil
+
+  defp safe_id_list(ids) when is_list(ids), do: ids |> Enum.map(&text_value/1) |> Enum.reject(&is_nil/1)
+  defp safe_id_list(id), do: if(text_value(id), do: [text_value(id)], else: [])
+
+  defp verified_codex_link(map) when is_map(map) do
+    thread = value(map, :thread) || %{}
+
+    verified? =
+      value(map, :codex_link_verified) == true or
+        value(map, :task_link_verified) == true or
+        value(map, :codex_url_verified) == true or
+        value(thread, :codex_link_verified) == true or
+        value(thread, :task_link_verified) == true
+
+    link =
+      value(map, :codex_link) ||
+        value(map, :task_link) ||
+        value(map, :codex_url) ||
+        value(map, :task_url) ||
+        value(thread, :codex_link) ||
+        value(thread, :task_link)
+
+    if verified? and is_binary(link) and String.trim(link) =~ ~r/^codex:\/\/threads\/[^\/\s]+$/ do
+      String.trim(link)
+    else
+      nil
+    end
+  end
+
+  defp verified_codex_link(_map), do: nil
+
+  defp safe_repositories(repositories) when is_list(repositories) do
+    repositories |> Enum.map(&text_value/1) |> Enum.reject(&is_nil/1) |> Enum.uniq()
+  end
+
+  defp safe_repositories(_repositories), do: []
+
+  defp safe_status_options(options) when is_map(options) do
+    Enum.reduce(options, %{}, fn {key, option_id}, acc ->
+      case {text_value(key), text_value(option_id)} do
+        {name, id} when not is_nil(name) and not is_nil(id) -> Map.put(acc, name, id)
+        _ -> acc
+      end
+    end)
+  end
+
+  defp safe_status_options(options) when is_list(options) do
+    safe_status_options(Map.new(options, fn item -> {value(item, :name), value(item, :id)} end))
+  end
+
+  defp safe_status_options(_options), do: %{}
+
+  defp safe_external_url(url) when is_binary(url) do
+    case URI.parse(String.trim(url)) do
+      %URI{scheme: scheme, host: host} when scheme in ["http", "https"] and is_binary(host) and host != "" ->
+        String.trim(url)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp safe_external_url(_url), do: nil
+
+  defp integer_or_zero(value) when is_integer(value), do: value
+  defp integer_or_zero(_value), do: 0
+  defp integer_or_nil(value) when is_integer(value), do: value
+  defp integer_or_nil(_value), do: nil
+
+  defp phase_name(value) do
+    value
+    |> text_value()
+    |> case do
+      nil -> "unknown"
+      phase -> String.downcase(phase)
+    end
+  end
+
+  defp value(map, key) when is_map(map) do
+    case Map.fetch(map, key) do
+      {:ok, val} -> val
+      :error -> Map.get(map, Atom.to_string(key))
+    end
+  end
+
+  defp value(_map, _key), do: nil
+
+  defp text_value(nil), do: nil
+
+  defp text_value(value) when is_binary(value) do
+    value = String.trim(value)
+    if value == "", do: nil, else: String.slice(value, 0, 240)
+  end
+
+  defp text_value(value) when is_atom(value), do: value |> Atom.to_string() |> text_value()
+  defp text_value(value) when is_integer(value), do: Integer.to_string(value)
+  defp text_value(_value), do: nil
+
+  defp safe_text(nil), do: nil
+
+  defp safe_text(value) when is_binary(value) do
+    value
+    |> String.replace(~r{(?:[A-Za-z]:[\/]|/(?:home|Users|tmp|workspaces)/)\S+}, "[path]")
+    |> text_value()
+  end
+
+  defp safe_text(value), do: value |> inspect(limit: 20, printable_limit: 240) |> text_value()
+
+  defp compact(map), do: Enum.reject(map, fn {_key, value} -> is_nil(value) end) |> Map.new()
 
   defp issue_payload_body(issue_identifier, running, retry, blocked) do
     %{

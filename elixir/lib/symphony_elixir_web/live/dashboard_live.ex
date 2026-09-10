@@ -112,6 +112,186 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
         </section>
 
+
+        <%= if @payload[:managed] do %>
+          <section class="section-card managed-summary">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Managed operations</h2>
+                <p class="section-copy">Project ownership and worker state from the managed control plane.</p>
+              </div>
+              <span class={managed_status_class(@payload.managed.status)}>
+                <%= humanize_status(@payload.managed.status) %>
+              </span>
+            </div>
+
+            <p class={managed_dispatch_class(@payload.managed.dispatch_paused)}>
+              Dispatch: <strong><%= if @payload.managed.dispatch_paused, do: "paused", else: "enabled" %></strong>
+            </p>
+
+            <div class="managed-count-grid">
+              <%= for {label, key} <- [{"Running", :running}, {"Queued", :queued}, {"Review", :review}, {"Waiting", :waiting}, {"Blocked", :blocked}] do %>
+                <article class="managed-count-card">
+                  <p class="metric-label"><%= label %></p>
+                  <p class="metric-value numeric"><%= @payload.managed.counts[key] %></p>
+                </article>
+              <% end %>
+            </div>
+
+            <%= if @payload.managed.projection.stale or @payload.managed.projection.errors != [] do %>
+              <div class="projection-alert">
+                <strong>Projection health: <%= humanize_status(@payload.managed.projection.status) %></strong>
+                <%= if @payload.managed.projection.stale do %>
+                  <span>Some managed state is stale.</span>
+                <% end %>
+                <%= for error <- @payload.managed.projection.errors do %>
+                  <span><%= error.assignment_id %>: <%= error.error %></span>
+                <% end %>
+              </div>
+            <% end %>
+          </section>
+
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Projects and repositories</h2>
+                <p class="section-copy">Bound project identities and their allowed repositories.</p>
+              </div>
+            </div>
+
+            <%= if map_size(@payload.managed.projects) == 0 do %>
+              <p class="empty-state">No managed projects are bound.</p>
+            <% else %>
+              <div class="managed-project-grid">
+                <article :for={{project_id, project} <- managed_entries(@payload.managed.projects)} class="managed-project-card">
+                  <h3><%= project_id %></h3>
+                  <p class="muted">
+                    Project #<%= Map.get(project, :project_number) || "n/a" %>
+                    <%= if Map.get(project, :revision) do %> · revision <%= Map.get(project, :revision) %><% end %>
+                  </p>
+                  <p><strong>Repositories</strong></p>
+                  <p class="mono"><%= join_values(project.repositories) %></p>
+                </article>
+              </div>
+            <% end %>
+          </section>
+
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Managed assignments</h2>
+                <p class="section-copy">Who owns each task, where it is in the workflow, and whether its provider projection is current.</p>
+              </div>
+            </div>
+
+            <%= if map_size(@payload.managed.assignments) == 0 do %>
+              <p class="empty-state">No managed assignments are enrolled.</p>
+            <% else %>
+              <div class="table-wrap">
+                <table class="data-table managed-assignment-table">
+                  <thead>
+                    <tr>
+                      <th>Task</th>
+                      <th>Project / repository</th>
+                      <th>Responsible PM</th>
+                      <th>Work status</th>
+                      <th>Worker</th>
+                      <th>Projection</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr :for={{_assignment_id, assignment} <- managed_entries(@payload.managed.assignments)}>
+                      <td>
+                        <div class="issue-stack">
+                          <%= if assignment.task.codex_link do %>
+                            <a class="issue-id issue-id-link" href={assignment.task.codex_link}><%= task_label(assignment) %></a>
+                          <% else %>
+                            <span class="issue-id"><%= task_label(assignment) %></span>
+                          <% end %>
+                          <span class="muted mono"><%= assignment.assignment_id %></span>
+                        </div>
+                      </td>
+                      <td>
+                        <span><%= Map.get(assignment, :project_id) || "n/a" %></span>
+                        <span class="muted"><%= Map.get(assignment, :repository) || "repository unavailable" %></span>
+                      </td>
+                      <td>
+                        <span class={owner_class(assignment)}><%= owner_label(assignment) %></span>
+                        <span class="muted"><%= humanize_status(assignment.ownership.status) %></span>
+                        <%= if assignment.operator_reconciliation_required do %>
+                          <span class="muted">Operator reconciliation required</span>
+                        <% end %>
+                      </td>
+                      <td><span class={managed_status_class(assignment.status)}><%= humanize_status(assignment.status) %></span></td>
+                      <td>
+                        <span class="mono"><%= worker_label(assignment) %></span>
+                        <%= if assignment.worker.activity do %>
+                          <span class="muted"><%= assignment.worker.activity %></span>
+                        <% end %>
+                      </td>
+                      <td>
+                        <span class={projection_status_class(assignment.projection)}>
+                          <%= projection_label(assignment.projection) %>
+                        </span>
+                        <%= if assignment.projection.error do %>
+                          <span class="muted"><%= assignment.projection.error %></span>
+                        <% end %>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            <% end %>
+          </section>
+
+          <%= if map_size(@payload.managed.principals) > 0 do %>
+            <section class="section-card">
+              <div class="section-header">
+                <div>
+                  <h2 class="section-title">Responsible PMs</h2>
+                  <p class="section-copy">Principal identities available to own managed tasks.</p>
+                </div>
+              </div>
+              <div class="managed-principal-grid">
+                <article :for={{principal_id, principal} <- managed_entries(@payload.managed.principals)} class="managed-principal-card">
+                  <strong><%= principal.display_name %></strong>
+                  <span class="muted mono"><%= principal_id %></span>
+                  <%= if principal.codex_link do %>
+                    <a class="issue-link" href={principal.codex_link}>Open task</a>
+                  <% else %>
+                    <span class="muted">Task link unavailable</span>
+                  <% end %>
+                </article>
+              </div>
+            </section>
+          <% end %>
+
+          <%= if @payload.managed.handoffs != [] do %>
+            <section class="section-card">
+              <div class="section-header">
+                <div>
+                  <h2 class="section-title">Handoff history</h2>
+                  <p class="section-copy">Recent ownership transfers and operator takeovers recorded by managed state.</p>
+                </div>
+              </div>
+              <div class="handoff-list">
+                <article :for={handoff <- @payload.managed.handoffs} class="handoff-entry">
+                  <div>
+                    <strong><%= humanize_status(handoff.operation) %></strong>
+                    <span class="muted mono"><%= handoff.at || "time unavailable" %></span>
+                  </div>
+                  <p>
+                    <span class="mono"><%= handoff.source_id || "source unavailable" %></span>
+                    <span aria-hidden="true"> → </span>
+                    <span class="mono"><%= handoff.destination_id || "destination unavailable" %></span>
+                  </p>
+                  <p class="muted"><%= handoff_reason(handoff) %></p>
+                </article>
+              </div>
+            </section>
+          <% end %>
+        <% end %>
+
         <section class="section-card">
           <div class="section-header">
             <div>
@@ -328,6 +508,84 @@ defmodule SymphonyElixirWeb.DashboardLive do
     </section>
     """
   end
+
+  defp managed_entries(map) when is_map(map), do: Enum.sort_by(map, fn {id, _entry} -> to_string(id) end)
+  defp managed_entries(_map), do: []
+
+  defp humanize_status(nil), do: "Unavailable"
+
+  defp humanize_status(status) do
+    status
+    |> to_string()
+    |> String.replace("_", " ")
+    |> String.split()
+    |> Enum.map(&String.capitalize/1)
+    |> Enum.join(" ")
+  end
+
+  defp managed_status_class(status) do
+    normalized = status |> to_string() |> String.downcase()
+    base = "state-badge"
+
+    cond do
+      normalized in ["available", "synced", "active", "owned", "enabled"] -> "#{base} state-badge-active"
+      normalized in ["failed", "blocked", "error", "stale", "unknown", "unassigned"] -> "#{base} state-badge-danger"
+      true -> "#{base} state-badge-warning"
+    end
+  end
+
+  defp managed_dispatch_class(true), do: "managed-dispatch managed-dispatch-paused"
+  defp managed_dispatch_class(false), do: "managed-dispatch managed-dispatch-enabled"
+
+  defp projection_status_class(%{status: "synced", stale: false}), do: "state-badge state-badge-active"
+  defp projection_status_class(%{status: "failed"}), do: "state-badge state-badge-danger"
+  defp projection_status_class(%{status: status}) when status in ["pending", "stale"], do: "state-badge state-badge-warning"
+  defp projection_status_class(_projection), do: "state-badge state-badge-danger"
+
+  defp projection_label(%{status: status, stale: true}) when status == "synced", do: "Stale"
+  defp projection_label(%{status: status}), do: humanize_status(status)
+  defp projection_label(_projection), do: "Unknown"
+
+  defp owner_class(assignment) do
+    if assignment.ownership.status == "unassigned", do: "managed-owner managed-owner-missing", else: "managed-owner"
+  end
+
+  defp owner_label(assignment) do
+    cond do
+      assignment.ownership.status == "needs_claim" -> "Operator claim required"
+      assignment.ownership.status == "needs_operator_reconciliation" -> "Operator reconciliation required"
+      assignment.ownership.display_name -> assignment.ownership.display_name
+      assignment.ownership.pm_id -> assignment.ownership.pm_id
+      assignment.phase == "review" -> "Review owner unavailable"
+      true -> "No PM owner"
+    end
+  end
+
+  defp task_label(assignment) do
+    Map.get(assignment, :title) || assignment.task.id || assignment.assignment_id
+  end
+
+  defp worker_label(assignment) do
+    cond do
+      assignment.worker.id && assignment.worker.active == true -> assignment.worker.id <> " (active)"
+      assignment.worker.id && assignment.worker.active == false -> assignment.worker.id <> " (down)"
+      assignment.thread.id -> assignment.thread.id
+      assignment.task.id -> assignment.task.id
+      true -> "not running"
+    end
+  end
+
+  defp handoff_reason(handoff) do
+    cond do
+      handoff.reason -> handoff.reason
+      handoff.assignment_id -> "Assignment " <> handoff.assignment_id
+      handoff.assignment_ids != [] -> "Assignments " <> Enum.join(handoff.assignment_ids, ", ")
+      true -> "Assignment details unavailable"
+    end
+  end
+
+  defp join_values(values) when is_list(values) and values != [], do: Enum.join(values, ", ")
+  defp join_values(_values), do: "None recorded"
 
   defp load_payload do
     Presenter.state_payload(orchestrator(), snapshot_timeout_ms())

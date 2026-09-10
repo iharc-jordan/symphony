@@ -54,6 +54,10 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:reply, Keyword.fetch!(state, :snapshot), state}
     end
 
+    def handle_call(:managed_state, _from, state) do
+      {:reply, Keyword.get(state, :managed_state, {:error, :managed_mode_disabled}), state}
+    end
+
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
@@ -563,6 +567,100 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     refute render(view) =~ "javascript:alert"
+  end
+
+  test "managed dashboard shows ownership, projects, worker counts, handoffs, and projection health" do
+    orchestrator_name = Module.concat(__MODULE__, :ManagedDashboardOrchestrator)
+    now = DateTime.utc_now()
+    stale = DateTime.add(now, -600, :second)
+
+    managed_state = %{
+      revision: 7,
+      cursor: 12,
+      paused: false,
+      disabled: false,
+      projects: %{
+        "project-alpha" => %{project_id: "project-alpha", project_number: 4, repositories: ["org/repo-alpha"], revision: 2},
+        "project-beta" => %{project_id: "project-beta", project_number: 8, repositories: ["org/repo-beta"], revision: 3}
+      },
+      principals: %{
+        "pm-one" => %{display_name: "PM One", task_uuid: "task-pm-one", codex_link: "codex://threads/task-pm-one", codex_link_verified: true},
+        "pm-two" => %{display_name: "PM Two", task_uuid: "task-pm-two"}
+      },
+      assignments: %{
+        "assign-active" => %{
+          assignment_id: "assign-active",
+          project_id: "project-alpha",
+          repository: "org/repo-alpha",
+          issue_number: 11,
+          title: "Build alpha",
+          phase: :active,
+          status: "active",
+          ownership: %{pm_id: "pm-one", status: :owned, ownership_revision: 4},
+          worker_id: "worker-alpha",
+          worker_active: true,
+          worker_activity: "running tests",
+          projection: %{status: :synced, revision: 2, updated_at: now, synced_at: now}
+        },
+        "assign-queued" => %{
+          assignment_id: "assign-queued",
+          project_id: "project-beta",
+          repository: "org/repo-beta",
+          issue_number: 22,
+          title: "Queue beta",
+          task_uuid: "task-beta",
+          phase: :ready,
+          status: "queued",
+          ownership: %{status: :needs_claim},
+          projection: %{status: :pending, revision: 1, updated_at: stale, retry_at: now}
+        },
+        "assign-review" => %{
+          assignment_id: "assign-review",
+          project_id: "project-alpha",
+          repository: "org/repo-alpha",
+          issue_number: 33,
+          title: "Review alpha",
+          phase: :review,
+          status: "review",
+          projection: %{status: :failed, revision: 5, updated_at: now, error: "provider projection failed"}
+        }
+      },
+      events: [
+        %{cursor: 12, at: now, operation: :handoff, source_id: "pm-one", destination_id: "pm-two", assignment_ids: ["assign-active"], reason: "capacity"},
+        %{cursor: 11, at: now, operation: :operator_takeover, source_id: "operator", destination_id: "pm-one", assignment_id: "assign-review", reason: "review owner absent"}
+      ]
+    }
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        managed_state: {:ok, managed_state}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "Managed operations"
+    assert html =~ "project-alpha"
+    assert html =~ "project-beta"
+    assert html =~ "org/repo-alpha"
+    assert html =~ "org/repo-beta"
+    assert html =~ "PM One"
+    assert html =~ "PM Two"
+    assert html =~ "Operator claim required"
+    assert html =~ "Review owner unavailable"
+    assert html =~ "worker-alpha (active)"
+    assert html =~ "running tests"
+    assert html =~ "Projection health"
+    assert html =~ "provider projection failed"
+    assert html =~ "Handoff history"
+    assert html =~ "Operator Takeover"
+    assert html =~ "pm-one"
+    assert html =~ "pm-two"
+    assert html =~ ~s(href="codex://threads/task-pm-one")
+    refute html =~ "codex://threads/task-beta"
+    refute html =~ "/workspaces/"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
