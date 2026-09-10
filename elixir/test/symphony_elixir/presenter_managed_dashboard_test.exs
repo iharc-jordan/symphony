@@ -21,6 +21,7 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
   test "projects current V2 assignments and excludes terminal history from health and counts" do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     terminal_projection_time = DateTime.add(now, -3_600, :second)
+    running_started_at = DateTime.add(now, -75, :second)
 
     managed = %{
       revision: 9,
@@ -45,7 +46,8 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
           turn_model: "gpt-5.6-luna",
           turn_effort: "xhigh",
           route: %{model: "gpt-5.6-terra", effort: "max"},
-          started_at: now,
+          started_at: terminal_projection_time,
+          usage: %{input_tokens: 901, output_tokens: 902, total_tokens: 1_803, seconds_running: 9_999},
           last_report: %{
             kind: "checkpoint",
             summary: "<safe summary>",
@@ -59,6 +61,7 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
           title: "Queued task",
           ownership: %{pm_id: "pm-two", status: :owned},
           worker_active: false,
+          usage: %{input_tokens: 21, output_tokens: 34, total_tokens: 55, seconds_running: 123},
           turn_model: "gpt-5.6-luna",
           turn_effort: "xhigh",
           route: %{model: "gpt-5.6-terra", effort: "max"},
@@ -85,6 +88,8 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
           phase: :accepted,
           ownership: %{pm_id: "pm-one", status: :owned},
           worker_active: true,
+          usage: %{input_tokens: 7, output_tokens: 8, total_tokens: 15, seconds_running: 64},
+          started_at: terminal_projection_time,
           projection: %{status: :failed, revision: 5, updated_at: terminal_projection_time, error: "old failure"}
         },
         "cancelled-history" => %{
@@ -97,7 +102,23 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
     }
 
     snapshot = %{
-      running: [],
+      running: [
+        %{
+          issue_id: "active",
+          identifier: "ACTIVE",
+          issue_url: "https://example.org/issues/ACTIVE",
+          state: "In Progress",
+          session_id: "session-active",
+          turn_count: 4,
+          last_codex_event: :notification,
+          last_codex_message: "live",
+          last_codex_timestamp: now,
+          codex_input_tokens: 4,
+          codex_output_tokens: 8,
+          codex_total_tokens: 12,
+          started_at: running_started_at
+        }
+      ],
       retrying: [],
       blocked: [],
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
@@ -115,7 +136,28 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
     assert assignments["active"].ownership.display_name == "PM <One>"
     assert assignments["active"].route == %{model: "gpt-5.6-luna", effort: "xhigh", source: "running"}
     assert assignments["queued"].route == %{model: "gpt-5.6-terra", effort: "max", source: "configured"}
-    assert assignments["active"].started_at == DateTime.to_iso8601(now)
+    assert assignments["active"].started_at == DateTime.to_iso8601(terminal_projection_time)
+
+    assert assignments["active"].usage == %{
+             input_tokens: 901,
+             output_tokens: 902,
+             total_tokens: 1_803,
+             seconds_running: 9_999
+           }
+
+    assert assignments["queued"].usage == %{
+             input_tokens: 21,
+             output_tokens: 34,
+             total_tokens: 55,
+             seconds_running: 123
+           }
+
+    assert assignments["accepted-history"].usage == %{
+             input_tokens: 7,
+             output_tokens: 8,
+             total_tokens: 15,
+             seconds_running: 64
+           }
 
     assert assignments["active"].worker == %{
              id: "worker-1",

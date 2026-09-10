@@ -374,15 +374,26 @@ The observability UI now runs on a minimal Phoenix stack:
 - Phoenix dependency static assets for the LiveView client bootstrap
 - Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
 
-The default **Live work** view groups open assignments by their current PM and draws their
+The default **Live work** view groups current assignments by their PM and draws their
 ownership connections as a map. Select a task for its state, model and effort, worker host,
 latest report, and issue link. Observed model settings are labelled as running only while the
 worker is active; otherwise the configured settings are shown. Search and a list view are also available. Moving connections
 mean the runtime reports an active worker; PM registration and the assignment phase alone do
 not prove that a Codex task is running.
 
-**History** contains accepted and cancelled assignments, including those with stop bookkeeping
-still pending. They are excluded from live counts and health. **Runtime** keeps the detailed
+Runtime and total tokens appear on task nodes and list rows; selecting a task also shows input
+and output tokens. Active tasks use their current session's counters and elapsed runtime.
+Inactive tasks retain their recorded usage and runtime, and missing values say "Not recorded".
+The live summary covers running workers; aggregate service totals, including completed sessions,
+remain in Runtime.
+
+Completed and cancelled subtasks remain connected to the current PM, with a completed count,
+so finishing a worker does not remove part of the PM's task. The selected PM is retained in the
+page URL, including after its final worker finishes, and a page refresh preserves that context.
+Completed subtasks do not animate or count as running, even with pending stop bookkeeping.
+
+**History** contains completed assignments from earlier PMs, outside the current PM context.
+They are excluded from live counts and health. **Runtime** keeps the detailed
 worker, project, and ownership-transfer information. These views observe existing state and
 refresh through PubSub without changing ownership, dispatch, or worker execution.
 

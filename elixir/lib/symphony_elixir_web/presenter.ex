@@ -378,7 +378,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp safe_usage(usage) when is_map(usage) do
     usage
-    |> Map.take([:baseline_tokens, :cumulative_tokens, :inflight_tokens, :overshoot_tokens, :cap_reached, :limit_tokens, :input_tokens, :output_tokens, :total_tokens])
+    |> Map.take([:baseline_tokens, :cumulative_tokens, :inflight_tokens, :overshoot_tokens, :cap_reached, :limit_tokens, :input_tokens, :output_tokens, :total_tokens, :seconds_running])
     |> Enum.reduce(%{}, fn {key, val}, acc ->
       if is_integer(val) or is_float(val) or is_boolean(val), do: Map.put(acc, key, val), else: acc
     end)
@@ -412,8 +412,9 @@ defmodule SymphonyElixirWeb.Presenter do
   defp assignment_route(assignment) do
     route = field_value(assignment, :route) || %{}
     turn_model = text_value(field_value(assignment, :turn_model))
+    active = nonterminal_assignment?(assignment) and field_value(assignment, :worker_active) == true
 
-    if field_value(assignment, :worker_active) == true and not is_nil(turn_model) do
+    if active and not is_nil(turn_model) do
       %{model: turn_model, effort: text_value(field_value(assignment, :turn_effort)), source: "running"}
     else
       %{model: text_value(field_value(route, :model)), effort: text_value(field_value(route, :effort)), source: "configured"}

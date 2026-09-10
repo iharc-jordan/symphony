@@ -11,15 +11,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
   @terminal_phases ["accepted", "cancelled"]
 
   @impl true
-  def mount(_params, _session, socket) do
+  def mount(params, _session, socket) do
     socket =
       socket
       |> assign(:payload, load_payload())
       |> assign(:now, DateTime.utc_now())
-      |> assign(:view, "live")
+      |> assign(:view, normalized_view(params["view"]))
       |> assign(:display_mode, "map")
       |> assign(:query, "")
-      |> assign(:selected_pm, nil)
+      |> assign(:selected_pm, if(normalized_view(params["view"]) == "live", do: params["pm"]))
+      |> assign(:context_pm, params["pm"])
+      |> assign(:retained_pm_ids, Enum.reject([params["pm"]], &is_nil/1))
       |> assign(:selected_task_id, nil)
       |> refresh_view()
 
@@ -29,6 +31,28 @@ defmodule SymphonyElixirWeb.DashboardLive do
     end
 
     {:ok, socket}
+  end
+
+  @impl true
+  def handle_params(params, _uri, socket) do
+    view = normalized_view(params["view"])
+    context_pm = params["pm"] || socket.assigns.context_pm
+    selected_pm = if view == "live", do: context_pm, else: history_selection(socket, view)
+
+    socket =
+      socket
+      |> assign(:view, view)
+      |> assign(:context_pm, context_pm)
+      |> assign(:selected_pm, selected_pm)
+      |> assign(:query, "")
+      |> assign(:selected_task_id, nil)
+      |> refresh_view()
+
+    if (socket.assigns.view == "live" and socket.assigns.selected_pm) && params["pm"] != socket.assigns.selected_pm do
+      {:noreply, push_patch(socket, to: dashboard_path(view, socket.assigns.selected_pm), replace: true)}
+    else
+      {:noreply, socket}
+    end
   end
 
   @impl true
@@ -48,13 +72,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   @impl true
   def handle_event("show_view", %{"view" => view}, socket) when view in ["live", "history", "runtime"] do
-    {:noreply,
-     socket
-     |> assign(:view, view)
-     |> assign(:query, "")
-     |> assign(:selected_pm, nil)
-     |> assign(:selected_task_id, nil)
-     |> refresh_view()}
+    {:noreply, push_patch(socket, to: dashboard_path(view, socket.assigns.context_pm), replace: true)}
   end
 
   def handle_event("set_layout", %{"layout" => layout}, socket) when layout in ["map", "list"] do
@@ -62,11 +80,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   def handle_event("select_pm", %{"id" => id}, socket) do
-    {:noreply,
-     socket
-     |> assign(:selected_pm, id)
-     |> assign(:selected_task_id, nil)
-     |> refresh_view()}
+    socket = socket |> assign(:selected_pm, id) |> assign(:selected_task_id, nil) |> refresh_view()
+
+    if socket.assigns.view == "live" and socket.assigns.selected_pm do
+      {:noreply, push_patch(socket, to: dashboard_path("live", socket.assigns.selected_pm), replace: true)}
+    else
+      {:noreply, socket}
+    end
   end
 
   def handle_event("select_task", %{"id" => id}, socket) do
@@ -139,6 +159,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <span><i class="state-dot state-review"></i><strong>{@work_counts.review}</strong> need review</span>
             <span><i class="state-dot state-waiting"></i><strong>{@work_counts.waiting}</strong> waiting</span>
             <span><i class="state-dot state-ready"></i><strong>{@work_counts.queued}</strong> queued</span>
+            <span class="summary-usage"><strong>{format_count(running_tokens(@payload))}</strong> running-worker tokens</span>
+            <span><strong>{format_duration(running_seconds(@payload, @now))}</strong> running-worker time</span>
           </div>
 
           <div class="workspace">
@@ -150,7 +172,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                   <span class={["manager-avatar", group.id == "__unassigned__" && "unassigned-avatar"]}>{if group.id == "__unassigned__", do: "?", else: "PM"}</span>
                   <span class="manager-option-copy">
                     <strong>{group.name}</strong>
-                    <span>{length(group.tasks)} {if @view == "live", do: "open", else: "past"} {plural(length(group.tasks), "task")}</span>
+                    <span>{group_counts_label(group, @view)}</span>
                   </span>
                   <span :if={group.running > 0} class="manager-running" title={"#{group.running} running workers"}>{group.running}</span>
                 </button>
@@ -166,7 +188,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
               <div class="work-toolbar">
                 <div class="work-toolbar-heading">
                   <h2>{if @selected_group, do: @selected_group.name, else: empty_heading(@view, @query)}</h2>
-                  <p :if={@selected_group}>{length(@selected_group.tasks)} {plural(length(@selected_group.tasks), "assignment")} · {if @view == "live", do: "current work", else: "completed or cancelled"}</p>
+                  <p :if={@selected_group}>{group_counts_label(@selected_group, @view)} · {if @view == "live", do: "PM work", else: "earlier PM work"}</p>
                 </div>
                 <form phx-change="search" phx-submit="search" role="search" class="work-search">
                   <label class="sr-only" for="work-query">Find a task or PM</label>
@@ -189,20 +211,21 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <div class="map-viewport" tabindex="0" aria-label="PM and assignment ownership map">
                         <div class="mind-map" style={"height: #{@map_height}px"} id="ownership-map">
                           <svg class="map-connections" viewBox={"0 0 820 #{@map_height}"} preserveAspectRatio="none" aria-hidden="true">
-                            <path :for={{task, index} <- Enum.with_index(@selected_group.tasks)} d={connection_path(index, @map_height)} class={["map-connection", task.worker.active == true && "connection-running", "connection-#{task.phase}"]} />
+                            <path :for={{task, index} <- Enum.with_index(@selected_group.tasks)} d={connection_path(index, @map_height)} class={["map-connection", worker_running?(task) && "connection-running", "connection-#{task.phase}"]} />
                             <circle cx="295" cy={div(@map_height, 2)} r="4" class="connection-origin" />
                           </svg>
                           <button type="button" phx-click="show_pm" class={["mind-node pm-node", is_nil(@selected_task) && "node-selected"]} style={"top: #{div(@map_height, 2) - 76}px"} aria-pressed={is_nil(@selected_task)}>
                             <span class="node-role"><span class="pm-symbol">{if @selected_group.id == "__unassigned__", do: "?", else: "PM"}</span>{if @selected_group.id == "__unassigned__", do: "Ownership needed", else: "Project manager"}</span>
                             <strong class="pm-node-title">{@selected_group.name}</strong>
-                            <span class="pm-node-count">{length(@selected_group.tasks)} open {plural(length(@selected_group.tasks), "assignment")}</span>
+                            <span class="pm-node-count">{group_counts_label(@selected_group, @view)}</span>
                             <span class="node-connector"></span>
                           </button>
                           <div class="map-tasks">
-                            <button :for={{task, index} <- Enum.with_index(@selected_group.tasks)} type="button" phx-click="select_task" phx-value-id={task.assignment_id} data-assignment-id={task.assignment_id} aria-pressed={@selected_task_id == task.assignment_id} class={["mind-node task-node", "task-#{task.phase}", task.worker.active == true && "worker-running", @selected_task_id == task.assignment_id && "node-selected"]} style={"top: #{task_top(index)}px"}>
-                              <span class="task-node-top"><span>{issue_label(task)}</span><span class={["task-state", "state-#{task.phase}"]}><i class={["state-dot", task.worker.active == true && "is-running"]}></i>{phase_label(task.phase)}</span></span>
+                            <button :for={{task, index} <- Enum.with_index(@selected_group.tasks)} type="button" phx-click="select_task" phx-value-id={task.assignment_id} data-assignment-id={task.assignment_id} aria-pressed={@selected_task_id == task.assignment_id} class={["mind-node task-node", "task-#{task.phase}", worker_running?(task) && "worker-running", @selected_task_id == task.assignment_id && "node-selected"]} style={"top: #{task_top(index)}px"}>
+                              <span class="task-node-top"><span>{issue_label(task)}</span><span class={["task-state", "state-#{task.phase}"]}><i class={["state-dot", worker_running?(task) && "is-running"]}></i>{phase_label(task.phase)}</span></span>
                               <strong class="task-node-title">{task_label(task)}</strong>
-                              <span class="task-node-meta">{route_label(task)}<span :if={task.worker.active == true} class="worker-label">Worker running</span></span>
+                              <span class="task-node-meta">{route_label(task)}<span :if={worker_running?(task)} class="worker-label">Worker running</span></span>
+                              <.task_metrics task={task} payload={@payload} now={@now} />
                               <span class="task-node-activity">{task_activity(task, @payload)}</span>
                             </button>
                           </div>
@@ -213,7 +236,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <div class="assignment-list" id={if @view == "history", do: "history-list", else: "live-list"}>
                         <button :for={task <- @selected_group.tasks} type="button" phx-click="select_task" phx-value-id={task.assignment_id} aria-pressed={@selected_task_id == task.assignment_id} data-assignment-id={task.assignment_id} class={["assignment-row", @selected_task_id == task.assignment_id && "is-selected"]}>
                           <span class={["row-state-mark", "state-#{task.phase}"]}></span>
-                          <span class="assignment-row-copy"><strong>{task_label(task)}</strong><span>{task[:repository] || "Repository unavailable"} · {issue_label(task)}</span></span>
+                          <span class="assignment-row-copy"><strong>{task_label(task)}</strong><span>{task[:repository] || "Repository unavailable"} · {issue_label(task)}</span><.task_metrics task={task} payload={@payload} now={@now} /></span>
                           <span class={["task-state", "state-#{task.phase}"]}>{phase_label(task.phase)}</span>
                           <span class="row-chevron" aria-hidden="true">›</span>
                         </button>
@@ -227,7 +250,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <h3>{@selected_task |> task_label()}</h3>
                       <dl class="detail-facts">
                         <div><dt>Responsible PM</dt><dd>{@selected_group.name}</dd></div>
-                        <div><dt>Worker</dt><dd>{if @selected_task.worker.active == true, do: "Running", else: "Not running"}</dd></div>
+                        <div><dt>Worker</dt><dd>{if worker_running?(@selected_task), do: "Running", else: "Not running"}</dd></div>
+                        <div><dt>Runtime</dt><dd>{format_duration(task_seconds(@selected_task, @payload, @now))}</dd></div>
+                        <div><dt>Total tokens</dt><dd>{format_count(task_usage(@selected_task, @payload)[:total_tokens])}</dd></div>
+                        <div><dt>Input tokens</dt><dd>{format_count(task_usage(@selected_task, @payload)[:input_tokens])}</dd></div>
+                        <div><dt>Output tokens</dt><dd>{format_count(task_usage(@selected_task, @payload)[:output_tokens])}</dd></div>
                         <div :if={@selected_task.worker.host}><dt>Worker host</dt><dd>{@selected_task.worker.host}</dd></div>
                         <div><dt>{if @selected_task.route[:source] == "running", do: "Running model & effort", else: "Configured model & effort"}</dt><dd>{route_label(@selected_task)}</dd></div>
                         <div><dt>Repository</dt><dd>{@selected_task[:repository] || "Not recorded"}</dd></div>
@@ -280,12 +307,20 @@ defmodule SymphonyElixirWeb.DashboardLive do
     ~H"""
     <section class="runtime-panel">
       <div class="runtime-heading"><h2>Runtime details</h2><p>Session activity and service diagnostics.</p></div>
+      <dl class="service-totals" aria-label="Service totals including completed sessions">
+        <div><dt>Total tokens</dt><dd>{format_count(@payload.codex_totals.total_tokens)}</dd></div>
+        <div><dt>Input tokens</dt><dd>{format_count(@payload.codex_totals.input_tokens)}</dd></div>
+        <div><dt>Output tokens</dt><dd>{format_count(@payload.codex_totals.output_tokens)}</dd></div>
+        <div><dt>Total runtime</dt><dd>{format_duration((@payload.codex_totals.seconds_running || 0) + running_seconds(@payload, @now))}</dd></div>
+      </dl>
+      <p class="detail-note">Service totals include completed sessions. Live work shows the workers currently running.</p>
       <section class="runtime-section"><h3>Running sessions <span>{length(@payload.running)}</span></h3>
         <p :if={@payload.running == []} class="empty-copy">No workers are running.</p>
         <article :for={entry <- @payload.running} class="session-row">
           <div><.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} /><span>{entry.state}</span></div>
           <p class="session-message">{entry.last_message || to_string(entry.last_event || "No update yet")}</p>
           <div class="session-meta"><span>Runtime {format_runtime(entry.started_at, @now)} · {entry.turn_count} turns</span><span>Codex update {entry.last_event_at || "unavailable"}</span><.copy_id :if={entry.session_id} value={entry.session_id} /></div>
+          <div class="session-meta"><span>Total tokens {format_count(entry.tokens.total_tokens)}</span><span>Input {format_count(entry.tokens.input_tokens)} · Output {format_count(entry.tokens.output_tokens)}</span></div>
         </article>
       </section>
       <section class="runtime-section"><h3>Blocked sessions <span>{length(@payload.blocked)}</span></h3>
@@ -311,6 +346,19 @@ defmodule SymphonyElixirWeb.DashboardLive do
         </details>
       <% end %>
     </section>
+    """
+  end
+
+  attr(:task, :map, required: true)
+  attr(:payload, :map, required: true)
+  attr(:now, :any, required: true)
+
+  defp task_metrics(assigns) do
+    ~H"""
+    <span class="task-metrics">
+      <span data-metric="runtime" title="Current worker run, or recorded runtime for an inactive task">Runtime <strong>{format_duration(task_seconds(@task, @payload, @now))}</strong></span>
+      <span data-metric="tokens">Tokens <strong>{format_count(task_usage(@task, @payload)[:total_tokens])}</strong></span>
+    </span>
     """
   end
 
@@ -358,21 +406,42 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp refresh_view(socket) do
     tasks = socket.assigns.payload |> get_in([:managed, :assignments]) |> assignment_values()
     {history, current} = Enum.split_with(tasks, &(&1.phase in @terminal_phases))
-    source = if socket.assigns.view == "history", do: history, else: current
+    open_pm_ids = current |> Enum.map(&owner_id/1) |> Enum.reject(&(&1 == "__unassigned__"))
+    selected_live_pm = if socket.assigns.view == "live", do: socket.assigns.selected_pm
+    retained = Enum.uniq(open_pm_ids ++ socket.assigns.retained_pm_ids ++ [selected_live_pm]) |> Enum.reject(&is_nil/1)
+    {current_completed, history} = Enum.split_with(history, &(owner_id(&1) != "__unassigned__" and owner_id(&1) in retained))
+    live_context = current ++ current_completed
+    source = if socket.assigns.view == "history", do: history, else: live_context
     groups = source |> filter_tasks(socket.assigns.query) |> ownership_groups(socket.assigns.view)
     group = Enum.find(groups, &(&1.id == socket.assigns.selected_pm)) || List.first(groups)
-    selected = if group, do: Enum.find(group.tasks, &(&1.assignment_id == socket.assigns.selected_task_id))
+    selected = find_selected_task(group, socket.assigns.selected_task_id)
 
     socket
+    |> assign(:retained_pm_ids, retained)
     |> assign(:groups, groups)
     |> assign(:selected_group, group)
     |> assign(:selected_pm, group && group.id)
+    |> assign(:context_pm, if(socket.assigns.view == "live" and group, do: group.id, else: socket.assigns.context_pm))
     |> assign(:selected_task, selected)
     |> assign(:selected_task_id, selected && selected.assignment_id)
     |> assign(:open_count, length(current))
     |> assign(:history_count, length(history))
     |> assign(:work_counts, work_counts(current))
     |> assign(:map_height, map_height(group))
+  end
+
+  defp find_selected_task(nil, _id), do: nil
+  defp find_selected_task(group, id), do: Enum.find(group.tasks, &(&1.assignment_id == id))
+
+  defp normalized_view(view) when view in ["history", "runtime"], do: view
+  defp normalized_view(_view), do: "live"
+
+  defp history_selection(socket, view), do: if(socket.assigns.view == view, do: socket.assigns.selected_pm)
+
+  defp dashboard_path(view, pm) do
+    params = if pm, do: %{"pm" => pm}, else: %{}
+    params = if view == "live", do: params, else: Map.put(params, "view", view)
+    if params == %{}, do: "/", else: "/?" <> URI.encode_query(params)
   end
 
   defp assignment_values(values) when is_map(values), do: Map.values(values)
@@ -398,11 +467,18 @@ defmodule SymphonyElixirWeb.DashboardLive do
         id: id,
         name: group_name(id, values, view),
         tasks: Enum.sort_by(values, &task_sort/1),
-        running: Enum.count(values, &(&1.worker.active == true))
+        running: Enum.count(values, &worker_running?/1),
+        open: Enum.count(values, &(&1.phase not in @terminal_phases)),
+        complete: Enum.count(values, &(&1.phase in @terminal_phases))
       }
     end)
     |> Enum.sort_by(&{&1.id == "__unassigned__", String.downcase(&1.name)})
   end
+
+  defp group_counts_label(group, "history"), do: "#{length(group.tasks)} past #{plural(length(group.tasks), "task")}"
+  defp group_counts_label(group, _view), do: "#{group.open} open · #{group.complete} complete"
+
+  defp worker_running?(task), do: task.phase not in @terminal_phases and task.worker.active == true
 
   defp owner_id(%{ownership: %{status: "owned", pm_id: id}}) when is_binary(id), do: id
   defp owner_id(_task), do: "__unassigned__"
@@ -432,12 +508,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp map_height(nil), do: 400
-  defp map_height(group), do: max(length(group.tasks) * 176 + 28, 400)
-  defp task_top(index), do: index * 176 + 26
+  defp map_height(group), do: max(length(group.tasks) * 200 + 28, 400)
+  defp task_top(index), do: index * 200 + 26
 
   defp connection_path(index, height) do
     middle = div(height, 2)
-    target = task_top(index) + 76
+    target = task_top(index) + 88
     "M 295 #{middle} C 367 #{middle}, 371 #{target}, 443 #{target}"
   end
 
@@ -450,6 +526,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp phase_label("review"), do: "Needs review"
   defp phase_label("review_pending"), do: "Accepting"
   defp phase_label("active"), do: "Active"
+  defp phase_label("accepted"), do: "Complete"
   defp phase_label(phase), do: humanize(phase)
 
   defp humanize(value), do: value |> to_string() |> String.replace("_", " ") |> String.capitalize()
@@ -465,6 +542,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
     short = model |> String.replace("gpt-5.6-", "") |> String.replace("gpt-", "") |> String.capitalize()
     if route[:effort], do: "#{short} · #{route.effort}", else: short
   end
+
+  defp task_activity(%{phase: "accepted"}, _payload), do: "Completed and retained in this PM's work"
+  defp task_activity(%{phase: "cancelled"}, _payload), do: "Cancelled and retained for context"
 
   defp task_activity(%{worker: %{active: true}} = task, payload) do
     case Enum.find(payload.running, &(&1.issue_id == task.assignment_id)) do
@@ -488,13 +568,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp owner_description(%{id: "__unassigned__"}, "live"), do: "These open assignments need an owner before work can proceed."
-  defp owner_description(_group, "history"), do: "This work has ended. It is kept here for reference and is excluded from the live map."
-  defp owner_description(group, _view), do: "#{group.name} owns the assignments connected in this map. Select one to inspect its state and latest report."
+  defp owner_description(_group, "history"), do: "Earlier PM work, kept here for reference."
+  defp owner_description(group, _view), do: "#{group.name} owns this work. Completed assignments stay connected so you can see the full task, including what is finished."
 
   defp view_title("history"), do: "Work history"
   defp view_title("runtime"), do: "Runtime"
   defp view_title(_view), do: "Live work"
-  defp view_description("history"), do: "Completed and cancelled assignments, separate from current work."
+  defp view_description("history"), do: "Completed work from earlier PMs, separate from the current PM's full task."
   defp view_description("runtime"), do: "A closer look at workers and service health."
   defp view_description(_view), do: "See who owns the work, what is running, and what needs attention."
 
@@ -508,19 +588,51 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp updated_time(%{generated_at: value}) when is_binary(value), do: String.slice(value, 11, 8) <> " UTC"
   defp updated_time(_payload), do: "unavailable"
 
-  defp format_runtime(started_at, now) do
-    seconds = elapsed_seconds(started_at, now)
-    "#{div(seconds, 60)}m #{rem(seconds, 60)}s"
+  defp current_session(%{worker: %{active: true}, phase: phase} = task, payload) when phase not in @terminal_phases do
+    Enum.find(payload.running, &(&1.issue_id == task.assignment_id))
   end
+
+  defp current_session(_task, _payload), do: nil
+
+  defp task_usage(task, payload) do
+    case current_session(task, payload) do
+      nil -> task.usage
+      session -> session.tokens
+    end
+  end
+
+  defp task_seconds(task, payload, now) do
+    case current_session(task, payload) do
+      nil -> task.usage[:seconds_running]
+      session -> elapsed_seconds(session.started_at, now)
+    end
+  end
+
+  defp running_tokens(payload), do: Enum.reduce(payload.running, 0, &(&1.tokens.total_tokens + &2))
+  defp running_seconds(payload, now), do: Enum.reduce(payload.running, 0, &((elapsed_seconds(&1.started_at, now) || 0) + &2))
+
+  defp format_count(value) when is_number(value), do: value |> trunc() |> Integer.to_string() |> String.replace(~r/\B(?=(\d{3})+(?!\d))/, ",")
+  defp format_count(_value), do: "Not recorded"
+
+  defp format_runtime(started_at, now), do: format_duration(elapsed_seconds(started_at, now))
+
+  defp format_duration(value) when is_number(value) do
+    seconds = max(trunc(value), 0)
+    minutes = div(rem(seconds, 3_600), 60)
+    remainder = rem(seconds, 60)
+    if seconds >= 3_600, do: "#{div(seconds, 3_600)}h #{minutes}m #{remainder}s", else: "#{minutes}m #{remainder}s"
+  end
+
+  defp format_duration(_value), do: "Not recorded"
 
   defp elapsed_seconds(value, now) when is_binary(value) do
     case DateTime.from_iso8601(value) do
       {:ok, started_at, _offset} -> max(DateTime.diff(now, started_at, :second), 0)
-      _ -> 0
+      _ -> nil
     end
   end
 
-  defp elapsed_seconds(_value, _now), do: 0
+  defp elapsed_seconds(_value, _now), do: nil
 
   defp external_issue_url(url) when is_binary(url) do
     case URI.parse(String.trim(url)) do

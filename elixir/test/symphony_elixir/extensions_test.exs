@@ -574,6 +574,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     orchestrator_name = Module.concat(__MODULE__, :ManagedDashboardOrchestrator)
     now = DateTime.utc_now()
     stale = DateTime.add(now, -600, :second)
+    running_started_at = DateTime.add(now, -75, :second)
 
     managed_state = %{
       revision: 7,
@@ -602,6 +603,8 @@ defmodule SymphonyElixir.ExtensionsTest do
           worker_id: "worker-alpha",
           worker_active: true,
           worker_activity: "running tests",
+          started_at: DateTime.add(now, -7_200, :second),
+          usage: %{input_tokens: 901, output_tokens: 902, total_tokens: 1_803, seconds_running: 9_999},
           projection: %{status: :synced, revision: 2, updated_at: now, synced_at: now}
         },
         "assign-active-idle" => %{
@@ -614,6 +617,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           status: "active",
           ownership: %{pm_id: "pm-one", status: :owned, ownership_revision: 5},
           worker_active: false,
+          usage: %{input_tokens: 21, output_tokens: 34, total_tokens: 55, seconds_running: 123},
           route: %{model: "gpt-5.6-luna", effort: "xhigh"}
         },
         "assign-queued" => %{
@@ -649,7 +653,9 @@ defmodule SymphonyElixir.ExtensionsTest do
           status: "accepted",
           stop_pending: true,
           ownership: %{pm_id: "pm-history", status: :owned},
-          worker_active: true
+          worker_active: true,
+          usage: %{input_tokens: 7, output_tokens: 8, total_tokens: 15, seconds_running: 64},
+          started_at: DateTime.add(now, -3_600, :second)
         },
         "assign-cancelled" => %{
           assignment_id: "assign-cancelled",
@@ -688,21 +694,42 @@ defmodule SymphonyElixir.ExtensionsTest do
       ]
     }
 
+    running_entry =
+      static_snapshot().running
+      |> List.first()
+      |> Map.merge(%{
+        issue_id: "assign-active",
+        identifier: "MT-ACTIVE",
+        issue_url: "https://example.org/issues/MT-ACTIVE",
+        started_at: running_started_at,
+        codex_input_tokens: 4,
+        codex_output_tokens: 8,
+        codex_total_tokens: 12
+      })
+
+    dashboard_snapshot = put_in(static_snapshot(), [:running], [running_entry])
+
     {:ok, orchestrator_pid} =
       StaticOrchestrator.start_link(
         name: orchestrator_name,
-        snapshot: static_snapshot(),
+        snapshot: dashboard_snapshot,
         managed_state: {:ok, managed_state}
       )
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
-    {:ok, view, html} = live(build_conn(), "/")
+    assert {:error, {:live_redirect, %{to: "/?pm=pm-one"}}} = live(build_conn(), "/")
+    {:ok, view, html} = live(build_conn(), "/?pm=pm-one")
     assert html =~ "Live work"
     assert html =~ "PM One"
     assert html =~ "Build alpha"
     assert html =~ "Phase active but idle"
     assert html =~ "Needs a project manager"
+    assert html =~ ~s(data-metric="runtime")
+    assert html =~ ~s(data-metric="tokens")
+    assert html =~ ~s(data-metric="tokens">Tokens <strong>12</strong>)
+    assert html =~ ~s(data-metric="tokens">Tokens <strong>55</strong>)
+    assert html =~ "Not recorded"
     refute html =~ "Finished history"
     refute html =~ "Cancelled history"
     refute html =~ "History PM"
@@ -747,6 +774,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     html = render(view)
     assert html =~ "Assignment details"
     assert html =~ "Build alpha"
+    assert html =~ ~r|<dt>Runtime</dt><dd>1m [0-9]+s</dd>|
+    assert html =~ ~s(<dt>Total tokens</dt><dd>12</dd>)
+    assert html =~ ~s(<dt>Input tokens</dt><dd>4</dd>)
+    assert html =~ ~s(<dt>Output tokens</dt><dd>8</dd>)
+    refute html =~ "<dd>1,803</dd>"
     assert html =~ ~s(href="https://github.com/org/repo-alpha/issues/11")
     assert html =~ ~s(target="_blank")
     refute html =~ "javascript:"
@@ -756,6 +788,24 @@ defmodule SymphonyElixir.ExtensionsTest do
     |> render_click()
 
     assert has_element?(view, ~s(button[data-assignment-id="assign-review"][aria-pressed]))
+
+    html = render(view)
+    assert html =~ ~s(<dt>Runtime</dt><dd>Not recorded</dd>)
+    assert html =~ ~s(<dt>Total tokens</dt><dd>Not recorded</dd>)
+
+    view
+    |> element(~s(button[data-assignment-id="assign-active-idle"]))
+    |> render_click()
+
+    html = render(view)
+    assert html =~ ~s(<dt>Runtime</dt><dd>2m 3s</dd>)
+    assert html =~ ~s(<dt>Total tokens</dt><dd>55</dd>)
+    assert html =~ ~s(<dt>Input tokens</dt><dd>21</dd>)
+    assert html =~ ~s(<dt>Output tokens</dt><dd>34</dd>)
+
+    view
+    |> element(~s(button[data-assignment-id="assign-review"]))
+    |> render_click()
 
     reviewed_state =
       managed_state
@@ -786,9 +836,17 @@ defmodule SymphonyElixir.ExtensionsTest do
     StatusDashboard.notify_update()
 
     assert_eventually(fn ->
-      not has_element?(view, ~s([data-assignment-id="assign-active"])) and
+      has_element?(view, ~s([data-assignment-id="assign-active"].task-accepted)) and
         has_element?(view, ~s(button[data-assignment-id="assign-review"][aria-pressed]))
     end)
+
+    html = render(view)
+    assert html =~ "Complete"
+    assert html =~ "2 open · 1 complete"
+    assert has_element?(view, ".task-node-activity", "Completed and retained in this PM's work")
+    assert html =~ ~s(Live work<span>3</span>)
+    refute has_element?(view, ~s([data-assignment-id="assign-active"].worker-running))
+    refute html =~ "connection-running"
 
     view
     |> element(~s(button[phx-value-view="history"]))
@@ -798,15 +856,29 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Work history"
     assert html =~ "History PM"
     assert html =~ "Finished history"
-    assert html =~ "PM One"
+    refute html =~ "PM One"
+    refute html =~ "Build alpha"
     assert html =~ "Earlier unassigned work"
     assert has_element?(view, "#history-list")
+    refute has_element?(view, ~s([data-assignment-id="assign-active"]))
 
     view
-    |> element("button.manager-option", "PM One")
+    |> element("button.manager-option", "History PM")
     |> render_click()
 
-    assert render(view) =~ "Build alpha"
+    assert has_element?(view, ~s([data-assignment-id="assign-accepted"]))
+    html = render(view)
+    assert html =~ ~s(data-metric="tokens">Tokens <strong>15</strong>)
+
+    view
+    |> element(~s(button[data-assignment-id="assign-accepted"]))
+    |> render_click()
+
+    html = render(view)
+    assert html =~ ~s(<dt>Runtime</dt><dd>1m 4s</dd>)
+    assert html =~ ~s(<dt>Total tokens</dt><dd>15</dd>)
+    assert html =~ ~s(<dt>Input tokens</dt><dd>7</dd>)
+    assert html =~ ~s(<dt>Output tokens</dt><dd>8</dd>)
 
     view
     |> element("button.manager-option", "Earlier unassigned work")
@@ -840,6 +912,39 @@ defmodule SymphonyElixir.ExtensionsTest do
     html = render(view)
     assert html =~ "Phase active but idle"
     refute html =~ "Build alpha"
+
+    view |> form("form.work-search") |> render_change(%{"query" => ""})
+
+    completed_state =
+      Enum.reduce(["assign-active-idle", "assign-review"], accepted_state, fn id, state ->
+        state
+        |> put_in([:assignments, id, :phase], :accepted)
+        |> put_in([:assignments, id, :worker_active], false)
+      end)
+
+    :sys.replace_state(orchestrator_pid, fn state ->
+      state
+      |> Keyword.put(:managed_state, {:ok, completed_state})
+      |> Keyword.put(:snapshot, put_in(dashboard_snapshot, [:running], []))
+    end)
+
+    StatusDashboard.notify_update()
+    assert_eventually(fn -> render(view) =~ "0 open · 3 complete" end)
+    assert has_element?(view, ~s([data-assignment-id="assign-active"].task-accepted))
+    refute has_element?(view, ".worker-running")
+
+    {:ok, reloaded_view, reloaded_html} = live(build_conn(), "/?pm=pm-one")
+    assert reloaded_html =~ "0 open · 3 complete"
+    assert has_element?(reloaded_view, ~s([data-assignment-id="assign-active"].task-accepted))
+
+    {:ok, history_view, history_html} = live(build_conn(), "/?pm=pm-one&view=history")
+    assert history_html =~ "Work history"
+    assert history_html =~ "History PM"
+    refute history_html =~ "Build alpha"
+    assert has_element?(history_view, "#history-list")
+
+    history_view |> element(~s(button[phx-value-view="live"])) |> render_click()
+    assert render(history_view) =~ "0 open · 3 complete"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
