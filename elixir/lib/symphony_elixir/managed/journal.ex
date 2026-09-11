@@ -246,10 +246,17 @@ defmodule SymphonyElixir.Managed.Journal do
     with {:ok, envelope} <- decode_external_term(binary, :managed_journal_checkpoint),
          {:ok, payload, checksum} <- checkpoint_payload(envelope),
          :ok <- verify_checkpoint_checksum(payload, checksum),
-         {:ok, record} <- decode_external_term(payload, :managed_journal_checkpoint_payload),
+         {:ok, record} <- decode_checkpoint_payload(payload),
          {:ok, _state} <- record_state(record) do
       {:ok, record}
     end
+  end
+
+  # The checksum is verified before this decode. The state payload has the same
+  # trusted local-file boundary as the legacy disk_log and may contain atoms
+  # that do not exist until a fresh BEAM restores them.
+  defp decode_checkpoint_payload(payload) do
+    decode_external_term(payload, :managed_journal_checkpoint_payload, [:used])
   end
 
   defp encode_checkpoint(record) do
@@ -287,8 +294,8 @@ defmodule SymphonyElixir.Managed.Journal do
     end
   end
 
-  defp decode_external_term(binary, prefix) do
-    case :erlang.binary_to_term(binary, [:safe, :used]) do
+  defp decode_external_term(binary, prefix, options \\ [:safe, :used]) do
+    case :erlang.binary_to_term(binary, options) do
       {term, used} when used == byte_size(binary) -> {:ok, term}
       {_term, _used} -> {:error, external_term_error(prefix, :trailing_bytes)}
     end

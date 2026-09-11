@@ -141,6 +141,19 @@ defmodule SymphonyElixir.ManagedJournalTest do
              Journal.open(path, name: name)
   end
 
+  test "a fresh BEAM restores valid state atoms that are not already loaded" do
+    path = journal_path("fresh-beam")
+    on_exit(fn -> cleanup(path) end)
+    dynamic_atom = String.to_atom("managed_restart_atom_#{System.unique_integer([:positive])}")
+    state = %{dynamic_atom => dynamic_atom, version: 2}
+
+    assert {:ok, handle, %{}} = Journal.open(path)
+    assert :ok = Journal.append(handle, state)
+    assert :ok = Journal.close(handle)
+
+    assert {:ok, ^state} = reopen_in_fresh_beam(path)
+  end
+
   test "many large updates keep total bytes bounded and restart returns the newest state" do
     path = journal_path("bounded")
     on_exit(fn -> cleanup(path) end)
@@ -332,6 +345,42 @@ defmodule SymphonyElixir.ManagedJournalTest do
   end
 
   defp checkpoint_path(path), do: path <> ".checkpoint"
+
+  defp reopen_in_fresh_beam(path) do
+    script = Path.join(System.tmp_dir!(), "managed-journal-restart-#{System.unique_integer([:positive])}.exs")
+    result_path = script <> ".result"
+    journal_ebin = Journal |> :code.which() |> List.to_string() |> Path.dirname()
+
+    File.write!(
+      script,
+      """
+      [path, result_path] = System.argv()
+      result =
+        case SymphonyElixir.Managed.Journal.open(path) do
+          {:ok, handle, state} ->
+            :ok = SymphonyElixir.Managed.Journal.close(handle)
+            {:ok, state}
+
+          error ->
+            error
+        end
+
+      File.write!(result_path, :erlang.term_to_binary(result))
+      """
+    )
+
+    try do
+      executable = System.find_executable("elixir") || raise "elixir executable is required"
+
+      {_output, 0} =
+        System.cmd(executable, ["-pa", journal_ebin, script, path, result_path], stderr_to_stdout: true)
+
+      result_path |> File.read!() |> :erlang.binary_to_term([:safe])
+    after
+      File.rm(script)
+      File.rm(result_path)
+    end
+  end
 
   defp cleanup(path) do
     File.rm_rf(path)
