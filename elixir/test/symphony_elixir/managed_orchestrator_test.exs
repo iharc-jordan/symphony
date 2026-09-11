@@ -130,6 +130,7 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     on_exit(fn ->
       if Process.alive?(pid), do: Process.exit(pid, :normal)
       File.rm(path)
+      File.rm(path <> ".checkpoint")
     end)
 
     {pid, path}
@@ -758,6 +759,7 @@ defmodule SymphonyElixir.ManagedOrchestratorDeferredReportTest do
     on_exit(fn ->
       if Process.alive?(pid), do: Process.exit(pid, :normal)
       File.rm(path)
+      File.rm(path <> ".checkpoint")
     end)
 
     assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
@@ -836,6 +838,7 @@ defmodule SymphonyElixir.ManagedOrchestratorDeferredReportTest do
     on_exit(fn ->
       if Process.alive?(pid), do: Process.exit(pid, :normal)
       File.rm(path)
+      File.rm(path <> ".checkpoint")
     end)
 
     assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
@@ -959,6 +962,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     on_exit(fn ->
       if Process.alive?(pid), do: Process.exit(pid, :normal)
       File.rm(path)
+      File.rm(path <> ".checkpoint")
     end)
 
     {pid, path}
@@ -977,6 +981,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     on_exit(fn ->
       if Process.alive?(pid), do: Process.exit(pid, :normal)
       File.rm(path)
+      File.rm(path <> ".checkpoint")
     end)
 
     assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
@@ -1020,6 +1025,7 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     on_exit(fn ->
       if Process.alive?(pid), do: Process.exit(pid, :normal)
       File.rm(path)
+      File.rm(path <> ".checkpoint")
     end)
 
     assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
@@ -1925,6 +1931,7 @@ defmodule SymphonyElixir.ManagedOrchestratorSourceReconciliationTest do
     on_exit(fn ->
       if Process.alive?(pid), do: Process.exit(pid, :normal)
       File.rm(path)
+      File.rm(path <> ".checkpoint")
     end)
 
     :sys.replace_state(pid, fn state ->
@@ -2076,6 +2083,7 @@ defmodule SymphonyElixir.ManagedOrchestratorUsageRecoveryTest do
     on_exit(fn ->
       if Process.alive?(pid), do: Process.exit(pid, :normal)
       File.rm(path)
+      File.rm(path <> ".checkpoint")
     end)
 
     state = :sys.get_state(pid)
@@ -2145,6 +2153,7 @@ defmodule SymphonyElixir.ManagedOperatorTakeoverRecoveryTest do
     on_exit(fn ->
       if Process.alive?(pid), do: Process.exit(pid, :normal)
       File.rm(path)
+      File.rm(path <> ".checkpoint")
     end)
 
     pid

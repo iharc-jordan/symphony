@@ -5,7 +5,7 @@ defmodule SymphonyElixir.ManagedJournalTest do
 
   test "append syncs the latest versioned state across close and reopen" do
     path = journal_path("roundtrip")
-    on_exit(fn -> File.rm(path) end)
+    on_exit(fn -> cleanup(path) end)
 
     assert {:ok, handle, %{}} = Journal.open(path)
     state = %{version: 1, control_revision: 3, event_cursor: 4, paused: true}
@@ -19,7 +19,7 @@ defmodule SymphonyElixir.ManagedJournalTest do
 
   test "append reports the disk log error when its handle is closed" do
     path = journal_path("append-error")
-    on_exit(fn -> File.rm(path) end)
+    on_exit(fn -> cleanup(path) end)
 
     assert {:ok, handle, %{}} = Journal.open(path)
     assert :ok = Journal.close(handle)
@@ -29,7 +29,7 @@ defmodule SymphonyElixir.ManagedJournalTest do
   test "loads a log repaired after an interrupted writer" do
     path = journal_path("repaired")
     name = journal_name("repaired")
-    on_exit(fn -> File.rm(path) end)
+    on_exit(fn -> cleanup(path) end)
     create_unclosed_log!(path, name, %{version: 1, kind: :state, state: %{recovered: true}})
 
     assert {:ok, handle, %{recovered: true}} = Journal.open(path, name: name)
@@ -39,11 +39,28 @@ defmodule SymphonyElixir.ManagedJournalTest do
   test "rejects repaired logs containing non-term bytes" do
     path = journal_path("repaired-corrupt")
     name = journal_name("repaired-corrupt")
-    on_exit(fn -> File.rm(path) end)
+    on_exit(fn -> cleanup(path) end)
     create_unclosed_log!(path, name, %{version: 1, kind: :state, state: %{recovered: true}})
     append_bytes!(path, :binary.copy(<<0>>, 7))
 
     assert {:error, {:managed_journal_corrupt, 7}} = Journal.open(path, name: name)
+  end
+
+  test "accepts a repaired WAL tail when a verified checkpoint anchors recovery" do
+    path = journal_path("checkpoint-repaired")
+    name = journal_name("checkpoint-repaired")
+    on_exit(fn -> cleanup(path) end)
+
+    assert {:ok, handle, %{}} = Journal.open(path, name: name)
+    assert :ok = Journal.append(handle, %{revision: 1})
+    assert :ok = Journal.close(handle)
+
+    create_unclosed_log!(path, name, state_record(%{revision: 2}))
+    append_bytes!(path, :binary.copy(<<0>>, 7))
+
+    assert {:ok, reopened, %{revision: 2}} = Journal.open(path, name: name)
+    assert :eof = :disk_log.chunk(name, :start)
+    assert :ok = Journal.close(reopened)
   end
 
   test "reports malformed and schema-mismatched persisted records" do
@@ -51,8 +68,8 @@ defmodule SymphonyElixir.ManagedJournalTest do
     schema_name = journal_name("schema-mismatch")
     malformed_path = journal_path("malformed")
     malformed_name = journal_name("malformed")
-    on_exit(fn -> File.rm(schema_path) end)
-    on_exit(fn -> File.rm(malformed_path) end)
+    on_exit(fn -> cleanup(schema_path) end)
+    on_exit(fn -> cleanup(malformed_path) end)
 
     assert {:ok, schema_handle, %{}} = Journal.open(schema_path, name: schema_name)
     assert :ok = :disk_log.log(schema_name, %{version: 999, kind: :state, state: %{}})
@@ -71,40 +88,201 @@ defmodule SymphonyElixir.ManagedJournalTest do
              Journal.open(malformed_path, name: malformed_name)
   end
 
-  test "reports corruption found while reading an otherwise openable log" do
-    path = journal_path("chunk-corrupt")
-    on_exit(fn -> File.rm(path) end)
+  test "fails closed on a corrupt checkpoint without consuming the valid WAL" do
+    path = journal_path("checkpoint-corrupt")
+    name = journal_name("checkpoint-corrupt")
+    on_exit(fn -> cleanup(path) end)
 
-    assert {:ok, handle, %{}} = Journal.open(path)
-    assert :ok = Journal.append(handle, %{state: :valid})
+    assert {:ok, handle, %{}} = Journal.open(path, name: name)
+    assert :ok = Journal.append(handle, %{revision: 1})
     assert :ok = Journal.close(handle)
-    append_bytes!(path, :binary.copy(<<0>>, 32))
 
-    assert {:error, {:managed_journal_read_failed, {:corrupt_log_file, _path}}} =
-             Journal.open(path)
+    append_wal_record!(path, name, state_record(%{revision: 2}))
+    File.write!(checkpoint_path(path), "not an external term")
+    wal_bytes = File.stat!(path).size
+
+    assert {:error, {:managed_journal_checkpoint_invalid, :managed_journal_checkpoint_corrupt}} = Journal.open(path, name: name)
+
+    assert File.stat!(path).size == wal_bytes
+
+    File.rm!(checkpoint_path(path))
+    assert {:ok, recovered, %{revision: 2}} = Journal.open(path, name: name)
+    assert :ok = Journal.close(recovered)
   end
 
-  test "loads the latest state after reading multiple disk log chunks" do
-    path = journal_path("multi-chunk")
-    on_exit(fn -> File.rm(path) end)
+  test "fails closed on a checkpoint schema mismatch" do
+    path = journal_path("checkpoint-schema")
+    name = journal_name("checkpoint-schema")
+    on_exit(fn -> cleanup(path) end)
+
+    assert {:ok, handle, %{}} = Journal.open(path, name: name)
+    assert :ok = Journal.close(handle)
+    File.write!(checkpoint_path(path), :erlang.term_to_binary(%{version: 999, kind: :state, state: %{}}))
+
+    assert {:error, {:managed_journal_checkpoint_invalid, {:managed_journal_schema_mismatch, 999}}} = Journal.open(path, name: name)
+  end
+
+  test "detects content corruption in an otherwise valid checkpoint envelope" do
+    path = journal_path("checkpoint-content-corrupt")
+    name = journal_name("checkpoint-content-corrupt")
+    on_exit(fn -> cleanup(path) end)
+
+    assert {:ok, handle, %{}} = Journal.open(path, name: name)
+    assert :ok = Journal.append(handle, %{revision: 1, ownership: %{owner: "pm-1"}})
+    assert :ok = Journal.close(handle)
+
+    checkpoint = checkpoint_path(path)
+    envelope = checkpoint |> File.read!() |> :erlang.binary_to_term([:safe])
+    <<first, rest::binary>> = envelope.payload
+    corrupted_payload = <<:erlang.bxor(first, 1), rest::binary>>
+    File.write!(checkpoint, :erlang.term_to_binary(%{envelope | payload: corrupted_payload}))
+
+    assert {:error, {:managed_journal_checkpoint_invalid, :managed_journal_checkpoint_checksum_mismatch}} =
+             Journal.open(path, name: name)
+  end
+
+  test "many large updates keep total bytes bounded and restart returns the newest state" do
+    path = journal_path("bounded")
+    on_exit(fn -> cleanup(path) end)
 
     assert {:ok, handle, %{}} = Journal.open(path)
+    payload = :crypto.strong_rand_bytes(64_000)
 
-    for index <- 1..100 do
-      assert :ok = Journal.append(handle, %{index: index, payload: String.duplicate("x", 1_000)})
+    sizes =
+      for index <- 1..40 do
+        assert :ok = Journal.append(handle, %{index: index, payload: payload})
+        File.stat!(path).size + File.stat!(checkpoint_path(path)).size
+      end
+
+    assert Enum.max(sizes) - Enum.min(sizes) < 1_024
+    assert Enum.max(sizes) < byte_size(payload) + 4_096
+    assert :eof = :disk_log.chunk(handle.name, :start)
+    assert :ok = Journal.close(handle)
+    assert {:ok, reopened, %{index: 40, payload: ^payload}} = Journal.open(path)
+    assert :ok = Journal.close(reopened)
+  end
+
+  test "migrates a legacy append-only log after preserving its exact latest state" do
+    path = journal_path("legacy")
+    name = journal_name("legacy")
+    on_exit(fn -> cleanup(path) end)
+
+    latest = %{
+      assignments: %{"a-1" => %{revision: 4, reports: %{"r-1" => %{kind: "result"}}}},
+      ownership: %{owner: "pm-1"},
+      control_revision: 9,
+      event_cursor: 12
+    }
+
+    append_wal_records!(path, name, [state_record(%{control_revision: 8}), state_record(latest)])
+
+    assert {:ok, migrated, ^latest} = Journal.open(path, name: name)
+    assert checkpoint_state(path) === latest
+    assert :eof = :disk_log.chunk(name, :start)
+    assert :ok = Journal.close(migrated)
+  end
+
+  test "replays a newer WAL record after a checkpoint crash window and compacts it" do
+    path = journal_path("crash-window")
+    name = journal_name("crash-window")
+    on_exit(fn -> cleanup(path) end)
+
+    assert {:ok, handle, %{}} = Journal.open(path, name: name)
+    assert :ok = Journal.append(handle, %{revision: 1})
+    assert :ok = Journal.close(handle)
+
+    append_wal_record!(path, name, state_record(%{revision: 2, reports: %{latest: true}}))
+
+    assert {:ok, recovered, %{revision: 2, reports: %{latest: true}} = latest} =
+             Journal.open(path, name: name)
+
+    assert checkpoint_state(path) === latest
+    assert :eof = :disk_log.chunk(name, :start)
+    assert :ok = Journal.close(recovered)
+  end
+
+  test "checkpoint replacement failure leaves the synced WAL recoverable" do
+    path = journal_path("checkpoint-failure")
+    name = journal_name("checkpoint-failure")
+    checkpoint = checkpoint_path(path)
+    on_exit(fn -> cleanup(path) end)
+
+    assert {:ok, handle, %{}} = Journal.open(path, name: name)
+    File.rm!(checkpoint)
+    File.mkdir!(checkpoint)
+
+    latest = %{revision: 5, reports: %{context: "retained"}}
+
+    assert {:error, {:managed_journal_checkpoint_rename_failed, :eisdir}} =
+             Journal.append(handle, latest)
+
+    assert {_continuation, [record]} = :disk_log.chunk(name, :start)
+    assert record == state_record(latest)
+    assert :ok = Journal.close(handle)
+
+    File.rmdir!(checkpoint)
+    assert {:ok, recovered, ^latest} = Journal.open(path, name: name)
+    assert checkpoint_state(path) === latest
+    assert :ok = Journal.close(recovered)
+  end
+
+  test "repeated checkpoint failures retain only the newest WAL state" do
+    path = journal_path("checkpoint-repeated-failure")
+    name = journal_name("checkpoint-repeated-failure")
+    checkpoint = checkpoint_path(path)
+    on_exit(fn -> cleanup(path) end)
+
+    assert {:ok, handle, %{}} = Journal.open(path, name: name)
+    File.rm!(checkpoint)
+    File.mkdir!(checkpoint)
+    payload = :crypto.strong_rand_bytes(64_000)
+
+    for revision <- 1..40 do
+      assert {:error, {:managed_journal_checkpoint_rename_failed, :eisdir}} =
+               Journal.append(handle, %{revision: revision, payload: payload})
     end
 
+    assert File.stat!(path).size < byte_size(payload) + 4_096
+    assert {_continuation, [record]} = :disk_log.chunk(name, :start)
+    assert record == state_record(%{revision: 40, payload: payload})
     assert :ok = Journal.close(handle)
-    assert {:ok, reopened, %{index: 100, payload: payload}} = Journal.open(path)
-    assert byte_size(payload) == 1_000
-    assert :ok = Journal.close(reopened)
+
+    File.rmdir!(checkpoint)
+    assert {:ok, recovered, %{revision: 40, payload: ^payload}} = Journal.open(path, name: name)
+    assert :ok = Journal.close(recovered)
+  end
+
+  test "a failed next checkpoint preserves the last acknowledged checkpoint and newer WAL" do
+    path = journal_path("checkpoint-acknowledged")
+    name = journal_name("checkpoint-acknowledged")
+    blocked_parent = path <> ".blocked"
+    on_exit(fn -> cleanup(path) end)
+    on_exit(fn -> File.rm(blocked_parent) end)
+
+    acknowledged = %{revision: 1, reports: %{accepted: true}}
+    newer = %{revision: 2, reports: %{accepted: true, published: true}}
+    assert {:ok, handle, %{}} = Journal.open(path, name: name)
+    assert :ok = Journal.append(handle, acknowledged)
+    File.write!(blocked_parent, "not a directory")
+    broken_handle = %{handle | checkpoint_path: Path.join(blocked_parent, "checkpoint")}
+
+    assert {:error, {:managed_journal_checkpoint_write_failed, :enotdir}} =
+             Journal.append(broken_handle, newer)
+
+    assert checkpoint_state(path) === acknowledged
+    assert {_continuation, [record]} = :disk_log.chunk(name, :start)
+    assert record == state_record(newer)
+    assert :ok = Journal.close(handle)
+
+    assert {:ok, recovered, ^newer} = Journal.open(path, name: name)
+    assert :ok = Journal.close(recovered)
   end
 
   test "reports invalid log files and parent directory failures" do
     path = journal_path("not-a-log")
     parent = journal_path("parent-file")
     child_path = Path.join(parent, "journal.log")
-    on_exit(fn -> File.rm(path) end)
+    on_exit(fn -> cleanup(path) end)
     on_exit(fn -> File.rm(parent) end)
 
     File.write!(path, "not a disk log")
@@ -127,6 +305,38 @@ defmodule SymphonyElixir.ManagedJournalTest do
     {:ok, file} = File.open(path, [:append, :binary])
     :ok = IO.binwrite(file, bytes)
     :ok = File.close(file)
+  end
+
+  defp append_wal_record!(path, name, record),
+    do: append_wal_records!(path, name, [record])
+
+  defp append_wal_records!(path, name, records) do
+    {:ok, ^name} = :disk_log.open(name: name, file: String.to_charlist(path), type: :halt)
+    Enum.each(records, fn record -> :ok = :disk_log.log(name, record) end)
+    :ok = :disk_log.sync(name)
+    :ok = :disk_log.close(name)
+  end
+
+  defp state_record(state), do: %{version: Journal.version(), kind: :state, state: state}
+
+  defp checkpoint_state(path) do
+    %{version: 1, kind: :checkpoint, checksum: checksum, payload: payload} =
+      path
+      |> checkpoint_path()
+      |> File.read!()
+      |> :erlang.binary_to_term([:safe])
+
+    assert :crypto.hash(:sha256, payload) == checksum
+    %{version: 1, kind: :state, state: state} = :erlang.binary_to_term(payload, [:safe])
+    state
+  end
+
+  defp checkpoint_path(path), do: path <> ".checkpoint"
+
+  defp cleanup(path) do
+    File.rm_rf(path)
+    File.rm_rf(checkpoint_path(path))
+    Enum.each(Path.wildcard(checkpoint_path(path) <> ".tmp-*"), &File.rm_rf/1)
   end
 
   defp create_unclosed_log!(path, name, record) do

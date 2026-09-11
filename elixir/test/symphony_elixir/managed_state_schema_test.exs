@@ -18,6 +18,7 @@ defmodule SymphonyElixir.ManagedStateSchemaTest do
     on_exit(fn ->
       if Process.alive?(pid), do: GenServer.stop(pid)
       File.rm(path)
+      File.rm(path <> ".checkpoint")
     end)
 
     loaded = :sys.get_state(pid).managed.data
@@ -47,6 +48,7 @@ defmodule SymphonyElixir.ManagedStateSchemaTest do
     assert {:ok, reopened, ^state} = Journal.open(path)
     assert :ok = Journal.close(reopened)
     File.rm(path)
+    File.rm(path <> ".checkpoint")
   end
 
   defp terminal_state do
