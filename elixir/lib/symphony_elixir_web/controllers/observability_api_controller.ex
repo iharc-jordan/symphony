@@ -184,10 +184,13 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   @spec managed_runtime_facts(GenServer.server()) :: map()
   defp managed_runtime_facts(server) do
-    max_concurrent_agents =
+    {max_concurrent_agents, max_concurrent_agents_by_state} =
       case Config.settings() do
-        {:ok, settings} -> settings.agent.max_concurrent_agents
-        _ -> nil
+        {:ok, settings} ->
+          {settings.agent.max_concurrent_agents, settings.agent.max_concurrent_agents_by_state}
+
+        _ ->
+          {nil, nil}
       end
 
     running_count =
@@ -199,6 +202,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
     %{
       max_concurrent_agents: max_concurrent_agents,
+      max_concurrent_agents_by_state: max_concurrent_agents_by_state,
       running_count: running_count
     }
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)

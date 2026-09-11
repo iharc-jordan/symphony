@@ -10,6 +10,10 @@
     {"route":{"model":"gpt-5.6-luna","effort":"xhigh"},"accepted":true},
     {"route":{"model":"gpt-5.6-terra","effort":"max"},"escalation_reason":"Fixture requires additional reasoning depth","accepted":true},
     {"route":{"model":"gpt-5.6-terra","effort":"max"},"accepted":false},
+    {"route":{"model":"gpt-5.6-sol","effort":"xhigh"},"escalation_reason":"Connected runtime fencing requires the stronger route","accepted":true},
+    {"route":{"model":"gpt-5.6-sol","effort":"max"},"escalation_reason":"Exceptional connected runtime review requires maximum depth","accepted":true},
+    {"route":{"model":"gpt-5.6-sol","effort":"xhigh"},"accepted":false},
+    {"route":{"model":"gpt-5.6-sol","effort":"max"},"accepted":false},
     {"route":{"model":"gpt-6-astra","effort":"xhigh"},"escalation_reason":"Not an allowed worker route","accepted":false}
   ],
   "http": {
@@ -210,7 +214,9 @@
           "changes": {
             "base_commit": "fedcba9876543210fedcba9876543210fedcba98",
             "requirements_fingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-            "requirements_revision": 2
+            "requirements_revision": 2,
+            "turn_limit": 30,
+            "turn_limit_reason": "Complete the connected recovery validation"
           }
         }
       },
@@ -218,7 +224,9 @@
         "operation": "revise",
         "assignment_id": "item-one",
         "revision": 2,
-        "phase": "ready"
+        "phase": "ready",
+        "turn_limit": 30,
+        "turn_limit_reason": "Complete the connected recovery validation"
       }
     },
     "pause": {

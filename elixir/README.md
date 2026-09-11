@@ -142,6 +142,7 @@ hooks:
     git clone git@github.com:your-org/your-repo.git .
 agent:
   max_concurrent_agents: 10
+  max_concurrent_agents_by_state: {}
   max_turns: 20
 codex:
   command: codex app-server
@@ -190,6 +191,10 @@ Notes:
   `networkAccess: true` in that policy. A `dangerFullAccess` policy needs no additional network field.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.max_concurrent_agents` is the effective global concurrency limit. Use the exact key
+  `agent.max_concurrent_agents_by_state` for positive per-state overrides; states not listed there
+  use the global fallback. The dashboard and managed-state diagnostics expose the global limit,
+  configured per-state overrides, and that fallback explicitly.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Every configured workspace hook receives `SYMPHONY_ISSUE_CONTEXT`, a UTF-8 JSON object with exactly
@@ -271,6 +276,21 @@ The version two control contract has these boundaries:
   `source_attempt_id`, and `report_id`. Sources must belong to the same Project and current PM.
   Canonical reports resolve into a bounded findings block on the next worker turn. These
   findings are evidence, cannot grant authority or change scope, and clear on material revision.
+- Managed routes may select the `gpt-5.6-sol` (Sol) route; the default managed route remains
+  `gpt-5.6-luna` with `xhigh` effort, and every accepted route is recorded with its model and effort.
+- Managed session start and resume reads use the configured `codex.read_timeout_ms` (default `60000`
+  ms). The stop/interrupt read remains separately bounded at `10000` ms so a slow startup does not
+  extend shutdown handling.
+- A worker `context_needed` report enters `WAITING`. If the PM now has the missing completion evidence,
+  accept that waiting outcome through the existing `review` operation with its accepted `evidence`
+  argument and the existing expected revision, ownership-revision, and Project fences; a waiting
+  acceptance rejects `peer_report_refs`, does not require a `reason`, and is terminal. If the missing
+  context is not yet resolved, use `rework` to return the retained assignment to dispatchable work.
+  No new report or control protocol is required.
+- Managed assignments start with an initial turn limit of `20`. An operator can extend the absolute
+  limit through `revise` using `changes.turn_limit` in the inclusive range `1..100`, strictly above
+  the current limit, and a required non-empty `changes.turn_limit_reason`; the field is not a
+  per-request increment.
 - `GET /api/v1/managed/state` defaults to compact `view=summary`. Optional `project_id`,
   `assignment_id`, and `include_history=true` select records. `view=detail` requires an
   assignment ID for complete reports; `view=full` is deliberate diagnostic access. The

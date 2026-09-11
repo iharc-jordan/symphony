@@ -269,6 +269,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           <details :if={@selected_task.last_report[:evidence] not in [nil, []]}><summary>Evidence</summary><ul><li :for={item <- @selected_task.last_report.evidence}>{item}</li></ul></details>
                         </section>
                       <% end %>
+                      <details :if={@selected_task[:reports] not in [nil, [], %{}]} class="technical-details"><summary>Report history</summary><ul>
+                        <li :for={report <- @selected_task.reports}><strong>{report[:kind] || "Report"}</strong><span :if={report[:report_id]}> · {report.report_id}</span><span :if={report[:summary]}> · {report.summary}</span></li>
+                      </ul></details>
+                      <details :if={@selected_task[:peer_report_refs] not in [nil, []]} class="technical-details"><summary>Peer report references</summary><ul>
+                        <li :for={reference <- @selected_task.peer_report_refs}><code>{reference[:source_assignment_id] || "assignment unavailable"}</code> / <code>{reference[:source_attempt_id] || "attempt unavailable"}</code> / <code>{reference[:report_id] || "report unavailable"}</code></li>
+                      </ul></details>
                       <.issue_identifier identifier={issue_label(@selected_task)} url={@selected_task[:issue_url]} />
                       <details class="technical-details"><summary>Task identifiers</summary><dl>
                         <div><dt>Assignment</dt><dd><code>{@selected_task.assignment_id}</code></dd></div>
@@ -321,6 +327,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <% end %>
         <div><dt>Total runtime</dt><dd>{format_duration((@payload.codex_totals.seconds_running || 0) + running_seconds(@payload, @now))}</dd></div>
       </dl>
+      <%= if @payload[:managed] && @payload.managed[:diagnostics] do %>
+        <section class="runtime-section"><h3>Concurrency limits</h3>
+          <p class="detail-note">Effective global limit: <strong>{format_count(get_in(@payload, [:managed, :diagnostics, :concurrency, :global]))}</strong></p>
+          <p class="detail-note">Per-state overrides: <code>{format_limits(get_in(@payload, [:managed, :diagnostics, :concurrency, :by_state]))}</code></p>
+        </section>
+      <% end %>
       <p class="detail-note">Service totals include completed sessions. Unavailable totals indicate incomplete historical accounting.</p>
       <section class="runtime-section"><h3>Running sessions <span>{length(@payload.running)}</span></h3>
         <p :if={@payload.running == []} class="empty-copy">No workers are running.</p>
@@ -636,7 +648,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
     if task.usage[:runtime_complete] == false, do: duration <> " (partial history)", else: duration
   end
 
-  defp format_tokens(%{accounting_status: "unavailable"}, _key), do: "Unavailable"
+  defp format_tokens(%{accounting_status: status}, _key) when status in ["unavailable", "unreliable"], do: "Unavailable"
 
   defp format_tokens(%{telemetry_complete: false} = usage, key) do
     if is_number(usage[key]) and usage[key] > 0, do: format_count(usage[key]) <> " (partial)", else: "Incomplete telemetry"
@@ -648,6 +660,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp format_count(value) when is_number(value), do: value |> trunc() |> Integer.to_string() |> String.replace(~r/\B(?=(\d{3})+(?!\d))/, ",")
   defp format_count(_value), do: "Not recorded"
+
+  defp format_limits(limits) when is_map(limits) and map_size(limits) > 0 do
+    limits
+    |> Enum.sort_by(fn {state, _limit} -> to_string(state) end)
+    |> Enum.map_join(", ", fn {state, limit} -> "#{state}: #{format_count(limit)}" end)
+  end
+
+  defp format_limits(_limits), do: "none"
 
   defp format_runtime(started_at, now), do: format_duration(elapsed_seconds(started_at, now))
 

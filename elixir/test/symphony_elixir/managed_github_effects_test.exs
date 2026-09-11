@@ -57,6 +57,22 @@ defmodule SymphonyElixir.ManagedGitHubEffectsTest do
     assert %{status: "REVIEW", issue_state: "OPEN", status_writes: 1, close_writes: 0} = snapshot(provider)
   end
 
+  test "accepted review advances a reconciled WAITING item and still proves issue close", %{provider: provider} do
+    Agent.update(provider, &%{&1 | status: "WAITING"})
+
+    assert {:ok,
+            %{
+              provider_state: :review,
+              provider_final_state: :accepted,
+              issue_final_state: :closed,
+              reconciled: true,
+              external_effects: %{status: :ok, issue_close: :ok}
+            }} = GitHubEffects.review(assignment(), %{}, context())
+
+    assert %{status: "ACCEPTED", issue_state: "CLOSED", reason: "COMPLETED", status_writes: 1, close_writes: 1} =
+             snapshot(provider)
+  end
+
   test "card summary writes only its dedicated field and keeps issue requirements intact", %{provider: provider} do
     binding = Map.put(context().binding, :projection_field_id, "FIELD_summary")
     projected = Map.put(assignment(), :project_id, binding.project_id)

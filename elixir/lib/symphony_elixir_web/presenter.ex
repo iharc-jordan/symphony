@@ -93,14 +93,13 @@ defmodule SymphonyElixirWeb.Presenter do
   defp managed_state_payload(state, snapshot) do
     principals = sanitize_principals(Map.get(state, :principals, %{}))
     source_assignments = Map.get(state, :assignments, %{})
+    concurrency = concurrency_diagnostics(state)
 
-    max_agents =
-      case Config.settings() do
-        {:ok, settings} -> settings.agent.max_concurrent_agents
-        _ -> nil
-      end
-
-    facts = %{max_concurrent_agents: max_agents, running_count: length(snapshot.running)}
+    facts = %{
+      max_concurrent_agents: concurrency.global,
+      max_concurrent_agents_by_state: concurrency.by_state,
+      running_count: length(snapshot.running)
+    }
 
     assignments =
       source_assignments
@@ -125,9 +124,47 @@ defmodule SymphonyElixirWeb.Presenter do
       assignments: assignments,
       counts: managed_counts(assignments),
       handoffs: handoff_history(Map.get(state, :events, [])),
-      projection: projection_summary(assignments)
+      projection: projection_summary(assignments),
+      diagnostics: %{concurrency: concurrency}
     }
   end
+
+  defp concurrency_diagnostics(state) do
+    {configured_global, configured_by_state} =
+      case Config.settings() do
+        {:ok, settings} -> {settings.agent.max_concurrent_agents, settings.agent.max_concurrent_agents_by_state}
+        _ -> {nil, %{}}
+      end
+
+    runtime = Map.get(state, :runtime, %{})
+
+    limits = %{
+      global:
+        positive_integer(Map.get(state, :max_concurrent_agents)) ||
+          positive_integer(field_value(runtime, :max_concurrent_agents)) || configured_global,
+      by_state:
+        safe_limits(
+          Map.get(state, :max_concurrent_agents_by_state) ||
+            field_value(runtime, :max_concurrent_agents_by_state) || configured_by_state
+        )
+    }
+
+    Map.put(limits, :fallback, limits.global)
+  end
+
+  defp safe_limits(limits) when is_map(limits) do
+    Enum.reduce(limits, %{}, fn {key, value}, acc ->
+      case {text_value(key), positive_integer(value)} do
+        {state, limit} when is_binary(state) and is_integer(limit) -> Map.put(acc, state, limit)
+        _ -> acc
+      end
+    end)
+  end
+
+  defp safe_limits(_limits), do: %{}
+
+  defp positive_integer(value) when is_integer(value) and value > 0, do: value
+  defp positive_integer(_value), do: nil
 
   defp sanitize_projects(projects) when is_map(projects) do
     Enum.reduce(projects, %{}, fn {key, project}, acc -> put_project(acc, key, project) end)
@@ -243,6 +280,7 @@ defmodule SymphonyElixirWeb.Presenter do
       stop_pending: field_value(assignment, :stop_pending) == true,
       route: assignment_route(assignment),
       last_report: safe_last_report(field_value(assignment, :last_report)),
+      peer_report_refs: safe_peer_report_refs(assignment),
       blocked_reason: safe_text(field_value(assignment, :blocked_reason)),
       started_at: iso8601(field_value(assignment, :started_at)),
       worker: safe_worker(assignment),
@@ -376,52 +414,113 @@ defmodule SymphonyElixirWeb.Presenter do
   defp safe_reports(nil), do: []
 
   defp safe_reports(reports) when is_list(reports) do
-    Enum.map(reports, fn report ->
-      if is_map(report) do
-        compact(%{
-          kind: text_value(Map.get(report, :kind)),
-          status: text_value(Map.get(report, :status)),
-          updated_at: iso8601(Map.get(report, :updated_at)),
-          count: Map.get(report, :count)
-        })
-      else
-        %{status: "available"}
-      end
-    end)
+    reports |> Enum.map(&safe_report/1) |> Enum.reject(&is_nil/1)
+  end
+
+  defp safe_reports(reports) when is_map(reports) do
+    reports
+    |> Enum.map(fn {_key, report} -> report end)
+    |> safe_reports()
   end
 
   defp safe_reports(_reports), do: []
 
+  defp safe_report(report) when is_map(report) do
+    compact(%{
+      report_id: text_value(field_value(report, :report_id) || field_value(report, :id)),
+      attempt_id: text_value(field_value(report, :attempt_id)),
+      kind: text_value(field_value(report, :kind)),
+      status: text_value(field_value(report, :status)),
+      summary: safe_report_text(field_value(report, :summary)),
+      evidence: safe_report_evidence(field_value(report, :evidence)),
+      source_assignment_id: text_value(field_value(report, :source_assignment_id)),
+      source_attempt_id: text_value(field_value(report, :source_attempt_id)),
+      updated_at: iso8601(field_value(report, :updated_at)),
+      count: integer_or_nil(field_value(report, :count))
+    })
+  end
+
+  defp safe_report(_report), do: nil
+
   defp safe_usage(nil), do: %{}
 
   defp safe_usage(usage) when is_map(usage) do
-    usage
-    |> Map.take([
-      :baseline_tokens,
-      :cumulative_tokens,
-      :inflight_tokens,
-      :overshoot_tokens,
-      :cap_reached,
-      :limit_tokens,
-      :input_tokens,
-      :cached_input_tokens,
-      :output_tokens,
-      :total_tokens,
-      :seconds_running,
-      :telemetry_complete,
-      :runtime_complete,
-      :accounting_status
-    ])
-    |> Enum.reduce(%{}, fn {key, val}, acc ->
-      cond do
-        key == :accounting_status and val in [:known, :unavailable, "known", "unavailable"] -> Map.put(acc, key, to_string(val))
-        is_integer(val) or is_float(val) or is_boolean(val) -> Map.put(acc, key, val)
-        true -> acc
-      end
-    end)
+    projected =
+      usage
+      |> Map.take([
+        :baseline_tokens,
+        :cumulative_tokens,
+        :inflight_tokens,
+        :overshoot_tokens,
+        :cap_reached,
+        :limit_tokens,
+        :input_tokens,
+        :cached_input_tokens,
+        :output_tokens,
+        :total_tokens,
+        :seconds_running,
+        :telemetry_complete,
+        :runtime_complete,
+        :accounting_status,
+        :diagnostic
+      ])
+      |> Enum.reduce(%{}, &put_safe_usage_value/2)
+
+    maybe_put_historical_raw_tokens(projected, usage)
   end
 
   defp safe_usage(_usage), do: %{}
+
+  defp put_safe_usage_value({key, value}, usage) do
+    cond do
+      key == :accounting_status and value in [:known, :unavailable, :unreliable, "known", "unavailable", "unreliable"] ->
+        Map.put(usage, key, to_string(value))
+
+      key == :diagnostic and value in [:unavailable, :unreliable, "unavailable", "unreliable"] ->
+        Map.put(usage, key, to_string(value))
+
+      is_integer(value) or is_float(value) or is_boolean(value) ->
+        Map.put(usage, key, value)
+
+      true ->
+        usage
+    end
+  end
+
+  defp maybe_put_historical_raw_tokens(projected, usage) do
+    if usage_unavailable?(usage) do
+      raw = Map.get(usage, :historical_raw_tokens, Map.get(usage, "historical_raw_tokens"))
+      put_historical_raw_tokens(projected, raw, accounting_status(usage))
+    else
+      projected
+    end
+  end
+
+  defp put_historical_raw_tokens(projected, raw, diagnostic) when is_map(raw) do
+    values =
+      Enum.reduce(raw, %{}, fn {key, value}, acc ->
+        if is_integer(value) or is_float(value), do: Map.put(acc, key, value), else: acc
+      end)
+
+    if map_size(values) > 0 do
+      Map.put(projected, :historical_raw_tokens, %{diagnostic: diagnostic, valid_spend: false, values: values})
+    else
+      projected
+    end
+  end
+
+  defp put_historical_raw_tokens(projected, _raw, _diagnostic), do: projected
+
+  defp usage_unavailable?(usage) do
+    Map.get(usage, :accounting_status, Map.get(usage, "accounting_status")) in [:unavailable, :unreliable, "unavailable", "unreliable"]
+  end
+
+  defp accounting_status(usage) do
+    case Map.get(usage, :accounting_status, Map.get(usage, "accounting_status")) do
+      status when status in [:unavailable, :unreliable, "unavailable", "unreliable"] -> to_string(status)
+      _ -> "unavailable"
+    end
+  end
 
   defp safe_attempt(nil), do: %{}
 
@@ -461,14 +560,42 @@ defmodule SymphonyElixirWeb.Presenter do
   defp safe_last_report(nil), do: %{kind: nil, summary: nil, evidence: []}
 
   defp safe_last_report(report) when is_map(report) do
-    %{
+    compact(%{
+      report_id: safe_report_text(field_value(report, :report_id) || field_value(report, :id)),
+      attempt_id: safe_report_text(field_value(report, :attempt_id)),
       kind: safe_report_text(field_value(report, :kind)),
       summary: safe_report_text(field_value(report, :summary)),
       evidence: safe_report_evidence(field_value(report, :evidence))
-    }
+    })
   end
 
   defp safe_last_report(_report), do: %{kind: nil, summary: nil, evidence: []}
+
+  defp safe_peer_report_refs(assignment) do
+    assignment
+    |> field_value(:review_feedback)
+    |> field_value(:peer_report_refs)
+    |> case do
+      nil -> field_value(assignment, :peer_report_refs)
+      refs -> refs
+    end
+    |> safe_peer_report_refs_value()
+  end
+
+  defp safe_peer_report_refs_value(refs) when is_list(refs) do
+    refs
+    |> Enum.filter(&is_map/1)
+    |> Enum.map(fn ref ->
+      compact(%{
+        source_assignment_id: text_value(field_value(ref, :source_assignment_id)),
+        source_attempt_id: text_value(field_value(ref, :source_attempt_id)),
+        report_id: text_value(field_value(ref, :report_id))
+      })
+    end)
+    |> Enum.reject(&(map_size(&1) == 0))
+  end
+
+  defp safe_peer_report_refs_value(_refs), do: []
 
   defp safe_report_evidence(evidence) when is_list(evidence) do
     evidence

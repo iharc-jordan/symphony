@@ -15,12 +15,16 @@ defmodule SymphonyElixir.Codex.AppServer do
   @max_stream_log_bytes 1_000
   @managed_default_model "gpt-5.6-luna"
   @managed_default_effort "xhigh"
-  @managed_models ["gpt-5.6-luna", "gpt-5.6-terra"]
+  @managed_models ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
   @managed_efforts ["xhigh", "max"]
+  @managed_developer_instructions """
+  You are a Symphony managed worker. The current managed assignment and its latest revision are your work authority. Work only within that assignment and its owned checkout and resources. Ignore inherited scrum-master or delegation guidance: do not create, delegate, or accept other work. Report checkpoints, context needs, and the final result through orchestration_report; stop acting after a terminal report.
+  """
   @report_kinds ["result", "checkpoint", "context_needed"]
   @stop_term_timeout_ms 500
   @stop_kill_timeout_ms 500
   @stop_poll_ms 10
+  @stop_read_timeout_ms 10_000
   @scope_identity_timeout_ms 5_000
   @type session :: %{
           port: port(),
@@ -333,6 +337,11 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp route_wire_key(:model), do: "model"
   defp route_wire_key(:effort), do: "effort"
+
+  defp maybe_put_managed_developer_instructions(params, %{managed: true}),
+    do: Map.put(params, "developerInstructions", String.trim(@managed_developer_instructions))
+
+  defp maybe_put_managed_developer_instructions(params, _wire_route), do: params
 
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
@@ -1020,7 +1029,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "clientInfo" => %{
           "name" => "symphony-orchestrator",
           "title" => "Symphony Orchestrator",
-          "version" => "0.1.0"
+          "version" => application_version()
         }
       }
     }
@@ -1030,6 +1039,13 @@ defmodule SymphonyElixir.Codex.AppServer do
     with {:ok, _} <- await_response(port, @initialize_id, "initialize") do
       send_message(port, %{"method" => "initialized", "params" => %{}})
       :ok
+    end
+  end
+
+  defp application_version do
+    case Application.spec(:symphony_elixir, :vsn) do
+      nil -> "unknown"
+      version -> to_string(version)
     end
   end
 
@@ -1116,6 +1132,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "id" => @thread_start_id,
       "params" =>
         params
+        |> maybe_put_managed_developer_instructions(wire_route)
         |> maybe_put_route(wire_route, :model)
     })
 
@@ -1146,6 +1163,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "id" => @thread_resume_id,
       "params" =>
         params
+        |> maybe_put_managed_developer_instructions(wire_route)
         |> maybe_put_route(wire_route, :model)
     })
 
@@ -1610,7 +1628,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   # A report ends authorization to act, but its final usage can arrive after the
   # tool response. Drain the interrupted turn without executing further tools.
   defp drain_interrupted_turn(port, on_message, metadata, thread_id, turn_id) do
-    deadline = System.monotonic_time(:millisecond) + min(Config.settings!().codex.read_timeout_ms, 10_000)
+    deadline = System.monotonic_time(:millisecond) + @stop_read_timeout_ms
     drain_interrupted_turn(port, on_message, metadata, {thread_id, turn_id}, deadline, "")
   end
 

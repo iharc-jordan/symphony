@@ -93,6 +93,40 @@ defmodule SymphonyElixirWeb.ManagedStateViewTest do
     assert payload.assignments["worker-active"].worker.active == true
   end
 
+  test "review and review_pending share one review count and diagnostics expose limit fallback" do
+    state =
+      state_with_assignments(%{
+        "review" => assignment("review", "PVT_one", @pm, :review),
+        "review-pending" => assignment("review-pending", "PVT_one", @pm, :review_pending),
+        "ready" => assignment("ready", "PVT_one", @pm, :ready)
+      })
+
+    assert {:ok, payload} =
+             ManagedStateView.project(state, pm(@pm), %{
+               view: :summary,
+               project_id: nil,
+               assignment_id: nil,
+               include_history: false,
+               runtime_facts: %{max_concurrent_agents: 3, max_concurrent_agents_by_state: %{"ready" => 2, "zero" => 0}}
+             })
+
+    assert payload.counts.review == 2
+    assert payload.diagnostics.concurrency == %{global: 3, by_state: %{"ready" => 2}, fallback: 3}
+    assert payload.usage["baseline_tokens"] == 10
+    assert payload.usage["cumulative_tokens"] == 20
+
+    assert {:ok, invalid_limits} =
+             ManagedStateView.project(state, pm(@pm), %{
+               view: :summary,
+               project_id: nil,
+               assignment_id: nil,
+               include_history: false,
+               runtime_facts: %{max_concurrent_agents: 3, max_concurrent_agents_by_state: :invalid}
+             })
+
+    assert invalid_limits.diagnostics.concurrency.by_state == %{}
+  end
+
   test "operator history keeps siblings for active PMs and omits terminal-only PM groups" do
     state =
       state_with_assignments(%{
@@ -135,7 +169,14 @@ defmodule SymphonyElixirWeb.ManagedStateViewTest do
 
   test "detail requires an assignment and keeps full report evidence and current metadata" do
     report = %{report_id: "r-1", kind: "result", summary: "done", evidence: [%{commit: "abc"}]}
-    assignment = assignment("a-1", "PVT_one", @pm, :review, reports: %{"r-1" => report}, last_report: report, attempt_id: "attempt-2")
+
+    assignment =
+      assignment("a-1", "PVT_one", @pm, :review,
+        reports: %{"r-1" => report},
+        last_report: report,
+        attempt_id: "attempt-2",
+        review_feedback: %{peer_report_refs: [%{source_assignment_id: "source", source_attempt_id: "source-attempt", report_id: "source-report"}]}
+      )
 
     assert {:error, {:assignment_id, message}} =
              ManagedStateView.project(state_with_assignments(%{"a-1" => assignment}), pm(@pm), %{
@@ -151,6 +192,7 @@ defmodule SymphonyElixirWeb.ManagedStateViewTest do
              })
 
     assert payload.assignment.reports["r-1"].evidence == [%{commit: "abc"}]
+    assert payload.assignment.peer_report_refs == [%{source_assignment_id: "source", source_attempt_id: "source-attempt", report_id: "source-report"}]
     assert payload.assignment.attempt_id == "attempt-2"
     assert payload.assignment.wait_reason == nil
   end
@@ -177,7 +219,12 @@ defmodule SymphonyElixirWeb.ManagedStateViewTest do
     assert payload.assignments["blocked"].wait_reason == "dependencies_not_accepted"
     assert payload.assignments["ready"].wait_reason == "ready"
     assert payload.usage["accounting_status"] == "unavailable"
-    assert payload.usage["historical_raw_tokens"] == %{"input" => 41, "output" => 59}
+
+    assert payload.usage["historical_raw_tokens"] == %{
+             diagnostic: "unavailable",
+             valid_spend: false,
+             values: %{"input" => 41, "output" => 59}
+           }
 
     saturated = Map.merge(state, %{max_concurrent_agents: 1, running: %{"worker" => %{}}})
     assert {:ok, payload} = ManagedStateView.project(saturated, pm(@pm), %{})
@@ -243,6 +290,7 @@ defmodule SymphonyElixirWeb.ManagedStateViewTest do
     malformed_usage = %{
       nil => 1,
       baseline_tokens: nil,
+      future_atom: :diagnostic,
       unsupported: {:tuple},
       historical_raw_tokens: %{nil => 1, "input" => 4, "bad" => "not-a-number"}
     }
@@ -292,7 +340,17 @@ defmodule SymphonyElixirWeb.ManagedStateViewTest do
     assert payload.assignments["dispatch-paused"].wait_reason == "assignment_paused"
     assert payload.assignments["dependency-missing"].wait_reason == "dependencies_not_accepted"
     assert payload.assignments["dependency-accepted"].wait_reason == "ready"
-    assert payload.usage["historical_raw_tokens"] == %{"input" => 4}
+    assert payload.usage["future_atom"] == "diagnostic"
+
+    assert payload.usage["historical_raw_tokens"] == %{
+             diagnostic: "unavailable",
+             valid_spend: false,
+             values: %{"input" => 4}
+           }
+
+    known_usage = %{accounting_status: :known, historical_raw_tokens: %{input: 99}}
+    assert {:ok, known_payload} = ManagedStateView.project(Map.put(state, :usage, known_usage), pm(@pm), %{project_id: "PVT_bad"})
+    refute Map.has_key?(known_payload.usage, "historical_raw_tokens")
 
     assert {:ok, filtered_full} =
              ManagedStateView.project(state, pm(@pm), %{"view" => "full", "project_id" => "PVT_bad"})

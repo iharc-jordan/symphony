@@ -644,7 +644,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
 - `codex.turn_timeout_ms`: integer, default `3600000`
-- `codex.read_timeout_ms`: integer, default `5000`
+- `codex.read_timeout_ms`: integer, default `60000` (60 seconds for session start/resume reads;
+  stop/interrupt reads remain separately bounded at 10000 ms)
 - `codex.stall_timeout_ms`: integer, default `300000`
 
 ## 7. Orchestration State Machine
@@ -2371,6 +2372,23 @@ Optional peer findings MUST reference canonical reports by source assignment, so
 and report ID. References MUST validate the current Project, PM ownership, and target revision
 fences. Resolve a bounded block for the next turn, treat it as evidence without authority, and
 clear references together with obsolete feedback on material scope revision.
+
+The managed route MAY select the `gpt-5.6-sol` Sol route; implementations MUST preserve the
+selected model and effort in the attempt metadata and reject silent substitutions. A
+  `context_needed` report places the assignment in `WAITING`; if the PM now has the missing
+  completion evidence, accepting that outcome uses the existing review fields with non-empty
+  `evidence` and expected revision, ownership-revision, and Project fences. Waiting acceptance MUST
+  reject `peer_report_refs` and does not require `reason`; it is terminal acceptance. If the missing
+  context is not yet resolved, use `rework` to return the retained assignment to dispatchable work.
+
+Managed assignments start with an absolute turn limit of 20. The `revise` operation MAY set
+`changes.turn_limit` to an absolute value in the inclusive range `1..100` strictly above the
+current limit only when a non-empty `changes.turn_limit_reason` accompanies it.
+
+Managed diagnostics MUST expose the effective global concurrency limit, configured per-state
+overrides, and the global fallback used by states without an override. Compact and detail projections SHOULD expose validated peer report
+references, while historical raw token values MUST carry an explicit unavailable or unreliable
+diagnostic label and MUST NOT be treated as valid spend or accounting.
 
 Managed usage MUST persist source-thread raw watermarks independently from corrected assignment
 totals. Reconnects, resumes, duplicate notifications, and restarts must count only new usage.

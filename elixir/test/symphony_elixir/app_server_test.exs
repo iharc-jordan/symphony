@@ -188,9 +188,19 @@ defmodule SymphonyElixir.AppServerTest do
         |> Enum.map(&String.trim_leading(&1, "JSON:"))
         |> Enum.map(&Jason.decode!/1)
 
+      initialize = Enum.find(payloads, &(&1["method"] == "initialize"))
+      assert get_in(initialize, ["params", "clientInfo", "version"]) == to_string(Application.spec(:symphony_elixir, :vsn))
+
       thread_start = Enum.find(payloads, &(&1["method"] == "thread/start"))
       assert get_in(thread_start, ["params", "model"]) == "gpt-5.6-luna"
       assert get_in(thread_start, ["params", "sandbox"]) == "danger-full-access"
+
+      assert get_in(thread_start, ["params", "developerInstructions"]) =~
+               "current managed assignment and its latest revision are your work authority"
+
+      assert get_in(thread_start, ["params", "developerInstructions"]) =~
+               "Ignore inherited scrum-master or delegation guidance"
+
       refute Map.has_key?(thread_start["params"], "permissions")
 
       assert Enum.any?(get_in(thread_start, ["params", "dynamicTools"]), fn tool ->
@@ -215,7 +225,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "terminal reports drain final usage and reject further tools before unwinding" do
+  test "terminal reports use an independent stop-read budget while draining final usage" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -252,6 +262,7 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":100,"method":"item/tool/call","params":{"tool":"forbidden_after_report","arguments":{}}}'
             ;;
           7)
+            sleep 0.5
             printf '%s\\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-terminal","tokenUsage":{"total":{"inputTokens":714937,"outputTokens":18786,"totalTokens":733723}}}}'
             printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-terminal","turn":{"id":"turn-terminal","status":"interrupted"}}}'
             ;;
@@ -263,7 +274,8 @@ defmodule SymphonyElixir.AppServerTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        codex_command: "#{codex_binary} app-server"
+        codex_command: "#{codex_binary} app-server",
+        codex_read_timeout_ms: 250
       )
 
       issue = %Issue{
@@ -399,7 +411,7 @@ defmodule SymphonyElixir.AppServerTest do
           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
           2) ;;
           3)
-            printf '%s\\n' '{"id":4,"result":{"thread":{"id":"thread-resume"},"model":"gpt-5.6-luna","reasoningEffort":null}}'
+            printf '%s\\n' '{"id":4,"result":{"thread":{"id":"thread-resume"},"model":"gpt-5.6-sol","reasoningEffort":null}}'
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-resume"}}}'
             ;;
           4)
@@ -440,8 +452,9 @@ defmodule SymphonyElixir.AppServerTest do
                  "Continue managed turn",
                  issue,
                  managed_attempt: attempt,
-                 model: "gpt-5.6-luna",
-                 effort: "xhigh",
+                 model: "gpt-5.6-sol",
+                 effort: "max",
+                 escalation_reason: "Connected recovery requires the strongest worker route",
                  resume_thread_id: "thread-resume"
                )
 
@@ -456,7 +469,14 @@ defmodule SymphonyElixir.AppServerTest do
       refute Enum.any?(payloads, &(&1["method"] == "thread/start"))
       resume = Enum.find(payloads, &(&1["method"] == "thread/resume"))
       assert get_in(resume, ["params", "threadId"]) == "thread-resume"
-      assert get_in(resume, ["params", "model"]) == "gpt-5.6-luna"
+      assert get_in(resume, ["params", "model"]) == "gpt-5.6-sol"
+
+      assert get_in(resume, ["params", "developerInstructions"]) =~
+               "current managed assignment and its latest revision are your work authority"
+
+      turn_start = Enum.find(payloads, &(&1["method"] == "turn/start"))
+      assert get_in(turn_start, ["params", "model"]) == "gpt-5.6-sol"
+      assert get_in(turn_start, ["params", "effort"]) == "max"
     after
       File.rm_rf(test_root)
     end

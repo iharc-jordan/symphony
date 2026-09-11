@@ -122,7 +122,7 @@ defmodule SymphonyElixir.Managed.GitHubEffects do
 
   defp ensure_project_accepted(issue, context) do
     case provider_status(issue) do
-      :review ->
+      status when status in [:review, :waiting] ->
         with {:ok, accepted_option} <- status_option(context, :accepted) do
           set_project_status(issue, context, accepted_option)
         end

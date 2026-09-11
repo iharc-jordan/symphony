@@ -8,11 +8,11 @@ They carry one attempt identity for the lifetime of the worker:
 - generation: non negative retry generation
 - attempt_id: unique worker attempt identity
 
-The managed route defaults to model gpt-5.6-luna with xhigh effort. The permitted
-managed routes are Luna or Terra with xhigh or max effort. Terra or max requires
-an escalation_reason. If route copies are present in the attempt metadata, they
-must equal the explicit route options. Astra and silent substitutions are
-rejected.
+The managed route defaults to model gpt-5.6-luna with xhigh effort. The Sol route
+(`gpt-5.6-sol`) is available when selected by the runtime; permitted managed
+routes use xhigh or max effort. Terra or max requires an escalation_reason. If
+route copies are present in the attempt metadata, they must equal the explicit
+route options. Astra and silent substitutions are rejected.
 
 A resumed managed session sends thread/resume with the exact supplied
 resume_thread_id. A start or resume response must contain the same thread id and
@@ -21,6 +21,10 @@ attempt before on_session or the first turn. The initial reasoningEffort may be
 null because effort is applied by turn/start; the selected turn wire includes
 and records the configured effort.
 
+Start and resume reads use `codex.read_timeout_ms`, whose default is 60 seconds.
+The stop/interrupt read has a separate 10 second bound; a slow start or resume
+cannot extend shutdown handling.
+
 The managed dynamic tool orchestration_report accepts result, checkpoint, and
 context_needed reports. Every accepted report callback payload includes the
 attempt identity, thread id, turn id, report kind, report id, summary, and
@@ -28,6 +32,19 @@ evidence. Checkpoint reports continue the current turn. Result and
 context_needed reports return the tool response, issue turn/interrupt, and stop
 the worker so no later model output can mutate the workspace. A callback error
 also returns the tool error, interrupts the turn, and stops the worker.
+
+`context_needed` places the assignment in `WAITING`. If the PM now has the
+missing completion evidence, operators accept that outcome through the
+existing review fields with non-empty `evidence` and the existing expected
+revision, ownership-revision, and Project fences. Waiting acceptance rejects
+`peer_report_refs`, does not require `reason`, and is terminal. If the missing
+context is not yet resolved, operators use `rework` to return the retained
+assignment to dispatchable work.
+
+Managed assignments start with an absolute turn limit of 20. The existing
+`revise` operation can set `changes.turn_limit` to an absolute value from 1 to
+100 strictly above the current limit only when the same changes map contains a
+non-empty `changes.turn_limit_reason`.
 
 Managed runner callbacks are synchronous. on_session receives thread id, actual
 model, selected turn effort, initial thread reasoning effort when available,

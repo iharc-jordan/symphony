@@ -14,10 +14,11 @@ defmodule SymphonyElixir.Managed.Rules do
   @active_phases [:ready, :active, :waiting, :review]
   @allowed_routes %{
     "gpt-5.6-luna" => ~w(xhigh max),
-    "gpt-5.6-terra" => ~w(xhigh max)
+    "gpt-5.6-terra" => ~w(xhigh max),
+    "gpt-5.6-sol" => ~w(xhigh max)
   }
   @default_route %{model: "gpt-5.6-luna", effort: "xhigh"}
-  @revision_change_keys ~w(base_commit route resources dependencies requirements requirements_fingerprint requirements_revision escalation_reason)a
+  @revision_change_keys ~w(base_commit route resources dependencies requirements requirements_fingerprint requirements_revision escalation_reason turn_limit turn_limit_reason)a
 
   @type state :: map()
   @type envelope :: map()
@@ -166,18 +167,19 @@ defmodule SymphonyElixir.Managed.Rules do
          :ok <- validate_request_id(normalized.request_id),
          {:ok, args} <- normalize_args(normalized.args),
          {:ok, principal} <- principal_context(context),
-         {:ok, :review} <- normalize_operation(normalized.operation) do
+         {:ok, :review} <- normalize_operation(normalized.operation),
+         :ok <- authorize_operation(state, :review, args, principal) do
       normalized = normalized |> Map.merge(%{operation: :review, args: args}) |> Map.put(:principal, principal)
       canonical = canonical_input(normalized)
 
-      prepare_review_result(state, normalized, canonical, principal, args)
+      prepare_review_result(state, normalized, canonical, principal, args, context)
     else
       {:ok, operation} -> {:error, :unsupported_operation, %{operation: operation}}
       {:error, code, details} -> {:error, code, details}
     end
   end
 
-  defp prepare_review_result(state, normalized, canonical, principal, args) do
+  defp prepare_review_result(state, normalized, canonical, principal, args, context) do
     case Map.get(state.requests, normalized.request_id) do
       %{canonical: ^canonical} = record ->
         duplicate_or_principal_conflict(record, principal, normalized.request_id)
@@ -186,18 +188,18 @@ defmodule SymphonyElixir.Managed.Rules do
         {:error, :request_id_conflict, %{request_id: normalized.request_id}}
 
       nil ->
-        review_intent(state, normalized, canonical, args)
+        review_intent(state, normalized, canonical, args, context)
     end
   end
 
-  defp review_intent(state, normalized, canonical, args) do
+  defp review_intent(state, normalized, canonical, args, context) do
     assignment_id = text_value(args, :assignment_id)
     disposition = args |> Map.get(:disposition, "accepted") |> phase()
 
     with :ok <- present(assignment_id, :assignment_id),
          {:ok, assignment} <- fetch_assignment(state, assignment_id),
          :ok <- expected_revision(state, args, {:assignment, assignment_id}),
-         :ok <- validate_review_intent(state, assignment, disposition, args) do
+         :ok <- validate_review_intent(state, assignment, disposition, args, context) do
       {:ok,
        %{
          request: Map.delete(normalized, :principal),
@@ -209,21 +211,57 @@ defmodule SymphonyElixir.Managed.Rules do
     end
   end
 
-  defp validate_review_intent(_state, assignment, :accepted, args) do
-    with :ok <- phase_is(assignment.phase, :review),
+  defp validate_review_intent(_state, assignment, :accepted, args, context) do
+    with :ok <- accepted_review_source(assignment, context),
          :ok <- peer_report_refs_absent?(args) do
       evidence_present(Map.get(args, :evidence, []))
     end
   end
 
-  defp validate_review_intent(state, assignment, disposition, args) when disposition in [:waiting, :rework, :blocked] do
+  defp validate_review_intent(state, assignment, disposition, args, _context) when disposition in [:waiting, :rework, :blocked] do
     with :ok <- present(text_value(args, :reason), :reason),
          {:ok, _reports} <- resolve_peer_report_refs(state, assignment, Map.get(args, :peer_report_refs, [])) do
       :ok
     end
   end
 
-  defp validate_review_intent(_state, _assignment, disposition, _args), do: {:error, :invalid_disposition, %{disposition: disposition}}
+  defp validate_review_intent(_state, _assignment, disposition, _args, _context),
+    do: {:error, :invalid_disposition, %{disposition: disposition}}
+
+  defp accepted_review_source(%{phase: :review}, _context), do: :ok
+
+  defp accepted_review_source(%{phase: :waiting} = assignment, context) do
+    case current_context_needed_report(assignment) do
+      :ok -> inactive_reconciled_process(context)
+      error -> error
+    end
+  end
+
+  defp accepted_review_source(assignment, _context), do: phase_is(assignment.phase, :review)
+
+  defp current_context_needed_report(assignment) do
+    report = Map.get(assignment, :last_report)
+    attempt_id = text_value(assignment, :attempt_id)
+
+    cond do
+      not is_map(report) or text_value(report, :kind) != "context_needed" ->
+        {:error, :context_needed_report_required, %{}}
+
+      is_nil(attempt_id) or text_value(report, :attempt_id) != attempt_id ->
+        {:error, :stale_context_needed_report, %{}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp inactive_reconciled_process(context) do
+    case Map.get(context, :managed_process_state, Map.get(context, "managed_process_state")) do
+      :inactive_reconciled -> :ok
+      "inactive_reconciled" -> :ok
+      actual -> {:error, :managed_process_not_inactive_reconciled, %{process_state: actual}}
+    end
+  end
 
   @spec expected_revision(state(), map(), :global | {:assignment, String.t()}) ::
           :ok | {:error, atom(), map()}
@@ -905,12 +943,18 @@ defmodule SymphonyElixir.Managed.Rules do
          :ok <- expected_revision(state, args, {:assignment, assignment_id}),
          :ok <- stop_reconciled_for_revision(assignment, context),
          {:ok, changes} <- revision_changes(args),
+         :ok <- validate_turn_limit_extension(assignment, changes),
          {:ok, route} <- maybe_route(changes),
          {:ok, revised} <- revise_assignment(assignment, changes, route),
          :ok <- duplicate_identity_free_after_revision?(state, assignment_id, revised),
          :ok <- resources_free?(state, revised.resources, assignment_id) do
       assignments = Map.put(state.assignments, assignment_id, revised)
-      response = %{operation: :revise, assignment_id: assignment_id, revision: revised.revision, phase: revised.phase}
+
+      response =
+        %{operation: :revise, assignment_id: assignment_id, revision: revised.revision, phase: revised.phase}
+        |> maybe_put(:turn_limit, Map.get(changes, :turn_limit))
+        |> maybe_put(:turn_limit_reason, text_value(changes, :turn_limit_reason))
+
       commit(state, request, canonical, response, %{assignments: assignments})
     end
   end
@@ -958,7 +1002,7 @@ defmodule SymphonyElixir.Managed.Rules do
   defp transition_stop_pending?(context), do: Map.get(context, :stop_reconciled) != true
 
   defp review_accepted(assignment, provider_state, evidence, state, context) do
-    with :ok <- phase_is(assignment.phase, :review),
+    with :ok <- accepted_review_source(assignment, context),
          :ok <- provider_phase_is(provider_state, :review),
          :ok <- evidence_present(evidence),
          :ok <- dependencies_accepted(assignment, state),
@@ -1149,6 +1193,7 @@ defmodule SymphonyElixir.Managed.Rules do
          :ok <- present(input.base_commit, :base_commit),
          :ok <- phase_is(input.board_state, :ready),
          :ok <- validate_route(input.route, input.escalation_reason),
+         :ok <- bounded_integer(input.turn_limit, :turn_limit, 1, 20),
          {:ok, resources} <- assignment_resources(input.resources, opts),
          :ok <- list_of_binaries(input.dependencies, :dependencies),
          {:ok, requirements} <- requirement_metadata(args) do
@@ -1183,7 +1228,7 @@ defmodule SymphonyElixir.Managed.Rules do
       native_issue_id: text_value(args, :native_issue_id),
       native_repository_id: text_value(args, :native_repository_id),
       escalation_reason: text_value(args, :escalation_reason),
-      turn_limit: min(value_or_default(number_value(args, :turn_limit), 20), 20)
+      turn_limit: value_or_default(number_value(args, :turn_limit), 20)
     }
   end
 
@@ -1398,6 +1443,8 @@ defmodule SymphonyElixir.Managed.Rules do
     base_commit = text_value(changes, :base_commit)
     resources = Map.get(changes, :resources)
     dependencies = Map.get(changes, :dependencies)
+    turn_limit = Map.get(changes, :turn_limit)
+    turn_limit_reason = text_value(changes, :turn_limit_reason)
 
     with :ok <- optional_requirements(requirement_body, fingerprint),
          :ok <- optional_text(base_commit, :base_commit),
@@ -1405,7 +1452,9 @@ defmodule SymphonyElixir.Managed.Rules do
          {:ok, normalized_resources} <- optional_resources(resources),
          :ok <- optional_list_of_binaries(dependencies, :dependencies),
          :ok <- optional_fingerprint(fingerprint),
-         :ok <- optional_requirement_revision(requirement_revision) do
+         :ok <- optional_requirement_revision(requirement_revision),
+         :ok <- optional_bounded_integer(turn_limit, :turn_limit, 1, 100),
+         :ok <- turn_limit_reason_pair(changes, turn_limit, turn_limit_reason) do
       sanitized =
         changes
         |> Map.take(@revision_change_keys -- [:requirements])
@@ -1414,6 +1463,8 @@ defmodule SymphonyElixir.Managed.Rules do
         |> maybe_put(:requirements_revision, requirement_revision)
         |> maybe_put(:escalation_reason, escalation_reason)
         |> maybe_put(:resources, normalized_resources)
+        |> maybe_put(:turn_limit, turn_limit)
+        |> maybe_put(:turn_limit_reason, turn_limit_reason)
 
       {:ok, sanitized}
     end
@@ -1459,6 +1510,43 @@ defmodule SymphonyElixir.Managed.Rules do
   defp optional_requirement_revision(nil), do: :ok
   defp optional_requirement_revision(value) when is_integer(value) and value >= 0, do: :ok
   defp optional_requirement_revision(_value), do: {:error, :invalid_argument, %{argument: :requirements_revision}}
+
+  defp optional_bounded_integer(nil, _key, _minimum, _maximum), do: :ok
+  defp optional_bounded_integer(value, key, minimum, maximum), do: bounded_integer(value, key, minimum, maximum)
+
+  defp turn_limit_reason_pair(changes, turn_limit, turn_limit_reason) do
+    reason_present? = Map.has_key?(changes, :turn_limit_reason)
+
+    cond do
+      not is_nil(turn_limit) and is_nil(turn_limit_reason) ->
+        {:error, :turn_limit_reason_required, %{}}
+
+      is_nil(turn_limit) and reason_present? ->
+        {:error, :turn_limit_required, %{}}
+
+      reason_present? ->
+        optional_text_value(Map.get(changes, :turn_limit_reason), :turn_limit_reason)
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_turn_limit_extension(assignment, changes) do
+    case Map.get(changes, :turn_limit) do
+      nil ->
+        :ok
+
+      requested when is_integer(requested) ->
+        existing = Map.get(assignment, :turn_limit, 20)
+
+        if is_integer(existing) and requested > existing do
+          :ok
+        else
+          {:error, :turn_limit_must_increase, %{existing: existing, requested: requested}}
+        end
+    end
+  end
 
   defp requirement_metadata(args) do
     body = Map.get(args, :requirements, Map.get(args, "requirements"))
@@ -1604,7 +1692,20 @@ defmodule SymphonyElixir.Managed.Rules do
       control_revision: control_revision
     }
 
-    event = Map.merge(event, Map.take(response, [:source_pm_id, :destination_pm_id, :assignment_ids, :reason, :handoff_id, :status]))
+    event =
+      Map.merge(
+        event,
+        Map.take(response, [
+          :source_pm_id,
+          :destination_pm_id,
+          :assignment_ids,
+          :reason,
+          :handoff_id,
+          :status,
+          :turn_limit,
+          :turn_limit_reason
+        ])
+      )
 
     next_state =
       next_state
@@ -1705,6 +1806,7 @@ defmodule SymphonyElixir.Managed.Rules do
   defp normalize_key("requirements_revision"), do: :requirements_revision
   defp normalize_key("escalation_reason"), do: :escalation_reason
   defp normalize_key("turn_limit"), do: :turn_limit
+  defp normalize_key("turn_limit_reason"), do: :turn_limit_reason
   defp normalize_key("issue_body"), do: :issue_body
   defp normalize_key("peer_report_refs"), do: :peer_report_refs
   defp normalize_key("source_assignment_id"), do: :source_assignment_id
@@ -1741,6 +1843,13 @@ defmodule SymphonyElixir.Managed.Rules do
   defp positive(value, _key) when is_integer(value) and value > 0, do: :ok
   defp positive(_value, key), do: {:error, :invalid_argument, %{argument: key}}
 
+  defp bounded_integer(value, _key, minimum, maximum)
+       when is_integer(value) and value >= minimum and value <= maximum,
+       do: :ok
+
+  defp bounded_integer(_value, key, minimum, maximum),
+    do: {:error, :invalid_argument, %{argument: key, minimum: minimum, maximum: maximum}}
+
   defp list_of_binaries(value, key) when is_list(value) do
     if Enum.all?(value, &is_binary/1), do: :ok, else: {:error, :invalid_argument, %{argument: key}}
   end
@@ -1765,7 +1874,7 @@ defmodule SymphonyElixir.Managed.Rules do
   defp transition_targets(:bound), do: [:ready, :cancelled]
   defp transition_targets(:ready), do: [:active, :cancelled, :waiting]
   defp transition_targets(:active), do: [:review, :waiting, :cancelled]
-  defp transition_targets(:waiting), do: [:ready, :active, :cancelled, :review]
+  defp transition_targets(:waiting), do: [:ready, :active, :cancelled, :review, :accepted]
   defp transition_targets(:review), do: [:accepted, :ready, :waiting, :cancelled]
   defp transition_targets(:accepted), do: []
   defp transition_targets(:cancelled), do: []

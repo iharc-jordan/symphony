@@ -28,6 +28,8 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
       cursor: 18,
       paused: false,
       disabled: false,
+      max_concurrent_agents: 3,
+      max_concurrent_agents_by_state: %{"ready" => 2},
       projects: %{},
       principals: %{
         "pm-one" => %{principal_id: "pm-one", display_name: "PM <One>", task_uuid: "task-pm-one"},
@@ -47,12 +49,24 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
           turn_effort: "xhigh",
           route: %{model: "gpt-5.6-terra", effort: "max"},
           started_at: terminal_projection_time,
-          usage: %{input_tokens: 901, output_tokens: 902, total_tokens: 1_803, seconds_running: 9_999},
+          usage: %{
+            input_tokens: 901,
+            output_tokens: 902,
+            total_tokens: 1_803,
+            seconds_running: 9_999,
+            accounting_status: :unavailable,
+            historical_raw_tokens: %{input_tokens: 4_001, output_tokens: 4_002, total_tokens: 8_003}
+          },
           last_report: %{
             kind: "checkpoint",
             summary: "<safe summary>",
             evidence: ["check passed", %{private: "must not be exposed"}]
           },
+          reports: %{
+            {"attempt-1", "report-1"} => %{attempt_id: "attempt-1", report_id: "report-1", kind: "checkpoint", summary: "first"},
+            {"attempt-2", "report-2"} => %{attempt_id: "attempt-2", report_id: "report-2", kind: "result", summary: "second"}
+          },
+          review_feedback: %{peer_report_refs: [%{source_assignment_id: "peer", source_attempt_id: "peer-attempt", report_id: "peer-report"}]},
           pending_effect: %{kind: :provider_transition, status: :reconciled, at: now}
         },
         "queued" => %{
@@ -61,7 +75,14 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
           title: "Queued task",
           ownership: %{pm_id: "pm-two", status: :owned},
           worker_active: false,
-          usage: %{input_tokens: 21, output_tokens: 34, total_tokens: 55, seconds_running: 123},
+          usage: %{
+            input_tokens: 21,
+            output_tokens: 34,
+            total_tokens: 55,
+            seconds_running: 123,
+            accounting_status: :unreliable,
+            historical_raw_tokens: %{input_tokens: 5_001, output_tokens: 5_002, total_tokens: 10_003}
+          },
           turn_model: "gpt-5.6-luna",
           turn_effort: "xhigh",
           route: %{model: "gpt-5.6-terra", effort: "max"},
@@ -80,6 +101,13 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
           assignment_id: "review",
           phase: :review,
           title: "Review task",
+          ownership: %{pm_id: "pm-one", status: :owned},
+          worker_active: false
+        },
+        "review-pending" => %{
+          assignment_id: "review-pending",
+          phase: :review_pending,
+          title: "Pending review task",
           ownership: %{pm_id: "pm-one", status: :owned},
           worker_active: false
         },
@@ -142,14 +170,26 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
              input_tokens: 901,
              output_tokens: 902,
              total_tokens: 1_803,
-             seconds_running: 9_999
+             seconds_running: 9_999,
+             accounting_status: "unavailable",
+             historical_raw_tokens: %{
+               diagnostic: "unavailable",
+               valid_spend: false,
+               values: %{input_tokens: 4_001, output_tokens: 4_002, total_tokens: 8_003}
+             }
            }
 
     assert assignments["queued"].usage == %{
              input_tokens: 21,
              output_tokens: 34,
              total_tokens: 55,
-             seconds_running: 123
+             seconds_running: 123,
+             accounting_status: "unreliable",
+             historical_raw_tokens: %{
+               diagnostic: "unreliable",
+               valid_spend: false,
+               values: %{input_tokens: 5_001, output_tokens: 5_002, total_tokens: 10_003}
+             }
            }
 
     assert assignments["accepted-history"].usage == %{
@@ -172,6 +212,9 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
              evidence: ["check passed"]
            }
 
+    assert Enum.map(assignments["active"].reports, & &1.report_id) |> Enum.sort() == ["report-1", "report-2"]
+    assert assignments["active"].peer_report_refs == [%{source_assignment_id: "peer", source_attempt_id: "peer-attempt", report_id: "peer-report"}]
+
     assert assignments["waiting"].blocked_reason == "<waiting for dependency>"
     refute assignments["waiting"].worker.active
     refute assignments["review"].worker.active
@@ -181,7 +224,8 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
     assert assignments["queued"].projection.status == "unknown"
     refute assignments["queued"].projection.stale
 
-    assert payload.managed.counts == %{running: 1, queued: 1, review: 1, waiting: 1, blocked: 1}
+    assert payload.managed.counts == %{running: 1, queued: 1, review: 2, waiting: 1, blocked: 1}
+    assert payload.managed.diagnostics.concurrency == %{global: 3, by_state: %{"ready" => 2}, fallback: 3}
     assert payload.managed.projection.errors == []
     refute payload.managed.projection.stale
   end

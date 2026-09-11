@@ -22,7 +22,9 @@ defmodule SymphonyElixir.ManagedOrchestratorTestControl do
 end
 
 defmodule SymphonyElixir.ManagedReviewEffectsStub do
-  def review(_assignment, _args, _context) do
+  def review(assignment, _args, _context) do
+    if is_pid(assignment[:review_observer]), do: send(assignment.review_observer, :managed_review_effect_called)
+
     {:ok,
      %{
        provider_state: :review,
@@ -356,6 +358,116 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     assert :reconcile in operations
     assert :review in operations
     assert :review_committed in operations
+  end
+
+  test "context-needed WAITING acceptance requires current fences and a reconciled inactive process" do
+    {pid, _path} = managed_server()
+    review_observer = self()
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind-waiting-review", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll-waiting-review", operation: :enroll, args: enrollment_args()})
+
+    :sys.replace_state(pid, fn state ->
+      assignment =
+        Map.merge(state.managed.data.assignments["item-1"], %{
+          phase: :waiting,
+          board_state: :waiting,
+          revision: 2,
+          generation: 1,
+          attempt_id: "attempt-context",
+          worker_active: false,
+          stop_pending: true,
+          review_observer: review_observer,
+          pending_effect: %{kind: :provider_transition, target: :waiting, status: :reconciled},
+          last_report: %{
+            kind: "context_needed",
+            attempt_id: "attempt-context",
+            report_id: "context-1",
+            summary: "Need PM evidence",
+            evidence: []
+          }
+        })
+
+      data = put_in(state.managed.data, [:assignments, "item-1"], assignment)
+      %{state | managed: %{state.managed | data: data}}
+    end)
+
+    args = %{
+      assignment_id: "item-1",
+      expected_revision: 2,
+      disposition: "accepted",
+      evidence: ["PM verified the requested context"]
+    }
+
+    assert {:error, :managed_process_not_inactive_reconciled, %{process_state: :unknown}} =
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{
+               request_id: "review-stop-unknown",
+               operation: :review,
+               args: args
+             })
+
+    refute_receive :managed_review_effect_called
+
+    :sys.replace_state(pid, fn state ->
+      data = put_in(state.managed.data, [:assignments, "item-1", :stop_pending], false)
+      %{state | managed: %{state.managed | data: data}}
+    end)
+
+    active_pid = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(active_pid), do: Process.exit(active_pid, :kill) end)
+
+    :sys.replace_state(pid, fn state ->
+      %{state | running: Map.put(state.running, "item-1", %{pid: active_pid})}
+    end)
+
+    assert {:error, :managed_process_not_inactive_reconciled, %{process_state: :active}} =
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{
+               request_id: "review-active-process",
+               operation: :review,
+               args: args
+             })
+
+    refute_receive :managed_review_effect_called
+    :sys.replace_state(pid, fn state -> %{state | running: Map.delete(state.running, "item-1")} end)
+    Process.exit(active_pid, :kill)
+
+    assert {:error, :evidence_required, %{}} =
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{
+               request_id: "review-missing-evidence",
+               operation: :review,
+               args: %{args | evidence: []}
+             })
+
+    assert {:error, :stale_revision, %{expected: 1, actual: 2}} =
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{
+               request_id: "review-stale-revision",
+               operation: :review,
+               args: %{args | expected_revision: 1}
+             })
+
+    wrong_owner = %{principal_id: "00000000-0000-4000-8000-000000000099", role: :pm, project_scope: :all}
+
+    wrong_owner_request =
+      SymphonyElixir.ManagedOrchestratorTestControl.envelope(%{
+        request_id: "review-wrong-owner",
+        operation: :review,
+        args: args
+      })
+
+    assert {:error, :ownership_conflict, _details} =
+             Control.submit_authorized(pid, wrong_owner_request, wrong_owner)
+
+    refute_receive :managed_review_effect_called
+
+    assert {:ok, %{phase: :accepted, issue_close: :ok}} =
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{
+               request_id: "review-context-accepted",
+               operation: :review,
+               args: args
+             })
+
+    assert_receive :managed_review_effect_called
+    assert {:ok, snapshot} = Control.state(pid)
+    assert snapshot.assignments["item-1"].phase == :accepted
   end
 
   test "managed callbacks fence stale attempts, reserve turns, and retain review reports" do
@@ -704,6 +816,7 @@ defmodule SymphonyElixir.ManagedOrchestratorDeferredReportTest do
     assert {:ok, final_snapshot} = Control.state(pid)
     assert final_snapshot.assignments["item-1"].phase == :waiting
     assert final_snapshot.assignments["item-1"].pending_effect.status == :reconciled
+    assert final_snapshot.assignments["item-1"].stop_pending == false
 
     state = :sys.get_state(pid)
     assert state.managed.data.effect_intents |> Map.values() |> Enum.any?(&(&1.status == :effect_reconciled))
@@ -1612,6 +1725,38 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
 
     assert Enum.map(dispatch_failures, & &1.retry_count) == [1, 2, 3]
     assert Enum.map(dispatch_failures, & &1.phase) == [:ready, :ready, :waiting]
+  end
+
+  test "managed retry eligibility uses the revised absolute lifetime turn limit above twenty" do
+    {pid, _path} = managed_server()
+
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind-extended-retry", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll-extended-retry", operation: :enroll, args: enrollment_args()})
+
+    state = :sys.get_state(pid)
+
+    assignment =
+      Map.merge(state.managed.data.assignments["item-1"], %{
+        turn_limit: 30,
+        turn_limit_reason: "Complete recovery after the initial lifetime allocation",
+        turns_reserved: 20,
+        retry_count: 0
+      })
+
+    state = put_in(state.managed.data.assignments["item-1"], assignment)
+
+    failed =
+      Orchestrator.mark_managed_dispatch_failed_for_test(
+        state,
+        "item-1",
+        %{assignment_id: "item-1", revision: 1, generation: 1, attempt_id: "attempt-extended"},
+        :spawn_failed
+      )
+
+    assignment = failed.managed.data.assignments["item-1"]
+    assert assignment.phase == :ready
+    assert assignment.retry_count == 1
+    assert assignment.pending_effect.status == :retry_pending
   end
 
   test "dispatch failure preserves an uncertain provider transition" do

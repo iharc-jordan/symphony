@@ -402,6 +402,14 @@ defmodule SymphonyElixir.ManagedRulesTest do
     assert {:error, :route_escalation_reason_required, %{}} =
              Rules.validate_route(%{model: "gpt-5.6-terra", effort: "max"})
 
+    for effort <- ["xhigh", "max"] do
+      route = %{model: "gpt-5.6-sol", effort: effort}
+      assert :ok = Rules.validate_route(route, "Connected runtime fencing requires Sol")
+
+      assert {:error, :route_escalation_reason_required, %{model: "gpt-5.6-sol", effort: ^effort}} =
+               Rules.validate_route(route)
+    end
+
     assert {:error, :invalid_phase_transition, %{from: :ready, to: :review}} =
              Rules.validate_transition(:ready, :review)
 
@@ -645,11 +653,16 @@ defmodule SymphonyElixir.ManagedRulesTest do
 
     native_args =
       enrollment_args("native-issue", 1)
-      |> Map.merge(%{native_issue_id: "node-issue", native_repository_id: "node-repo", turn_limit: 99})
+      |> Map.merge(%{native_issue_id: "node-issue", native_repository_id: "node-repo", turn_limit: 20})
 
     assert {:ok, native_state, _} = apply_request(list_bound, envelope("enroll-native", :enroll, native_args))
     assert native_state.assignments["native-issue"].underlying_issue_id == "node-issue"
     assert native_state.assignments["native-issue"].turn_limit == 20
+
+    oversized = enrollment_args("oversized-limit", 2, issue_number: 13) |> Map.put(:turn_limit, 21)
+
+    assert {:error, :invalid_argument, %{argument: :turn_limit, minimum: 1, maximum: 20}} =
+             apply_request(native_state, envelope("enroll-oversized-limit", :enroll, oversized))
 
     duplicate_native =
       enrollment_args("native-issue-2", 2)
@@ -731,6 +744,170 @@ defmodule SymphonyElixir.ManagedRulesTest do
     assert same.assignments["issue-1"].thread_id == "old-thread"
     assert same.assignments["issue-1"].resume_ready
     refute Map.has_key?(same.assignments["issue-1"], :review_feedback)
+  end
+
+  test "revision extends the absolute lifetime turn limit only with a non-empty reason" do
+    state =
+      enrolled_state("issue-1")
+      |> put_in([:assignments, "issue-1", :turns_reserved], 17)
+
+    base = %{assignment_id: "issue-1", expected_revision: 1}
+
+    assert {:error, :turn_limit_reason_required, %{}} =
+             apply_request(
+               state,
+               envelope("limit-no-reason", :revise, Map.put(base, :changes, %{turn_limit: 30}))
+             )
+
+    assert {:error, :turn_limit_required, %{}} =
+             apply_request(
+               state,
+               envelope(
+                 "limit-reason-only",
+                 :revise,
+                 Map.put(base, :changes, %{turn_limit_reason: "More investigation"})
+               )
+             )
+
+    assert {:error, :turn_limit_must_increase, %{existing: 20, requested: 20}} =
+             apply_request(
+               state,
+               envelope(
+                 "limit-not-increased",
+                 :revise,
+                 Map.put(base, :changes, %{turn_limit: 20, turn_limit_reason: "More investigation"})
+               )
+             )
+
+    assert {:error, :invalid_argument, %{argument: :turn_limit, minimum: 1, maximum: 100}} =
+             apply_request(
+               state,
+               envelope(
+                 "limit-too-large",
+                 :revise,
+                 Map.put(base, :changes, %{turn_limit: 101, turn_limit_reason: "More investigation"})
+               )
+             )
+
+    changes = %{turn_limit: 30, turn_limit_reason: "Complete the connected recovery checks"}
+
+    assert {:ok, revised, response} =
+             apply_request(
+               state,
+               envelope("limit-extended", :revise, Map.put(base, :changes, changes))
+             )
+
+    assignment = revised.assignments["issue-1"]
+    assert assignment.turn_limit == 30
+    assert assignment.turn_limit_reason == changes.turn_limit_reason
+    assert assignment.turns_reserved == 17
+    assert response.turn_limit == 30
+    assert response.turn_limit_reason == changes.turn_limit_reason
+    assert hd(revised.events).turn_limit == 30
+    assert hd(revised.events).turn_limit_reason == changes.turn_limit_reason
+  end
+
+  test "accepted review may use only the current fenced context-needed WAITING report" do
+    assignment =
+      enrolled_state("issue-1").assignments["issue-1"]
+      |> Map.merge(%{
+        phase: :waiting,
+        board_state: :waiting,
+        revision: 2,
+        generation: 1,
+        attempt_id: "attempt-1",
+        worker_active: false,
+        last_report: %{
+          kind: "context_needed",
+          attempt_id: "attempt-1",
+          report_id: "context-1",
+          summary: "Need PM evidence",
+          evidence: []
+        }
+      })
+
+    state = put_in(enrolled_state("issue-1"), [:assignments, "issue-1"], assignment)
+    args = %{assignment_id: "issue-1", expected_revision: 2, disposition: "accepted", evidence: ["PM verified the requested context"]}
+
+    proof = %{
+      managed_process_state: :inactive_reconciled,
+      provider_state: :review,
+      reconciled: true,
+      external_effects: %{status: :ok, issue_close: :ok}
+    }
+
+    assert {:ok, accepted, response} =
+             apply_request(state, envelope("accept-context-needed", :review, args), proof)
+
+    assert accepted.assignments["issue-1"].phase == :accepted
+    assert response.issue_close == :ok
+
+    assert {:ok, _intent} =
+             prepare_request(
+               state,
+               envelope("accept-string-process-state", :review, args),
+               %{"managed_process_state" => "inactive_reconciled"}
+             )
+
+    assert {:error, :managed_process_not_inactive_reconciled, %{process_state: :active}} =
+             prepare_request(
+               state,
+               envelope("accept-active", :review, args),
+               %{managed_process_state: :active}
+             )
+
+    assert {:error, :evidence_required, %{}} =
+             prepare_request(
+               state,
+               envelope("accept-missing-evidence", :review, %{args | evidence: []}),
+               %{managed_process_state: :inactive_reconciled}
+             )
+
+    wrong_report = put_in(state, [:assignments, "issue-1", :last_report, :kind], "result")
+
+    assert {:error, :context_needed_report_required, %{}} =
+             prepare_request(
+               wrong_report,
+               envelope("accept-wrong-report-kind", :review, args),
+               %{managed_process_state: :inactive_reconciled}
+             )
+
+    ready_state =
+      state
+      |> put_in([:assignments, "issue-1", :phase], :ready)
+      |> put_in([:assignments, "issue-1", :board_state], :ready)
+
+    assert {:error, :invalid_phase, %{expected: :review, actual: :ready}} =
+             prepare_request(
+               ready_state,
+               envelope("accept-ready-assignment", :review, args),
+               %{managed_process_state: :inactive_reconciled}
+             )
+
+    stale_report = put_in(state, [:assignments, "issue-1", :last_report, :attempt_id], "attempt-0")
+
+    assert {:error, :stale_context_needed_report, %{}} =
+             prepare_request(
+               stale_report,
+               envelope("accept-stale-report", :review, args),
+               %{managed_process_state: :inactive_reconciled}
+             )
+
+    assert {:error, :stale_revision, %{expected: 1, actual: 2}} =
+             prepare_request(
+               state,
+               envelope("accept-stale-revision", :review, %{args | expected_revision: 1}),
+               %{managed_process_state: :inactive_reconciled}
+             )
+
+    wrong_owner = %{principal_id: "different-pm", role: :pm, project_scope: :all}
+
+    assert {:error, :ownership_conflict, _details} =
+             prepare_request(
+               state,
+               envelope("accept-wrong-owner", :review, args),
+               %{principal: wrong_owner, managed_process_state: :inactive_reconciled}
+             )
   end
 
   test "strict authorization and defensive lifecycle branches are explicit" do

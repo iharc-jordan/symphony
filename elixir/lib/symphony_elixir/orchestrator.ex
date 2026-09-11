@@ -357,7 +357,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp prepare_managed_review(state, envelope, context \\ %{}) do
-    principal_context = Map.merge(managed_principal_context(state), context)
+    principal_context =
+      managed_principal_context(state)
+      |> Map.merge(context)
+      |> Map.merge(managed_review_process_context(state, envelope))
 
     case Rules.prepare_review(state.managed.data, envelope, principal_context) do
       {:ok, intent} ->
@@ -2549,9 +2552,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp execute_managed_review(%State{} = state, intent) do
+    principal_context =
+      (intent[:principal_context] || %{})
+      |> Map.merge(managed_review_process_context(state, intent.request))
+
     result =
       with :ok <- managed_binding_unchanged(state, intent.assignment, intent[:binding]),
-           :ok <- Rules.authorize(state.managed.data, intent.request, intent[:principal_context] || %{}) do
+           :ok <- Rules.authorize(state.managed.data, intent.request, principal_context),
+           {:ok, _current_intent} <- Rules.prepare_review(state.managed.data, intent.request, principal_context) do
         managed_review_effects(state, intent)
       end
 
@@ -2565,6 +2573,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp commit_managed_review(state, intent, facts) do
+    principal_context =
+      (intent[:principal_context] || %{})
+      |> Map.merge(managed_review_process_context(state, intent.request))
+
     facts =
       facts
       |> Map.put(:revision, intent.assignment.revision)
@@ -2574,7 +2586,7 @@ defmodule SymphonyElixir.Orchestrator do
            record_managed_reconciliation(state.managed.data, intent.assignment.assignment_id, facts),
          {:ok, reconciled_state} <- persist_managed_data(state, reconciled_data),
          {:ok, next_data, response} <-
-           apply_managed_rules(reconciled_state, intent.request, Map.merge(intent[:principal_context] || %{}, facts)) do
+           apply_managed_rules(reconciled_state, intent.request, Map.merge(principal_context, facts)) do
       complete_and_persist_managed_review(reconciled_state, next_data, intent, response)
     else
       {:duplicate, response} -> {:reply, {:ok, Map.put(response, :duplicate, true)}, state}
@@ -2607,6 +2619,32 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp managed_review_effects(_state, _intent), do: {:error, :managed_review_effects_unavailable, %{}}
+
+  defp managed_review_process_context(state, envelope) do
+    args = map_value(envelope, :args) || %{}
+    assignment_id = map_value(args, :assignment_id)
+    assignment = get_in(state.managed.data, [:assignments, assignment_id])
+
+    process_state =
+      cond do
+        Map.has_key?(state.running, assignment_id) -> :active
+        reconciled_inactive_waiting?(assignment) -> :inactive_reconciled
+        true -> :unknown
+      end
+
+    %{managed_process_state: process_state}
+  end
+
+  defp reconciled_inactive_waiting?(assignment) when is_map(assignment) do
+    effect = Map.get(assignment, :pending_effect, %{})
+
+    assignment[:phase] == :waiting and assignment[:worker_active] == false and
+      assignment[:stop_pending] != true and
+      map_value(effect, :kind) == :provider_transition and
+      map_value(effect, :target) == :waiting and map_value(effect, :status) == :reconciled
+  end
+
+  defp reconciled_inactive_waiting?(_assignment), do: false
 
   defp managed_review_available?(module) do
     Code.ensure_loaded?(module) and
@@ -2880,7 +2918,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp managed_terminal_result({:managed_agent_terminal, _report}, phase, true, assignment, attempt)
        when phase in [:waiting, :cancelled] do
     pending_effect = %{kind: :run, status: :report_deferred, attempt_id: attempt.attempt_id}
-    {phase, phase, pending_effect, true, assignment[:blocked_reason]}
+    {phase, phase, pending_effect, false, assignment[:blocked_reason]}
   end
 
   defp managed_terminal_result(_reason, _phase, _stop_pending, _assignment, _attempt), do: nil
@@ -2981,7 +3019,7 @@ defmodule SymphonyElixir.Orchestrator do
     limit = assignment[:turn_limit] || 20
 
     is_integer(retry_count) and retry_count < 2 and is_integer(reserved) and
-      is_integer(limit) and reserved < min(limit, 20)
+      is_integer(limit) and reserved < limit
   end
 
   defp managed_retry_allowed?(_assignment), do: false

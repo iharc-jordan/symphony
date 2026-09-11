@@ -67,12 +67,12 @@ defmodule SymphonyElixirWeb.ManagedStateView do
     {:ok, detail_payload(state, principal, assignment, options, runtime_facts)}
   end
 
-  defp render_view(state, principal, assignments, %{view: :full} = options, _runtime_facts) do
-    {:ok, full_payload(state, principal, assignments, options)}
+  defp render_view(state, principal, assignments, %{view: :full} = options, runtime_facts) do
+    {:ok, full_payload(state, principal, assignments, options, runtime_facts)}
   end
 
   defp summary_payload(state, principal, assignments, options, runtime_facts) do
-    metadata(state, principal)
+    metadata(state, principal, runtime_facts)
     |> Map.merge(%{
       view: "summary",
       projects: summary_projects(state, assignments, options),
@@ -83,7 +83,7 @@ defmodule SymphonyElixirWeb.ManagedStateView do
   end
 
   defp detail_payload(state, principal, assignment, options, runtime_facts) do
-    metadata(state, principal)
+    metadata(state, principal, runtime_facts)
     |> Map.merge(%{
       view: "detail",
       project: detail_project(state, assignment),
@@ -92,12 +92,24 @@ defmodule SymphonyElixirWeb.ManagedStateView do
     })
   end
 
-  defp full_payload(state, principal, assignments, options) do
+  defp full_payload(state, principal, assignments, options, runtime_facts) do
     state
     |> Map.put(:principal, principal_payload(principal))
     |> Map.put(:view, "full")
-    |> Map.put(:assignments, assignments)
+    |> Map.put(:usage, usage_payload(Map.get(state, :usage)))
+    |> Map.put(:diagnostics, diagnostics_payload(state, runtime_facts))
+    |> Map.put(:assignments, full_assignments(assignments))
     |> maybe_filter_projects(options.project_id, state)
+  end
+
+  defp full_assignments(assignments) when is_map(assignments) do
+    Map.new(assignments, fn {id, assignment} ->
+      if is_map(assignment) and Map.has_key?(assignment, :usage) do
+        {id, Map.put(assignment, :usage, usage_payload(Map.get(assignment, :usage)))}
+      else
+        {id, assignment}
+      end
+    end)
   end
 
   defp maybe_filter_projects(state, nil, _original), do: state
@@ -115,7 +127,7 @@ defmodule SymphonyElixirWeb.ManagedStateView do
     )
   end
 
-  defp metadata(state, principal) do
+  defp metadata(state, principal, runtime_facts) do
     usage = usage_payload(Map.get(state, :usage))
 
     %{
@@ -129,9 +141,48 @@ defmodule SymphonyElixirWeb.ManagedStateView do
       disabled: Map.get(state, :disabled, false) == true,
       paused: Map.get(state, :paused, false) == true,
       usage_limit_tokens: integer_or_nil(Map.get(state, :usage_limit_tokens)),
-      usage: usage
+      usage: usage,
+      diagnostics: diagnostics_payload(state, runtime_facts)
     }
   end
+
+  defp diagnostics_payload(state, runtime_facts) do
+    limits = concurrency_limits(state, runtime_facts)
+    %{concurrency: limits}
+  end
+
+  defp concurrency_limits(state, runtime_facts) do
+    runtime = Map.get(state, :runtime, %{})
+
+    limits = %{
+      global:
+        positive_integer(Map.get(runtime_facts, :max_concurrent_agents)) ||
+          positive_integer(Map.get(state, :max_concurrent_agents)) ||
+          positive_integer(field(runtime, :max_concurrent_agents)),
+      by_state:
+        safe_limits(
+          Map.get(runtime_facts, :max_concurrent_agents_by_state) ||
+            Map.get(state, :max_concurrent_agents_by_state) ||
+            field(runtime, :max_concurrent_agents_by_state)
+        )
+    }
+
+    Map.put(limits, :fallback, limits.global)
+  end
+
+  defp safe_limits(limits) when is_map(limits) do
+    Enum.reduce(limits, %{}, fn {key, value}, acc ->
+      case {text_value(key), positive_integer(value)} do
+        {state, limit} when is_binary(state) and is_integer(limit) -> Map.put(acc, state, limit)
+        _ -> acc
+      end
+    end)
+  end
+
+  defp safe_limits(_limits), do: %{}
+
+  defp positive_integer(value) when is_integer(value) and value > 0, do: value
+  defp positive_integer(_value), do: nil
 
   defp scoped_assignments(state, principal, options) do
     all = state |> Map.get(:assignments, %{}) |> assignment_entries()
@@ -246,6 +297,7 @@ defmodule SymphonyElixirWeb.ManagedStateView do
       worker: worker_payload(assignment),
       route: route_payload(assignment),
       last_report: report_summary(field(assignment, :last_report)),
+      peer_report_refs: peer_report_refs(assignment),
       report_id: report_id(assignment),
       report_source: report_source(assignment),
       attempt: attempt_summary(assignment),
@@ -262,7 +314,7 @@ defmodule SymphonyElixirWeb.ManagedStateView do
       total: length(values),
       running: Enum.count(values, &worker_active?/1),
       queued: Enum.count(values, &(phase_name(field(&1, :phase)) in ["bound", "ready"])),
-      review: Enum.count(values, &(phase_name(field(&1, :phase)) == "review")),
+      review: Enum.count(values, &(phase_name(field(&1, :phase)) in ["review", "review_pending"])),
       waiting: Enum.count(values, &(phase_name(field(&1, :phase)) == "waiting")),
       terminal: Enum.count(values, &terminal_assignment?/1)
     }
@@ -273,6 +325,7 @@ defmodule SymphonyElixirWeb.ManagedStateView do
     |> Map.put(:assignment_id, field(assignment, :assignment_id) || key_for_assignment(assignment))
     |> Map.put(:project_id, project_id_of(assignment, nil))
     |> Map.put(:wait_reason, wait_reason(assignment, state, runtime_facts))
+    |> Map.put(:peer_report_refs, peer_report_refs(assignment))
     |> Map.put(:reports, field(assignment, :reports) || %{})
     |> Map.put(:last_report, field(assignment, :last_report))
     |> Map.put(:attempt, field(assignment, :attempt))
@@ -384,6 +437,32 @@ defmodule SymphonyElixirWeb.ManagedStateView do
 
   defp report_id_from(report) when is_map(report), do: text_value(field(report, :report_id) || field(report, :id))
   defp report_id_from(_report), do: nil
+
+  defp peer_report_refs(assignment) do
+    assignment
+    |> field(:review_feedback)
+    |> field(:peer_report_refs)
+    |> case do
+      nil -> field(assignment, :peer_report_refs)
+      refs -> refs
+    end
+    |> peer_report_refs_payload()
+  end
+
+  defp peer_report_refs_payload(refs) when is_list(refs) do
+    refs
+    |> Enum.filter(&is_map/1)
+    |> Enum.map(fn ref ->
+      compact(%{
+        source_assignment_id: text_value(field(ref, :source_assignment_id)),
+        source_attempt_id: text_value(field(ref, :source_attempt_id)),
+        report_id: text_value(field(ref, :report_id))
+      })
+    end)
+    |> Enum.reject(&(map_size(&1) == 0))
+  end
+
+  defp peer_report_refs_payload(_refs), do: []
 
   @spec wait_reason(map(), map(), map()) :: String.t() | nil
   def wait_reason(assignment, state, runtime_facts)
@@ -534,21 +613,34 @@ defmodule SymphonyElixirWeb.ManagedStateView do
   defp usage_payload(nil), do: %{}
 
   defp usage_payload(usage) when is_map(usage) do
-    usage
-    |> Enum.reduce(%{}, fn {key, value}, acc ->
-      key = text_value(key)
+    status = usage_accounting_status(usage)
 
-      cond do
-        is_nil(key) ->
-          acc
+    projected =
+      usage
+      |> Enum.reduce(%{}, fn {key, value}, acc ->
+        key = text_value(key)
 
-        key == "historical_raw_tokens" ->
-          Map.put(acc, key, historical_tokens_payload(value))
+        cond do
+          is_nil(key) or key == "historical_raw_tokens" ->
+            acc
 
-        true ->
-          put_usage_value(acc, key, value)
-      end
-    end)
+          key == "accounting_status" ->
+            Map.put(acc, key, status)
+
+          true ->
+            put_usage_value(acc, key, value)
+        end
+      end)
+
+    raw_history = Map.get(usage, :historical_raw_tokens, Map.get(usage, "historical_raw_tokens"))
+
+    case historical_tokens_payload(raw_history) do
+      values when is_map(values) and map_size(values) > 0 and status in ["unavailable", "unreliable"] ->
+        Map.put(projected, "historical_raw_tokens", %{diagnostic: status, valid_spend: false, values: values})
+
+      _ ->
+        projected
+    end
   end
 
   defp usage_payload(_usage), do: %{}
@@ -557,6 +649,17 @@ defmodule SymphonyElixirWeb.ManagedStateView do
     case safe_usage_value(value) do
       {:ok, safe} -> Map.put(acc, key, safe)
       :error -> acc
+    end
+  end
+
+  defp usage_accounting_status(usage) do
+    case text_value(Map.get(usage, :accounting_status)) do
+      status when status in ["known", "unavailable", "unreliable"] ->
+        status
+
+      _ ->
+        raw = Map.get(usage, :historical_raw_tokens, Map.get(usage, "historical_raw_tokens"))
+        if(is_map(raw), do: "unavailable", else: "known")
     end
   end
 
