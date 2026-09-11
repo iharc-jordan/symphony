@@ -581,6 +581,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       cursor: 12,
       paused: false,
       disabled: false,
+      usage: %{cumulative_tokens: 0, inflight_tokens: 0, accounting_status: :unavailable},
       projects: %{
         "project-alpha" => %{project_id: "project-alpha", project_number: 4, repositories: ["org/repo-alpha"], revision: 2},
         "project-beta" => %{project_id: "project-beta", project_number: 8, repositories: ["org/repo-beta"], revision: 3}
@@ -641,6 +642,12 @@ defmodule SymphonyElixir.ExtensionsTest do
           phase: :review,
           status: "review",
           ownership: %{pm_id: "pm-one", status: :owned},
+          usage: %{
+            total_tokens: 120_000_000,
+            seconds_running: 556,
+            accounting_status: :unavailable,
+            runtime_complete: false
+          },
           projection: %{status: :failed, revision: 5, updated_at: now, error: "provider projection failed"}
         },
         "assign-accepted" => %{
@@ -727,9 +734,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Needs a project manager"
     assert html =~ ~s(data-metric="runtime")
     assert html =~ ~s(data-metric="tokens")
-    assert html =~ ~s(data-metric="tokens">Tokens <strong>12</strong>)
+    assert html =~ ~s(data-metric="tokens">Tokens <strong>1,803</strong>)
     assert html =~ ~s(data-metric="tokens">Tokens <strong>55</strong>)
-    assert html =~ "Not recorded"
+    assert html =~ "Unavailable"
     refute html =~ "Finished history"
     refute html =~ "Cancelled history"
     refute html =~ "History PM"
@@ -739,6 +746,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert has_element?(view, ~s([data-assignment-id="assign-active"].worker-running))
     refute has_element?(view, ~s([data-assignment-id="assign-active-idle"].worker-running))
     assert html =~ "PM identity shows ownership, not whether its Codex task is currently running."
+    assert html =~ "Parent delivery is unverified. Counts describe assignment states."
 
     view
     |> element("button.manager-option", "Needs a project manager")
@@ -746,6 +754,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     html = render(view)
     assert html =~ "Stale owner task"
+    assert html =~ "Not recorded"
     refute html =~ "PM Two"
 
     view
@@ -774,11 +783,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     html = render(view)
     assert html =~ "Assignment details"
     assert html =~ "Build alpha"
-    assert html =~ ~r|<dt>Runtime</dt><dd>1m [0-9]+s</dd>|
-    assert html =~ ~s(<dt>Total tokens</dt><dd>12</dd>)
-    assert html =~ ~s(<dt>Input tokens</dt><dd>4</dd>)
-    assert html =~ ~s(<dt>Output tokens</dt><dd>8</dd>)
-    refute html =~ "<dd>1,803</dd>"
+    assert html =~ ~r|<dt>Runtime</dt><dd>2h 47m [0-9]+s</dd>|
+    assert html =~ ~r|<dt>Current run</dt><dd>1m [0-9]+s</dd>|
+    assert html =~ ~s(<dt>Total tokens</dt><dd>1,803</dd>)
+    assert html =~ ~s(<dt>Input tokens</dt><dd>901</dd>)
+    assert html =~ ~s(<dt>Output tokens</dt><dd>902</dd>)
+    refute html =~ "<dt>Total tokens</dt><dd>12</dd>"
     assert html =~ ~s(href="https://github.com/org/repo-alpha/issues/11")
     assert html =~ ~s(target="_blank")
     refute html =~ "javascript:"
@@ -790,8 +800,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert has_element?(view, ~s(button[data-assignment-id="assign-review"][aria-pressed]))
 
     html = render(view)
-    assert html =~ ~s(<dt>Runtime</dt><dd>Not recorded</dd>)
-    assert html =~ ~s(<dt>Total tokens</dt><dd>Not recorded</dd>)
+    assert html =~ "<dt>Runtime</dt><dd>9m 16s (partial history)</dd>"
+    assert html =~ ~s(<dt>Total tokens</dt><dd>Unavailable</dd>)
+    refute html =~ "120,000,000"
 
     view
     |> element(~s(button[data-assignment-id="assign-active-idle"]))
@@ -841,9 +852,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     html = render(view)
-    assert html =~ "Complete"
-    assert html =~ "2 open · 1 complete"
-    assert has_element?(view, ".task-node-activity", "Completed and retained in this PM's work")
+    assert html =~ "Accepted"
+    assert html =~ "2 open · 1 accepted"
+    assert has_element?(view, ".task-node-activity", "Accepted and retained in this PM's work")
     assert html =~ ~s(Live work<span>3</span>)
     refute has_element?(view, ~s([data-assignment-id="assign-active"].worker-running))
     refute html =~ "connection-running"
@@ -892,6 +903,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     html = render(view)
     assert html =~ "Runtime details"
+    assert html =~ ~s(<dt>Managed tokens</dt><dd>Unavailable</dd>)
     assert html =~ "Projects and repositories"
     assert html =~ "Project 4"
     assert html =~ "org/repo-alpha"
@@ -929,12 +941,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     StatusDashboard.notify_update()
-    assert_eventually(fn -> render(view) =~ "0 open · 3 complete" end)
+    assert_eventually(fn -> render(view) =~ "0 open · 3 accepted" end)
     assert has_element?(view, ~s([data-assignment-id="assign-active"].task-accepted))
     refute has_element?(view, ".worker-running")
 
     {:ok, reloaded_view, reloaded_html} = live(build_conn(), "/?pm=pm-one")
-    assert reloaded_html =~ "0 open · 3 complete"
+    assert reloaded_html =~ "0 open · 3 accepted"
     assert has_element?(reloaded_view, ~s([data-assignment-id="assign-active"].task-accepted))
 
     {:ok, history_view, history_html} = live(build_conn(), "/?pm=pm-one&view=history")
@@ -944,7 +956,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert has_element?(history_view, "#history-list")
 
     history_view |> element(~s(button[phx-value-view="live"])) |> render_click()
-    assert render(history_view) =~ "0 open · 3 complete"
+    assert render(history_view) =~ "0 open · 3 accepted"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do

@@ -17,6 +17,10 @@ handoffs transfer that responsibility while preserving a healthy worker. The ope
 remains authoritative for ownership, and optional Project card summaries expose that state to users.
 See [managed controls](elixir/README.md#managed-control-plane).
 
+PMs can select existing reports as scoped findings for a worker's next turn. Compact reads and
+the ownership dashboard keep that review focused, while corrected usage and runtime retain
+their source and history limits. Accepted assignments remain distinct from parent delivery.
+
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 

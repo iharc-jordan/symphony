@@ -6,9 +6,9 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   use Phoenix.Controller, formats: [:json]
 
   alias Plug.Conn
-  alias SymphonyElixir.Config
+  alias SymphonyElixir.{Config, Orchestrator}
   alias SymphonyElixir.Managed.{Control, Principal}
-  alias SymphonyElixirWeb.{Endpoint, Presenter}
+  alias SymphonyElixirWeb.{Endpoint, ManagedStateView, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
@@ -40,15 +40,32 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   end
 
   @spec managed_state(Conn.t(), map()) :: Conn.t()
-  def managed_state(conn, _params) do
+  def managed_state(conn, params) do
     with {:ok, principal} <- authorize_managed(conn),
-         {:ok, payload} <- Control.state(orchestrator(), snapshot_timeout_ms()) do
-      json(conn, Map.put(payload, :principal, principal))
+         {:ok, options} <- ManagedStateView.parse_params(params),
+         {:ok, state} <- Control.state(orchestrator(), snapshot_timeout_ms()),
+         runtime_facts = managed_runtime_facts(orchestrator()),
+         {:ok, payload} <-
+           ManagedStateView.project(state, principal, Map.put(options, :runtime_facts, runtime_facts)) do
+      json(conn, payload)
     else
-      {:error, :unauthorized} -> managed_error(conn, 401, "unauthorized", "Unauthorized")
-      {:error, :forbidden} -> managed_error(conn, 403, "loopback_required", "Loopback access required")
-      {:error, :managed_mode_disabled} -> managed_error(conn, 503, "managed_mode_disabled", "Managed mode is disabled")
-      {:error, reason} -> managed_error(conn, 503, "managed_unavailable", safe_managed_message(reason))
+      {:error, :unauthorized} ->
+        managed_error(conn, 401, "unauthorized", "Unauthorized")
+
+      {:error, :forbidden} ->
+        managed_error(conn, 403, "loopback_required", "Loopback access required")
+
+      {:error, :managed_mode_disabled} ->
+        managed_error(conn, 503, "managed_mode_disabled", "Managed mode is disabled")
+
+      {:error, {:assignment_not_found, assignment_id}} ->
+        managed_error(conn, 404, "assignment_not_found", "Assignment not found", %{assignment_id: assignment_id})
+
+      {:error, {field, message}} when is_atom(field) and is_binary(message) ->
+        managed_error(conn, 400, "invalid_request", message, %{field: field})
+
+      {:error, reason} ->
+        managed_error(conn, 503, "managed_unavailable", safe_managed_message(reason))
     end
   end
 
@@ -163,6 +180,29 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
       other ->
         other
     end
+  end
+
+  @spec managed_runtime_facts(GenServer.server()) :: map()
+  defp managed_runtime_facts(server) do
+    max_concurrent_agents =
+      case Config.settings() do
+        {:ok, settings} -> settings.agent.max_concurrent_agents
+        _ -> nil
+      end
+
+    running_count =
+      case Orchestrator.snapshot(server, snapshot_timeout_ms()) do
+        %{running: running} when is_list(running) -> length(running)
+        %{running: running} when is_map(running) -> map_size(running)
+        _ -> nil
+      end
+
+    %{
+      max_concurrent_agents: max_concurrent_agents,
+      running_count: running_count
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
   end
 
   defp managed_error(conn, status, code, message, details \\ %{}) do

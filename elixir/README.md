@@ -264,6 +264,23 @@ The version two control contract has these boundaries:
   status, and never replace issue requirements or the workflow Status field.
 - A terminal worker report ends permission to execute tools. The runtime interrupts the
   turn and briefly drains final usage notifications; incomplete telemetry is marked explicitly.
+- Reports are identified by the trusted attempt ID and local report ID. An identical retry
+  is idempotent; changed content under that same key is rejected. A later attempt can reuse
+  the local ID. Successful REVIEW projection is reconciled once, including on worker exit.
+- Review feedback may carry up to eight `peer_report_refs` with `source_assignment_id`,
+  `source_attempt_id`, and `report_id`. Sources must belong to the same Project and current PM.
+  Canonical reports resolve into a bounded findings block on the next worker turn. These
+  findings are evidence, cannot grant authority or change scope, and clear on material revision.
+- `GET /api/v1/managed/state` defaults to compact `view=summary`. Optional `project_id`,
+  `assignment_id`, and `include_history=true` select records. `view=detail` requires an
+  assignment ID for complete reports; `view=full` is deliberate diagnostic access. The
+  projection uses existing read authentication and adds no new Project access-control claim.
+- Managed usage persists cumulative source-thread watermarks and counts each new delta once
+  across resumes and restarts. Assignment runtime adds completed attempts and the active run.
+  Legacy totals without sufficient evidence are unavailable; a configured token cap holds
+  dispatch when historical accounting cannot support it. A service without a cap can continue.
+- Startup response timeouts include the pending method, stage, elapsed milliseconds, and
+  configured timeout. Unrelated output cannot extend that request's deadline.
 
 Project bindings and ownership belong to the journal, not to a second scheduler or database.
 The workflow's tracker credentials remain the provider credential authority. Keep the control
@@ -382,15 +399,18 @@ mean the runtime reports an active worker; PM registration and the assignment ph
 not prove that a Codex task is running.
 
 Runtime and total tokens appear on task nodes and list rows; selecting a task also shows input
-and output tokens. Active tasks use their current session's counters and elapsed runtime.
-Inactive tasks retain their recorded usage and runtime, and missing values say "Not recorded".
-The live summary covers running workers; aggregate service totals, including completed sessions,
-remain in Runtime.
+and output tokens. Managed tokens use corrected assignment totals, while runtime adds saved
+attempt durations and current elapsed time. Details show the current run separately. Missing
+values say "Not recorded"; unavailable historical totals and partial telemetry are explicit.
+The live summary shows current-attempt tokens and running-worker time. Aggregate managed usage
+and raw thread counters are labelled separately in Runtime.
 
-Completed and cancelled subtasks remain connected to the current PM, with a completed count,
+Accepted and cancelled subtasks remain connected to the current PM, with assignment-state counts,
 so finishing a worker does not remove part of the PM's task. The selected PM is retained in the
 page URL, including after its final worker finishes, and a page refresh preserves that context.
 Completed subtasks do not animate or count as running, even with pending stop bookkeeping.
+Accepted assignments do not establish delivery of the user's parent task; delivery remains
+unverified without a parent delivery record.
 
 **History** contains completed assignments from earlier PMs, outside the current PM context.
 They are excluded from live counts and health. **Runtime** keeps the detailed

@@ -1,6 +1,57 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "response deadlines identify the pending startup or turn request despite unrelated output" do
+    for method <- ["initialize", "thread/start", "thread/resume", "turn/start"] do
+      test_root = Path.join(System.tmp_dir!(), "symphony-response-deadline-#{System.unique_integer([:positive])}")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-DEADLINE")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "requests.log")
+      File.mkdir_p!(workspace)
+      on_exit(fn -> File.rm_rf!(test_root) end)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        echo "$line" >> "#{trace_file}"
+        case "$line" in
+          *'"method":"#{method}"'*)
+            while :; do
+              echo '{"method":"test/progress","params":{}}'
+              sleep 0.01
+            done
+            ;;
+          *'"method":"initialize"'*) echo '{"id":1,"result":{}}' ;;
+          *'"method":"thread/start"'*) echo '{"id":2,"result":{"thread":{"id":"thread-deadline"}}}' ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      Workflow.set_workflow_file_path(Path.join(test_root, "WORKFLOW.md"))
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_read_timeout_ms: 5_000
+      )
+
+      assert :ok = SymphonyElixir.WorkflowStore.force_reload()
+
+      opts = if method == "thread/resume", do: [resume_thread_id: "thread-deadline"], else: []
+      issue = %Issue{id: "issue-deadline", identifier: "MT-DEADLINE", title: "Response deadline", state: "In Progress"}
+
+      assert {:error, {:response_timeout, detail}} = AppServer.run(workspace, "Run", issue, opts)
+      assert detail.method == method, "pending method #{inspect(detail)}; requests: #{inspect(File.read(trace_file))}"
+      assert detail.stage == if(method == "initialize", do: :initialization, else: :request)
+      assert detail.timeout_ms == 5_000
+      assert detail.elapsed_ms >= detail.timeout_ms
+      assert detail.elapsed_ms < 10_000
+    end
+  end
+
   test "managed app server uses configured tools and repairs invalid report input in the same turn" do
     test_root =
       Path.join(

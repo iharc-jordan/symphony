@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.GitHubProjects.Client
-  alias SymphonyElixir.Managed.{Checkout, Journal, Principal, Projection, Rules}
+  alias SymphonyElixir.Managed.{Checkout, Journal, Principal, Projection, Rules, Usage}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -165,8 +165,11 @@ defmodule SymphonyElixir.Orchestrator do
     case record_managed_session(managed.data, attempt, info) do
       {:ok, data} ->
         case persist_managed_data(state, data) do
-          {:ok, next_state} -> {:reply, :ok, next_state}
-          {:error, reason} -> {:reply, {:error, reason}, state}
+          {:ok, next_state} ->
+            {:reply, :ok, hydrate_managed_usage_source(next_state, attempt, info)}
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, state}
         end
 
       {:error, code, details} ->
@@ -559,15 +562,19 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
-        updated_running_entry =
-          running_entry
-          |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
-          |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+        if managed_worker_update_current?(running_entry, runtime_info) do
+          updated_running_entry =
+            running_entry
+            |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
+            |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
 
-        next_state = %{state | running: Map.put(running, issue_id, updated_running_entry)}
-        next_state = managed_record_runtime(next_state, issue_id, runtime_info)
-        notify_dashboard()
-        {:noreply, next_state}
+          next_state = %{state | running: Map.put(running, issue_id, updated_running_entry)}
+          next_state = managed_record_runtime(next_state, issue_id, runtime_info)
+          notify_dashboard()
+          {:noreply, next_state}
+        else
+          {:noreply, state}
+        end
     end
   end
 
@@ -580,17 +587,21 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
-        {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        if managed_worker_update_current?(running_entry, update) do
+          {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
 
-        state =
-          state
-          |> apply_codex_token_delta(token_delta)
-          |> apply_codex_rate_limits(update)
-          |> Map.put(:running, Map.put(running, issue_id, updated_running_entry))
-          |> managed_record_usage(issue_id, token_delta)
+          state =
+            state
+            |> apply_codex_token_delta(token_delta)
+            |> apply_codex_rate_limits(update)
+            |> Map.put(:running, Map.put(running, issue_id, updated_running_entry))
+            |> managed_record_usage(issue_id)
 
-        notify_dashboard()
-        {:noreply, state}
+          notify_dashboard()
+          {:noreply, state}
+        else
+          {:noreply, state}
+        end
     end
   end
 
@@ -1293,98 +1304,84 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp managed_finalize_usage(usage, running_entry, previous_usage_total, limit)
-       when is_map(usage) and is_map(running_entry) do
-    observed_total = nonnegative_integer(running_entry[:codex_total_tokens], 0)
-    previous_total = nonnegative_integer(previous_usage_total, 0)
-    additional = max(observed_total - previous_total, 0)
-    cumulative = nonnegative_integer(usage[:cumulative_tokens], 0) + additional
-    inflight = max(nonnegative_integer(usage[:inflight_tokens], 0) - observed_total, 0)
-
-    %{
-      baseline_tokens: nonnegative_integer(usage[:baseline_tokens], 0),
-      cumulative_tokens: cumulative,
-      inflight_tokens: inflight,
-      overshoot_tokens: max(nonnegative_integer(usage[:overshoot_tokens], 0), 0),
-      cap_reached: usage[:cap_reached] == true
-    }
-    |> then(fn next_usage ->
-      if is_integer(limit) and limit > 0 do
-        Map.merge(next_usage, %{
-          overshoot_tokens: max(cumulative - limit, 0),
-          cap_reached: cumulative >= limit
-        })
-      else
-        next_usage
-      end
-    end)
-  end
-
-  defp managed_finalize_usage(usage, _running_entry, _previous_usage_total, _limit) when is_map(usage), do: usage
-  defp managed_finalize_usage(_usage, _running_entry, _previous_usage_total, _limit), do: %{}
-
-  defp managed_usage_exhausted?(data) when is_map(data) do
+  defp managed_usage_block_reason(data) when is_map(data) do
+    usage = Usage.normalize_aggregate(data[:usage] || %{})
     limit = data[:usage_limit_tokens]
-    usage = data[:usage] || %{}
-    cumulative = usage[:cumulative_tokens] || 0
-    is_integer(limit) and limit > 0 and is_integer(cumulative) and cumulative >= limit
+
+    cond do
+      is_integer(limit) and limit > 0 and usage.accounting_status == :unavailable ->
+        :managed_usage_accounting_unavailable
+
+      is_integer(limit) and limit > 0 and usage.cumulative_tokens >= limit ->
+        :managed_usage_limit_exhausted
+
+      true ->
+        nil
+    end
   end
 
-  defp managed_usage_exhausted?(_data), do: false
+  defp managed_usage_block_reason(_data), do: nil
 
-  defp managed_record_usage(%State{managed: %{data: data}} = state, issue_id, token_delta)
-       when is_binary(issue_id) and is_map(token_delta) do
-    case token_delta[:total_tokens] do
-      total when is_integer(total) and total > 0 ->
-        record_managed_usage_for_assignment(state, data, issue_id, token_delta, total)
+  defp managed_usage_exhausted?(data), do: managed_usage_block_reason(data) == :managed_usage_limit_exhausted
 
+  defp managed_record_usage(%State{managed: %{data: data}} = state, issue_id)
+       when is_binary(issue_id) do
+    with assignment when is_map(assignment) <- get_in(data, [:assignments, issue_id]),
+         running_entry when is_map(running_entry) <- Map.get(state.running, issue_id),
+         thread_id when is_binary(thread_id) <- running_entry[:managed_usage_source_thread_id],
+         %{attempt_id: attempt_id} = attempt when is_binary(attempt_id) <- running_entry[:managed_attempt],
+         :ok <- managed_attempt_matches?(assignment, attempt) do
+      previous_total = nonnegative_integer(get_in(assignment, [:usage, :total_tokens]), 0)
+      raw = managed_raw_watermarks(running_entry)
+
+      durable_delta =
+        assignment
+        |> Usage.source_for(thread_id)
+        |> Usage.source_raw()
+        |> Usage.raw_delta(raw)
+
+      updated_assignment = Usage.record_delta(assignment, thread_id, attempt_id, raw, durable_delta)
+      recorded_total = nonnegative_integer(get_in(updated_assignment, [:usage, :total_tokens]), 0)
+      corrected_delta = max(recorded_total - previous_total, 0)
+
+      next_data =
+        data
+        |> put_in([:assignments, issue_id], updated_assignment)
+        |> Map.update(:usage, Usage.new_aggregate(), &Usage.add_aggregate_delta(&1, corrected_delta, data[:usage_limit_tokens]))
+
+      persist_managed_usage(state, next_data, issue_id)
+    else
       _ ->
         state
     end
   end
 
-  defp managed_record_usage(state, _issue_id, _token_delta), do: state
+  defp managed_record_usage(state, _issue_id), do: state
 
-  defp record_managed_usage_for_assignment(state, data, issue_id, token_delta, total) do
-    case get_in(data, [:assignments, issue_id]) do
-      assignment when is_map(assignment) ->
-        assignment_usage = assignment[:usage] || %{}
-        previous_total = nonnegative_integer(assignment_usage[:total_tokens], 0)
-        usage = data[:usage] || %{}
-        cumulative = nonnegative_integer(usage[:cumulative_tokens], 0) + total
-        limit = data[:usage_limit_tokens]
-        overshoot = if is_integer(limit) and limit > 0, do: max(cumulative - limit, 0), else: 0
+  defp managed_worker_update_current?(running_entry, update) when is_map(running_entry) and is_map(update) do
+    case running_entry[:managed_attempt] do
+      expected when is_map(expected) ->
+        received = map_value(update, :attempt)
 
-        next_usage = %{
-          input_tokens:
-            nonnegative_integer(assignment_usage[:input_tokens], 0) +
-              nonnegative_integer(token_delta[:input_tokens], 0),
-          output_tokens:
-            nonnegative_integer(assignment_usage[:output_tokens], 0) +
-              nonnegative_integer(token_delta[:output_tokens], 0),
-          total_tokens: previous_total + total,
-          seconds_running: nonnegative_integer(assignment_usage[:seconds_running], 0),
-          attempt_id: get_in(assignment, [:attempt_id])
-        }
-
-        next_aggregate = %{
-          baseline_tokens: nonnegative_integer(usage[:baseline_tokens], 0),
-          cumulative_tokens: cumulative,
-          inflight_tokens: nonnegative_integer(usage[:inflight_tokens], 0) + total,
-          overshoot_tokens: overshoot,
-          cap_reached: is_integer(limit) and limit > 0 and cumulative >= limit
-        }
-
-        next_data =
-          data
-          |> put_in([:assignments, issue_id, :usage], next_usage)
-          |> Map.put(:usage, next_aggregate)
-
-        persist_managed_usage(state, next_data, issue_id)
+        is_map(received) and
+          Enum.all?([:assignment_id, :revision, :generation, :attempt_id], fn key ->
+            map_value(received, key) == map_value(expected, key)
+          end)
 
       _ ->
-        state
+        true
     end
+  end
+
+  defp managed_worker_update_current?(_running_entry, _update), do: false
+
+  defp managed_raw_watermarks(running_entry) when is_map(running_entry) do
+    %{
+      input_tokens: nonnegative_integer(running_entry[:codex_last_reported_input_tokens], 0),
+      output_tokens: nonnegative_integer(running_entry[:codex_last_reported_output_tokens], 0),
+      total_tokens: nonnegative_integer(running_entry[:codex_last_reported_total_tokens], 0),
+      cached_input_tokens: optional_nonnegative_integer(running_entry[:codex_last_reported_cached_input_tokens])
+    }
   end
 
   defp persist_managed_usage(state, data, issue_id) do
@@ -1427,6 +1424,8 @@ defmodule SymphonyElixir.Orchestrator do
     with {:ok, assignment} <- Map.fetch(data.assignments, assignment_id),
          :ok <- managed_attempt_matches?(assignment, attempt),
          thread_id when is_binary(thread_id) <- map_value(info, :thread_id) do
+      assignment = Usage.start_source(assignment, thread_id, map_value(attempt, :attempt_id))
+
       patch =
         info
         |> Map.take([
@@ -1455,14 +1454,39 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp hydrate_managed_usage_source(%State{} = state, attempt, info) when is_map(attempt) and is_map(info) do
+    assignment_id = map_value(attempt, :assignment_id)
+    thread_id = map_value(info, :thread_id)
+
+    with true <- is_binary(assignment_id),
+         true <- is_binary(thread_id),
+         assignment when is_map(assignment) <- get_in(state.managed.data, [:assignments, assignment_id]),
+         running_entry when is_map(running_entry) <- Map.get(state.running, assignment_id) do
+      source = Usage.source_for(assignment, thread_id)
+
+      hydrated =
+        running_entry
+        |> Map.put(:managed_usage_source_thread_id, thread_id)
+        |> Map.put(:codex_last_reported_input_tokens, source.input_tokens)
+        |> Map.put(:codex_last_reported_output_tokens, source.output_tokens)
+        |> Map.put(:codex_last_reported_total_tokens, source.total_tokens)
+        |> Map.put(:codex_last_reported_cached_input_tokens, source.cached_input_tokens)
+
+      %{state | running: Map.put(state.running, assignment_id, hydrated)}
+    else
+      _ -> state
+    end
+  end
+
+  defp hydrate_managed_usage_source(state, _attempt, _info), do: state
+
   defp managed_before_turn(%State{managed: %{data: _data}} = state, turn_context) do
     case managed_source_reconcile(state, turn_context) do
       {:ok, reconciled_state, :unchanged} ->
         decision =
-          if managed_usage_exhausted?(reconciled_state.managed.data) do
-            {:stop, :managed_usage_limit_exhausted}
-          else
-            managed_before_turn_decision(reconciled_state.managed.data, turn_context)
+          case managed_usage_block_reason(reconciled_state.managed.data) do
+            nil -> managed_before_turn_decision(reconciled_state.managed.data, turn_context)
+            reason -> {:stop, reason}
           end
 
         case decision do
@@ -1531,6 +1555,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp record_managed_report(data, payload) do
     attempt = map_value(payload, :attempt)
     assignment_id = map_value(attempt || %{}, :assignment_id)
+    attempt_id = map_value(attempt || %{}, :attempt_id)
     report_id = map_value(payload, :report_id)
     kind = map_value(payload, :kind)
     summary = map_value(payload, :summary)
@@ -1540,19 +1565,27 @@ defmodule SymphonyElixir.Orchestrator do
          :ok <- managed_attempt_matches?(assignment, attempt),
          :ok <- valid_managed_report(kind, report_id, summary, evidence) do
       reports = assignment[:reports] || %{}
-      canonical = %{report_id: report_id, kind: kind, summary: String.slice(summary, 0, 2_000), evidence: Enum.take(evidence, 20)}
+      report_key = Rules.report_key(attempt_id, report_id)
 
-      case Map.get(reports, report_id) do
+      canonical = %{
+        attempt_id: attempt_id,
+        report_id: report_id,
+        kind: kind,
+        summary: String.slice(summary, 0, 2_000),
+        evidence: Enum.take(evidence, 20)
+      }
+
+      case Map.get(reports, report_key) do
         ^canonical ->
           {:ok, data}
 
         existing when is_map(existing) ->
-          {:error, :report_id_conflict, %{report_id: report_id}}
+          {:error, :report_id_conflict, %{attempt_id: attempt_id, report_id: report_id}}
 
         nil ->
           updated =
             assignment
-            |> Map.put(:reports, Map.put(reports, report_id, canonical))
+            |> Map.put(:reports, Map.put(reports, report_key, canonical))
             |> Map.put(:last_report, canonical)
             |> managed_report_phase(kind, summary)
 
@@ -1562,6 +1595,7 @@ defmodule SymphonyElixir.Orchestrator do
             |> append_managed_event(%{
               operation: :report,
               assignment_id: assignment_id,
+              attempt_id: attempt_id,
               report_id: report_id,
               kind: kind,
               phase: updated[:phase]
@@ -1921,15 +1955,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp recover_managed_usage_inflight(%State{managed: %{data: data}} = state) do
-    usage = data[:usage] || %{}
-    stale_inflight = nonnegative_integer(usage[:inflight_tokens], 0)
+    usage = Usage.normalize_aggregate(data[:usage] || %{})
+    stale_inflight = usage.inflight_tokens
 
-    if stale_inflight == 0 do
+    assignments =
+      Map.new(data.assignments, fn {assignment_id, assignment} ->
+        {assignment_id, Usage.clear_assignment_inflight(assignment)}
+      end)
+
+    if stale_inflight == 0 and assignments == data.assignments and usage == data[:usage] do
       state
     else
       recovered_data =
         data
-        |> put_in([:usage, :inflight_tokens], 0)
+        |> Map.put(:assignments, assignments)
+        |> Map.put(:usage, Usage.clear_inflight(usage))
         |> append_managed_event(%{
           operation: :startup_usage_recovery,
           stale_inflight_tokens: stale_inflight
@@ -2728,33 +2768,38 @@ defmodule SymphonyElixir.Orchestrator do
         attempt
       )
 
-    previous_usage_total = get_in(assignment, [:usage, :total_tokens]) || 0
+    thread_id = running_entry[:managed_usage_source_thread_id] || assignment[:thread_id]
+    raw = managed_raw_watermarks(running_entry)
+    seconds_running = running_seconds(Map.get(running_entry, :started_at), DateTime.utc_now())
+
+    {usage_completed, completion_delta, persisted_inflight} =
+      Usage.complete_attempt(assignment, thread_id, attempt.attempt_id, raw, seconds_running)
 
     retrying? =
       phase == :ready and managed_retry_allowed?(assignment) and match?({:managed_agent_failed, _}, reason)
 
     updated =
-      assignment
+      usage_completed
       |> Map.merge(%{phase: phase, board_state: board_state, pending_effect: pending_effect, worker_active: false})
       |> maybe_put_managed(
         :retry_count,
         if(retrying?, do: (assignment[:retry_count] || 0) + 1, else: assignment[:retry_count])
       )
       |> maybe_put_managed(:resume_ready, if(retrying?, do: false, else: assignment[:resume_ready]))
-      |> Map.put(:usage, %{
-        input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
-        output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
-        total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
-        telemetry_complete: Map.get(running_entry, :codex_usage_complete),
-        seconds_running: running_seconds(Map.get(running_entry, :started_at), DateTime.utc_now())
-      })
+      |> update_in([:usage], &Map.put(&1, :telemetry_complete, Map.get(running_entry, :codex_usage_complete) == true))
       |> maybe_put_managed(:stop_pending, stop_pending)
       |> maybe_put_managed(:blocked_reason, blocked_reason)
+
+    aggregate_inflight = persisted_inflight + completion_delta.total_tokens
 
     data =
       state.managed.data
       |> put_in([:assignments, issue_id], updated)
-      |> update_in([:usage], &managed_finalize_usage(&1, running_entry, previous_usage_total, state.managed.data[:usage_limit_tokens]))
+      |> update_in([:usage], fn usage ->
+        usage
+        |> Usage.add_aggregate_delta(completion_delta.total_tokens, state.managed.data[:usage_limit_tokens])
+        |> Usage.complete_aggregate_attempt(aggregate_inflight, state.managed.data[:usage_limit_tokens])
+      end)
       |> append_managed_event(%{
         operation: :agent_down,
         assignment_id: issue_id,
@@ -3704,6 +3749,8 @@ defmodule SymphonyElixir.Orchestrator do
     case get_in(data, [:assignments, issue_id]) do
       %{attempt_id: attempt_id, revision: revision, generation: generation} = assignment
       when is_binary(attempt_id) and is_integer(revision) and is_integer(generation) ->
+        peer_context = Rules.peer_report_context(data, assignment)
+
         %{
           assignment_id: issue_id,
           revision: revision,
@@ -3712,7 +3759,9 @@ defmodule SymphonyElixir.Orchestrator do
           model: route_value(assignment[:route], :model),
           effort: route_value(assignment[:route], :effort),
           escalation_reason: assignment[:escalation_reason],
-          review_feedback: assignment[:review_feedback]
+          review_feedback: assignment[:review_feedback],
+          peer_reports: peer_reports(peer_context),
+          peer_report_notice: peer_report_notice(peer_context)
         }
 
       _ ->
@@ -3721,6 +3770,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp managed_attempt_for_issue(_state, _issue_id), do: nil
+
+  defp peer_reports({:ok, reports}) when is_list(reports), do: reports
+  defp peer_reports(_peer_context), do: []
+
+  defp peer_report_notice({:unavailable, %{code: code, details: details}}) do
+    %{code: code, source_assignment_id: details[:source_assignment_id], report_id: details[:report_id]}
+  end
+
+  defp peer_report_notice(_peer_context), do: nil
 
   defp managed_checkout_options do
     case Config.settings() do
@@ -3771,6 +3829,8 @@ defmodule SymphonyElixir.Orchestrator do
         effort: attempt[:effort],
         escalation_reason: attempt[:escalation_reason],
         review_feedback: attempt[:review_feedback],
+        peer_reports: attempt[:peer_reports],
+        peer_report_notice: attempt[:peer_report_notice],
         workspace_preparer: workspace_preparer,
         issue_state_fetcher: managed_issue_state_fetcher(state, assignment),
         on_session: fn info -> managed_callback_call(owner, {:managed_session, attempt, info}) end,
@@ -3856,6 +3916,9 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            codex_cached_input_tokens: nil,
+            codex_last_reported_cached_input_tokens: nil,
+            managed_usage_source_thread_id: nil,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             managed_attempt: managed_attempt_for_issue(state, issue.id),
@@ -4098,26 +4161,34 @@ defmodule SymphonyElixir.Orchestrator do
   defp managed_data(_data, _config), do: {:error, :managed_journal_schema_mismatch}
 
   defp normalize_managed_usage(%{usage: usage} = data) when is_map(usage) do
-    normalized = %{
-      baseline_tokens: nonnegative_integer(usage[:baseline_tokens], 0),
-      cumulative_tokens: nonnegative_integer(usage[:cumulative_tokens], 0),
-      inflight_tokens: nonnegative_integer(usage[:inflight_tokens], 0),
-      overshoot_tokens: nonnegative_integer(usage[:overshoot_tokens], 0),
-      cap_reached: usage[:cap_reached] == true
-    }
-
-    Map.put(data, :usage, normalized)
+    data
+    |> Map.put(:usage, Usage.normalize_aggregate(usage))
+    |> normalize_managed_assignment_usage()
   end
 
   defp normalize_managed_usage(data) when is_map(data) do
-    Map.put(data, :usage, %{
-      baseline_tokens: 0,
-      cumulative_tokens: 0,
-      inflight_tokens: 0,
-      overshoot_tokens: 0,
-      cap_reached: false
-    })
+    data
+    |> Map.put(:usage, Usage.new_aggregate())
+    |> normalize_managed_assignment_usage()
   end
+
+  defp normalize_managed_assignment_usage(data) do
+    assignments =
+      case data[:assignments] do
+        assignments when is_map(assignments) ->
+          Map.new(assignments, fn {assignment_id, assignment} ->
+            {assignment_id, Usage.normalize_assignment(assignment)}
+          end)
+
+        _ ->
+          %{}
+      end
+
+    Map.put(data, :assignments, assignments)
+  end
+
+  defp optional_nonnegative_integer(value) when is_integer(value) and value >= 0, do: value
+  defp optional_nonnegative_integer(_value), do: nil
 
   defp nonnegative_integer(value, _default) when is_integer(value) and value >= 0, do: value
   defp nonnegative_integer(_value, default), do: default
@@ -4457,10 +4528,13 @@ defmodule SymphonyElixir.Orchestrator do
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
     codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
+    codex_cached_input_tokens = Map.get(running_entry, :codex_cached_input_tokens)
     codex_app_server_pid = Map.get(running_entry, :codex_app_server_pid)
     last_reported_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
+    last_reported_cached_input = Map.get(running_entry, :codex_last_reported_cached_input_tokens)
+    cached_input_watermark = max_optional_token_watermark(last_reported_cached_input, token_delta.cached_input_reported)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
     {
@@ -4473,10 +4547,12 @@ defmodule SymphonyElixir.Orchestrator do
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
         codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
+        codex_cached_input_tokens: add_optional_token_delta(codex_cached_input_tokens, token_delta.cached_input_tokens),
         codex_usage_complete: usage_completion_for_update(running_entry, event),
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+        codex_last_reported_cached_input_tokens: cached_input_watermark,
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       }),
       token_delta
@@ -4659,17 +4735,25 @@ defmodule SymphonyElixir.Orchestrator do
         :total,
         usage,
         :codex_last_reported_total_tokens
+      ),
+      compute_optional_token_delta(
+        running_entry,
+        :cached_input,
+        usage,
+        :codex_last_reported_cached_input_tokens
       )
     }
     |> Tuple.to_list()
-    |> then(fn [input, output, total] ->
+    |> then(fn [input, output, total, cached_input] ->
       %{
         input_tokens: input.delta,
         output_tokens: output.delta,
         total_tokens: total.delta,
+        cached_input_tokens: cached_input.delta,
         input_reported: input.reported,
         output_reported: output.reported,
-        total_reported: total.reported
+        total_reported: total.reported,
+        cached_input_reported: cached_input.reported
       }
     end)
   end
@@ -4690,6 +4774,32 @@ defmodule SymphonyElixir.Orchestrator do
       reported: if(is_integer(next_total), do: next_total, else: prev_reported)
     }
   end
+
+  defp compute_optional_token_delta(running_entry, token_key, usage, reported_key) do
+    next_total = get_token_usage(usage, token_key)
+    prev_reported = Map.get(running_entry, reported_key)
+
+    if is_integer(next_total) and next_total >= 0 do
+      previous = if is_integer(prev_reported) and prev_reported >= 0, do: prev_reported, else: 0
+      %{delta: max(next_total - previous, 0), reported: max(next_total, previous)}
+    else
+      %{delta: nil, reported: prev_reported}
+    end
+  end
+
+  defp add_optional_token_delta(existing, delta) when is_integer(delta) and delta >= 0 do
+    nonnegative_integer(existing, 0) + delta
+  end
+
+  defp add_optional_token_delta(existing, _delta) when is_integer(existing) and existing >= 0, do: existing
+  defp add_optional_token_delta(_existing, _delta), do: nil
+
+  defp max_optional_token_watermark(existing, value) when is_integer(value) and value >= 0 do
+    max(nonnegative_integer(existing, 0), value)
+  end
+
+  defp max_optional_token_watermark(existing, _value) when is_integer(existing) and existing >= 0, do: existing
+  defp max_optional_token_watermark(_existing, _value), do: nil
 
   defp extract_token_usage(update) do
     payloads = [
@@ -4880,6 +4990,17 @@ defmodule SymphonyElixir.Orchestrator do
         :promptTokens,
         "inputTokens",
         :inputTokens
+      ])
+
+  defp get_token_usage(usage, :cached_input),
+    do:
+      payload_get(usage, [
+        "cached_input_tokens",
+        :cached_input_tokens,
+        "cachedInputTokens",
+        :cachedInputTokens,
+        "cached_input",
+        :cached_input
       ])
 
   defp get_token_usage(usage, :output),

@@ -148,6 +148,57 @@ defmodule SymphonyElixir.ManagedOwnershipHttpTest do
     assert state.assignments == %{}
   end
 
+  test "managed state GET supports compact summary, assignment detail, and clear invalid query errors", %{pid: pid} do
+    assignment = %{
+      assignment_id: "item-one",
+      project_id: "PVT_one",
+      repository: "acme/one",
+      issue_number: 1,
+      phase: :review,
+      board_state: :review,
+      ownership: %{status: :owned, pm_id: @pm_a, ownership_revision: 1},
+      reports: %{"r-1" => %{report_id: "r-1", evidence: ["proof"]}},
+      last_report: %{report_id: "r-1", kind: "result", summary: "done", evidence: ["proof"]}
+    }
+
+    :sys.replace_state(pid, fn state ->
+      data =
+        Rules.new(
+          control_revision: 3,
+          event_cursor: 4,
+          projects: %{"PVT_one" => %{project_id: "PVT_one", revision: 1}},
+          assignments: %{"item-one" => assignment},
+          paused: false
+        )
+
+      %{state | managed: %{state.managed | data: data}}
+    end)
+
+    summary = get_request(@secret, "/api/v1/managed/state") |> json_response(200)
+    assert summary["view"] == "summary"
+    assert summary["control_revision"] == 3
+    assert summary["assignments"]["item-one"]["phase"] == "review"
+    refute Map.has_key?(summary, "events")
+
+    detail =
+      get_request(@secret, "/api/v1/managed/state?view=detail&assignment_id=item-one")
+      |> json_response(200)
+
+    assert detail["view"] == "detail"
+    assert detail["assignment"]["reports"]["r-1"]["evidence"] == ["proof"]
+
+    invalid = get_request(@secret, "/api/v1/managed/state?view=compact") |> json_response(400)
+    assert invalid["error"]["code"] == "invalid_request"
+    assert invalid["error"]["details"]["field"] == "view"
+  end
+
+  defp get_request(token, path) do
+    build_conn(:get, path)
+    |> Map.put(:remote_ip, {127, 0, 0, 1})
+    |> put_req_header("authorization", "Bearer " <> token)
+    |> get(path)
+  end
+
   defp request(token, body) do
     build_conn(:post, "/api/v1/managed/control")
     |> Map.put(:remote_ip, {127, 0, 0, 1})

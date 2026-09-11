@@ -1164,7 +1164,9 @@ Error mapping (RECOMMENDED normalized categories):
 
 - `codex_not_found`
 - `invalid_workspace_cwd`
-- `response_timeout`
+- `response_timeout` (include the pending method, initialization/request stage,
+  elapsed milliseconds, and configured timeout; unrelated stream output must
+  not extend a request's deadline)
 - `turn_timeout`
 - `port_exit`
 - `response_error`
@@ -2360,3 +2362,17 @@ Optional Project card summaries are derived projections of journal state. Projec
 MUST be visible and MUST NOT be reported as synchronized. Summary writes MUST NOT replace issue
 requirements or workflow status. A terminal worker report revokes further tool execution;
 a bounded drain MAY collect final usage, with incomplete accounting explicitly marked.
+
+Managed report identity MUST include the trusted attempt and the local report ID. Identical
+replays are idempotent; conflicting content under the same identity is rejected. A successful
+terminal report and worker exit MUST NOT duplicate a successful provider projection.
+
+Optional peer findings MUST reference canonical reports by source assignment, source attempt,
+and report ID. References MUST validate the current Project, PM ownership, and target revision
+fences. Resolve a bounded block for the next turn, treat it as evidence without authority, and
+clear references together with obsolete feedback on material scope revision.
+
+Managed usage MUST persist source-thread raw watermarks independently from corrected assignment
+totals. Reconnects, resumes, duplicate notifications, and restarts must count only new usage.
+Completed-attempt duration is additive and distinct from the current run. Historical totals
+without enough durable evidence MUST remain unavailable and MUST NOT authorize token-cap headroom.

@@ -1027,7 +1027,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     send_message(port, payload)
 
-    with {:ok, _} <- await_response(port, @initialize_id) do
+    with {:ok, _} <- await_response(port, @initialize_id, "initialize") do
       send_message(port, %{"method" => "initialized", "params" => %{}})
       :ok
     end
@@ -1119,7 +1119,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         |> maybe_put_route(wire_route, :model)
     })
 
-    case await_response(port, @thread_start_id) do
+    case await_response(port, @thread_start_id, "thread/start") do
       {:ok, response} -> thread_response_info(response, wire_route)
       other -> other
     end
@@ -1149,7 +1149,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         |> maybe_put_route(wire_route, :model)
     })
 
-    case await_response(port, @thread_resume_id) do
+    case await_response(port, @thread_resume_id, "thread/resume") do
       {:ok, response} ->
         with {:ok, thread_info} <- thread_response_info(response, wire_route),
              :ok <- validate_resumed_thread_id(thread_info.thread_id, resume_thread_id) do
@@ -1240,7 +1240,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "params" => params |> maybe_put_route(wire_route, :model) |> maybe_put_route(wire_route, :effort)
     })
 
-    case await_response(port, @turn_start_id) do
+    case await_response(port, @turn_start_id, "turn/start") do
       {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
       other -> other
     end
@@ -1704,28 +1704,56 @@ defmodule SymphonyElixir.Codex.AppServer do
     ]
   end
 
-  defp await_response(port, request_id) do
-    with_timeout_response(port, request_id, Config.settings!().codex.read_timeout_ms, "")
+  defp await_response(port, request_id, method) do
+    started_at = System.monotonic_time(:millisecond)
+    timeout_ms = Config.settings!().codex.read_timeout_ms
+
+    request = %{
+      id: request_id,
+      method: method,
+      started_at: started_at,
+      deadline: started_at + timeout_ms,
+      timeout_ms: timeout_ms
+    }
+
+    with_timeout_response(port, request, "")
   end
 
-  defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
-    receive do
-      {^port, {:data, {:eol, chunk}}} ->
-        complete_line = pending_line <> to_string(chunk)
-        handle_response(port, request_id, complete_line, timeout_ms)
+  defp with_timeout_response(port, request, pending_line) do
+    remaining = request.deadline - System.monotonic_time(:millisecond)
 
-      {^port, {:data, {:noeol, chunk}}} ->
-        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk))
+    if remaining <= 0 do
+      response_timeout(request)
+    else
+      receive do
+        {^port, {:data, {:eol, chunk}}} ->
+          complete_line = pending_line <> to_string(chunk)
+          handle_response(port, request, complete_line)
 
-      {^port, {:exit_status, status}} ->
-        {:error, {:port_exit, status}}
-    after
-      timeout_ms ->
-        {:error, :response_timeout}
+        {^port, {:data, {:noeol, chunk}}} ->
+          with_timeout_response(port, request, pending_line <> to_string(chunk))
+
+        {^port, {:exit_status, status}} ->
+          {:error, {:port_exit, status}}
+      after
+        remaining -> response_timeout(request)
+      end
     end
   end
 
-  defp handle_response(port, request_id, data, timeout_ms) do
+  defp response_timeout(request) do
+    {:error,
+     {:response_timeout,
+      %{
+        method: request.method,
+        stage: if(request.method == "initialize", do: :initialization, else: :request),
+        elapsed_ms: max(System.monotonic_time(:millisecond) - request.started_at, 0),
+        timeout_ms: request.timeout_ms
+      }}}
+  end
+
+  defp handle_response(port, request, data) do
+    request_id = request.id
     payload = to_string(data)
 
     case Jason.decode(payload) do
@@ -1740,11 +1768,11 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {:ok, %{} = other} ->
         Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
-        with_timeout_response(port, request_id, timeout_ms, "")
+        with_timeout_response(port, request, "")
 
       {:error, _} ->
         log_non_json_stream_line(payload, "response stream")
-        with_timeout_response(port, request_id, timeout_ms, "")
+        with_timeout_response(port, request, "")
     end
   end
 

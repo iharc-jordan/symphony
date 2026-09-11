@@ -26,6 +26,60 @@
         "assignments": {}
       }
     },
+    "state_views": {
+      "summary": {
+        "method": "GET",
+        "path": "/api/v1/managed/state?view=summary&project_id=PVT_one",
+        "authorization": "Bearer <token-file-value>",
+        "response": {
+          "revision": 4,
+          "cursor": 9,
+          "control_revision": 4,
+          "principal": {"principal_id": "00000000-0000-4000-8000-000000000001"},
+          "projects": {"PVT_one": {"project_id": "PVT_one", "project_number": 1, "repositories": ["acme/one"], "revision": 2}},
+          "usage": {"cumulative_tokens": 1200, "inflight_tokens": 0},
+          "assignments": {
+            "item-one": {
+              "assignment_id": "item-one",
+              "phase": "ready",
+              "ownership": {"pm_id": "00000000-0000-4000-8000-000000000001", "status": "owned", "ownership_revision": 1},
+              "route": {"model": "gpt-5.6-luna", "effort": "xhigh"},
+              "wait_reason": null,
+              "last_report": {"report_id": "report-fixture-1", "attempt_id": "managed-item-one-attempt-1"}
+            }
+          }
+        }
+      },
+      "detail": {
+        "method": "GET",
+        "path": "/api/v1/managed/state?view=detail&project_id=PVT_one&assignment_id=item-one&include_history=true",
+        "authorization": "Bearer <token-file-value>",
+        "response": {
+          "revision": 4,
+          "cursor": 9,
+          "control_revision": 4,
+          "assignment": {
+            "assignment_id": "item-one",
+            "phase": "ready",
+            "reports": {"report-fixture-1": {"kind": "result", "summary": "Sourced fixture report"}}
+          },
+          "project": {"project_id": "PVT_one", "project_number": 1, "repositories": ["acme/one"], "revision": 2}
+        }
+      },
+      "full": {
+        "method": "GET",
+        "path": "/api/v1/managed/state?view=full&include_history=true",
+        "authorization": "Bearer <token-file-value>",
+        "response": {
+          "revision": 4,
+          "cursor": 9,
+          "control_revision": 4,
+          "projects": {"PVT_one": {"project_id": "PVT_one", "project_number": 1, "repositories": ["acme/one"], "revision": 2}},
+          "assignments": {"item-one": {"assignment_id": "item-one", "reports": {"report-fixture-1": {"kind": "result"}}}},
+          "events": [{"cursor": 9, "event": "report_recorded"}]
+        }
+      }
+    },
     "events": {
       "method": "GET",
       "path": "/api/v1/managed/events?after=0&wait_ms=1000&limit=100",
@@ -267,6 +321,37 @@
         "phase": "accepted",
         "disposition": "accepted",
         "issue_close": "ok"
+      }
+    },
+    "review_peer_refs": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "review-rework-fixture-1",
+        "operation": "review",
+        "args": {
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
+          "expected_revision": 1,
+          "expected_ownership_revision": 1,
+          "disposition": "rework",
+          "reason": "Apply the referenced peer finding before the next review.",
+          "evidence": ["https://example.invalid/evidence/fixture-1"],
+          "peer_report_refs": [
+            {
+              "source_assignment_id": "item-one",
+              "source_attempt_id": "managed-item-one-attempt-1",
+              "report_id": "report-fixture-1"
+            }
+          ]
+        }
+      },
+      "response": {
+        "operation": "review",
+        "assignment_id": "item-one",
+        "revision": 2,
+        "phase": "ready",
+        "disposition": "rework"
       }
     },
     "handoff": {

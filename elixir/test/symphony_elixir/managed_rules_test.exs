@@ -937,6 +937,21 @@ defmodule SymphonyElixir.ManagedRulesTest do
     assert taken.assignments["handoff"].ownership.pm_id == "target"
   end
 
+  test "acceptance cannot attach findings intended for a subsequent worker turn" do
+    state = enrolled_state("peer-review") |> put_in([:assignments, "peer-review", :phase], :review)
+
+    args = %{
+      assignment_id: "peer-review",
+      expected_revision: 1,
+      disposition: "accepted",
+      evidence: ["verified"],
+      peer_report_refs: [%{source_assignment_id: "source", source_attempt_id: "attempt", report_id: "report"}]
+    }
+
+    assert {:error, :invalid_argument, %{argument: :peer_report_refs}} =
+             prepare_request(state, envelope("accept-with-peer-context", :review, args))
+  end
+
   test "request history remains bounded after many valid operations" do
     state =
       Enum.reduce(1..101, Rules.new(), fn index, state ->

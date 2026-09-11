@@ -84,7 +84,7 @@ end
 defmodule SymphonyElixir.ManagedOrchestratorTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.Managed.{Control, Journal, Rules}
+  alias SymphonyElixir.Managed.{Control, Journal, Rules, Usage}
 
   defp binding_args do
     %{
@@ -131,6 +131,22 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     end)
 
     {pid, path}
+  end
+
+  defp managed_usage_update(attempt, input, output, total) do
+    %{
+      attempt: attempt,
+      event: :notification,
+      timestamp: DateTime.utc_now(),
+      payload: %{
+        "method" => "thread/tokenUsage/updated",
+        "params" => %{
+          "tokenUsage" => %{
+            "total" => %{"inputTokens" => input, "outputTokens" => output, "totalTokens" => total}
+          }
+        }
+      }
+    }
   end
 
   for scenario <- [:fresh, :resume, :escalate] do
@@ -388,6 +404,152 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     assert assignment.turns_reserved == 2
     assert assignment.last_report.report_id == "r1"
     assert assignment.last_report.summary == "done"
+  end
+
+  test "managed reports are idempotent per attempt and local report id" do
+    {pid, _path} = managed_server()
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind-reports", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll-reports", operation: :enroll, args: enrollment_args()})
+
+    attempt_one = %{assignment_id: "item-1", revision: 1, generation: 1, attempt_id: "attempt-1"}
+
+    :sys.replace_state(pid, fn state ->
+      data =
+        put_in(
+          state.managed.data,
+          [:assignments, "item-1"],
+          Map.merge(state.managed.data.assignments["item-1"], %{
+            phase: :active,
+            board_state: :active,
+            generation: 1,
+            attempt_id: "attempt-1"
+          })
+        )
+
+      %{state | managed: %{state.managed | data: data}}
+    end)
+
+    first = %{attempt: attempt_one, kind: "result", report_id: "r1", summary: "first result", evidence: ["a"]}
+    assert :ok = GenServer.call(pid, {:managed_report, first})
+    assert :ok = GenServer.call(pid, {:managed_report, first})
+
+    attempt_two = %{attempt_one | generation: 2, attempt_id: "attempt-2"}
+
+    :sys.replace_state(pid, fn state ->
+      data =
+        update_in(state.managed.data, [:assignments, "item-1"], fn assignment ->
+          Map.merge(assignment, %{phase: :active, board_state: :active, generation: 2, attempt_id: "attempt-2"})
+        end)
+
+      %{state | managed: %{state.managed | data: data}}
+    end)
+
+    second = %{attempt: attempt_two, kind: "result", report_id: "r1", summary: "second result", evidence: ["b"]}
+    assert :ok = GenServer.call(pid, {:managed_report, second})
+    assert :ok = GenServer.call(pid, {:managed_report, second})
+
+    assert {:error, {:report_id_conflict, %{attempt_id: "attempt-2", report_id: "r1"}}} =
+             GenServer.call(pid, {:managed_report, %{second | summary: "changed"}})
+
+    assert {:ok, snapshot} = Control.state(pid)
+    reports = snapshot.assignments["item-1"].reports
+    assert map_size(reports) == 2
+    assert snapshot.assignments["item-1"].last_report.attempt_id == "attempt-2"
+    assert snapshot.assignments["item-1"].last_report.summary == "second result"
+  end
+
+  test "stale managed worker telemetry cannot charge its replacement attempt" do
+    {pid, _path} = managed_server()
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind-stale-telemetry", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll-stale-telemetry", operation: :enroll, args: enrollment_args()})
+
+    current_attempt = %{assignment_id: "item-1", revision: 1, generation: 2, attempt_id: "attempt-2"}
+    stale_attempt = %{current_attempt | generation: 1, attempt_id: "attempt-1"}
+    fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    :sys.replace_state(pid, fn state ->
+      assignment =
+        state.managed.data.assignments["item-1"]
+        |> Map.merge(%{phase: :active, board_state: :active, generation: 2, attempt_id: "attempt-2"})
+        |> Usage.start_source("thread-2", "attempt-2")
+
+      data = put_in(state.managed.data, [:assignments, "item-1"], assignment)
+
+      running = %{
+        pid: fake_pid,
+        ref: make_ref(),
+        session_id: nil,
+        managed_attempt: current_attempt,
+        managed_usage_source_thread_id: "thread-2",
+        codex_last_reported_input_tokens: 0,
+        codex_last_reported_output_tokens: 0,
+        codex_last_reported_total_tokens: 0
+      }
+
+      %{state | managed: %{state.managed | data: data}, running: %{"item-1" => running}}
+    end)
+
+    send(pid, {:codex_worker_update, "item-1", managed_usage_update(stale_attempt, 100, 20, 120)})
+    assert {:ok, stale_snapshot} = Control.state(pid)
+    assert stale_snapshot.assignments["item-1"][:usage] == nil
+
+    send(pid, {:codex_worker_update, "item-1", managed_usage_update(current_attempt, 100, 20, 120)})
+    assert {:ok, current_snapshot} = Control.state(pid)
+    assert current_snapshot.assignments["item-1"].usage.total_tokens == 120
+    assert current_snapshot.usage.cumulative_tokens == 120
+
+    Process.exit(fake_pid, :kill)
+  end
+
+  test "managed usage retries from the durable source watermark after a journal failure" do
+    {pid, _path} = managed_server()
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind-durable-telemetry", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll-durable-telemetry", operation: :enroll, args: enrollment_args()})
+
+    attempt = %{assignment_id: "item-1", revision: 1, generation: 1, attempt_id: "attempt-1"}
+    fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+    state = :sys.get_state(pid)
+    durable_journal = state.managed.journal
+
+    :sys.replace_state(pid, fn state ->
+      assignment =
+        state.managed.data.assignments["item-1"]
+        |> Map.merge(%{phase: :active, board_state: :active, generation: 1, attempt_id: "attempt-1"})
+        |> Usage.start_source("thread-1", "attempt-1")
+
+      data = put_in(state.managed.data, [:assignments, "item-1"], assignment)
+
+      running = %{
+        pid: fake_pid,
+        ref: make_ref(),
+        session_id: nil,
+        managed_attempt: attempt,
+        managed_usage_source_thread_id: "thread-1",
+        codex_last_reported_input_tokens: 0,
+        codex_last_reported_output_tokens: 0,
+        codex_last_reported_total_tokens: 0
+      }
+
+      %{
+        state
+        | managed: %{state.managed | data: data, journal: %{name: :missing_managed_usage_journal}},
+          running: %{"item-1" => running}
+      }
+    end)
+
+    send(pid, {:codex_worker_update, "item-1", managed_usage_update(attempt, 100, 20, 120)})
+    assert {:ok, failed_snapshot} = Control.state(pid)
+    assert failed_snapshot.assignments["item-1"][:usage] == nil
+    assert :sys.get_state(pid).running["item-1"].codex_last_reported_total_tokens == 120
+
+    :sys.replace_state(pid, fn state -> %{state | managed: %{state.managed | journal: durable_journal}} end)
+
+    send(pid, {:codex_worker_update, "item-1", managed_usage_update(attempt, 125, 25, 150)})
+    assert {:ok, recovered_snapshot} = Control.state(pid)
+    assert recovered_snapshot.assignments["item-1"].usage.total_tokens == 150
+    assert recovered_snapshot.usage.cumulative_tokens == 150
+
+    Process.exit(fake_pid, :kill)
   end
 
   test "service reconciliation supplies review facts while caller fields are ignored" do

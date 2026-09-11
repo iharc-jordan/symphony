@@ -5,6 +5,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
   alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, Workspace}
   alias SymphonyElixir.Managed.Control
+  alias SymphonyElixirWeb.ManagedStateView
   @projection_stale_after_seconds 300
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
@@ -77,21 +78,37 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp managed_payload(orchestrator, snapshot_timeout_ms, snapshot) do
     case Map.get(snapshot, :managed) do
-      managed when is_map(managed) -> managed_state_payload(managed)
-      _ -> fetch_managed_payload(orchestrator, snapshot_timeout_ms)
+      managed when is_map(managed) -> managed_state_payload(managed, snapshot)
+      _ -> fetch_managed_payload(orchestrator, snapshot_timeout_ms, snapshot)
     end
   end
 
-  defp fetch_managed_payload(orchestrator, snapshot_timeout_ms) do
+  defp fetch_managed_payload(orchestrator, snapshot_timeout_ms, snapshot) do
     case Control.state(orchestrator, snapshot_timeout_ms) do
-      {:ok, state} when is_map(state) -> managed_state_payload(state)
+      {:ok, state} when is_map(state) -> managed_state_payload(state, snapshot)
       _ -> nil
     end
   end
 
-  defp managed_state_payload(state) do
+  defp managed_state_payload(state, snapshot) do
     principals = sanitize_principals(Map.get(state, :principals, %{}))
-    assignments = sanitize_assignments(Map.get(state, :assignments, %{}), principals)
+    source_assignments = Map.get(state, :assignments, %{})
+
+    max_agents =
+      case Config.settings() do
+        {:ok, settings} -> settings.agent.max_concurrent_agents
+        _ -> nil
+      end
+
+    facts = %{max_concurrent_agents: max_agents, running_count: length(snapshot.running)}
+
+    assignments =
+      source_assignments
+      |> sanitize_assignments(principals)
+      |> Map.new(fn {id, assignment} ->
+        {id, Map.put(assignment, :wait_reason, ManagedStateView.wait_reason(Map.get(source_assignments, id, %{}), state, facts))}
+      end)
+
     paused = Map.get(state, :paused, false)
     disabled = Map.get(state, :disabled, false)
 
@@ -102,6 +119,7 @@ defmodule SymphonyElixirWeb.Presenter do
       paused: paused,
       disabled: disabled,
       dispatch_paused: paused or disabled,
+      usage: safe_usage(Map.get(state, :usage)),
       projects: sanitize_projects(Map.get(state, :projects, %{})),
       principals: principals,
       assignments: assignments,
@@ -378,9 +396,28 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp safe_usage(usage) when is_map(usage) do
     usage
-    |> Map.take([:baseline_tokens, :cumulative_tokens, :inflight_tokens, :overshoot_tokens, :cap_reached, :limit_tokens, :input_tokens, :output_tokens, :total_tokens, :seconds_running])
+    |> Map.take([
+      :baseline_tokens,
+      :cumulative_tokens,
+      :inflight_tokens,
+      :overshoot_tokens,
+      :cap_reached,
+      :limit_tokens,
+      :input_tokens,
+      :cached_input_tokens,
+      :output_tokens,
+      :total_tokens,
+      :seconds_running,
+      :telemetry_complete,
+      :runtime_complete,
+      :accounting_status
+    ])
     |> Enum.reduce(%{}, fn {key, val}, acc ->
-      if is_integer(val) or is_float(val) or is_boolean(val), do: Map.put(acc, key, val), else: acc
+      cond do
+        key == :accounting_status and val in [:known, :unavailable, "known", "unavailable"] -> Map.put(acc, key, to_string(val))
+        is_integer(val) or is_float(val) or is_boolean(val) -> Map.put(acc, key, val)
+        true -> acc
+      end
     end)
   end
 

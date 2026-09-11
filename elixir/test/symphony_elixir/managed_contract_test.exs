@@ -10,7 +10,15 @@ defmodule SymphonyElixir.Managed.ContractTest do
 
   test "shared bridge requests cover the v2 managed control surface" do
     fixture = load_fixture()
-    operations = fixture["http"] |> Map.keys() |> Enum.filter(&(&1 not in ["state", "events", "errors"])) |> Enum.sort()
+
+    operations =
+      fixture["http"]
+      |> Map.values()
+      |> Enum.filter(&(is_map(&1) and &1["method"] == "POST"))
+      |> Enum.map(& &1["body"]["operation"])
+      |> Enum.uniq()
+      |> Enum.sort()
+
     expected = ~w(bind_project register_pm claim enroll revise pause resume interrupt cancel review handoff) |> Enum.sort()
 
     assert operations == expected
@@ -78,6 +86,34 @@ defmodule SymphonyElixir.Managed.ContractTest do
       result = Rules.apply(bound, Map.put(template, "args", args), %{principal: @pm_a})
       assert match?({:ok, _, _}, result) == route_case["accepted"]
     end
+  end
+
+  test "shared peer reference example resolves a canonical attempt report" do
+    http = load_fixture()["http"]
+    bound = apply_example(Rules.new(), http["bind_project"], @operator)
+    enrolled = apply_example(bound, http["enroll"], @pm_a)
+    example = http["review_peer_refs"]
+    ref = hd(example["body"]["args"]["peer_report_refs"])
+
+    report = %{
+      attempt_id: ref["source_attempt_id"],
+      report_id: ref["report_id"],
+      kind: :checkpoint,
+      summary: "The source fixture demonstrates the failed provider interface.",
+      evidence: ["Use the verified interface documented by the fixture."]
+    }
+
+    state =
+      enrolled
+      |> put_in([:assignments, "item-one", :phase], :review)
+      |> put_in([:assignments, "item-one", :board_state], :review)
+      |> put_in([:assignments, "item-one", :reports], %{Rules.report_key(report.attempt_id, report.report_id) => report})
+
+    revised = apply_example(state, example, @pm_a)
+    assert {:ok, [finding]} = Rules.peer_report_context(revised, revised.assignments["item-one"])
+    assert finding.source_attempt_id == report.attempt_id
+    assert finding.report_id == report.report_id
+    assert finding.evidence == report.evidence
   end
 
   defp load_fixture do

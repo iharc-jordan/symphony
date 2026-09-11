@@ -91,6 +91,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Start every task by opening the tracking workpad comment and bringing it up to date before doing new implementation work.
 - Spend extra effort up front on planning and verification design before implementation.
 - Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.
+- Before dependent implementation, identify the fixture owner, pinned source/schema baseline, required tools, external resource identity, permitted operations, and existing cleanup/recovery procedure. Record a missing dependency once and continue independent work. For UI work, the PM owns a populated account fixture and early desktop/mobile review. A disposable database does not make a connected provider disposable; use the application's existing lifecycle for cleanup.
 - Keep ticket metadata current (state, checklist, acceptance criteria, links).
 - Treat a single persistent Linear comment as the source of truth for progress.
 - Use that single workpad comment for all progress and handoff notes; do not post separate "done"/summary comments.

@@ -29,6 +29,25 @@ defmodule SymphonyElixir.Managed.Rules do
   @spec allowed_operations() :: [atom()]
   def allowed_operations, do: @operations
 
+  @spec report_key(String.t(), String.t()) :: String.t()
+  def report_key(attempt_id, report_id) when is_binary(attempt_id) and is_binary(report_id) do
+    {attempt_id, report_id}
+    |> :erlang.term_to_binary()
+    |> Base.url_encode64(padding: false)
+  end
+
+  @spec peer_report_context(state(), map()) :: {:ok, [map()]} | {:unavailable, map()}
+  def peer_report_context(state, assignment) when is_map(state) and is_map(assignment) do
+    refs = get_in(assignment, [:review_feedback, :peer_report_refs]) || []
+
+    case resolve_peer_report_refs(state, assignment, refs) do
+      {:ok, reports} -> {:ok, reports}
+      {:error, code, details} -> {:unavailable, %{code: code, details: Map.take(details, [:source_assignment_id, :report_id])}}
+    end
+  end
+
+  def peer_report_context(_state, _assignment), do: {:unavailable, %{code: :peer_report_context_invalid, details: %{}}}
+
   @spec new(keyword()) :: state()
   def new(opts \\ []) do
     %{
@@ -178,7 +197,7 @@ defmodule SymphonyElixir.Managed.Rules do
     with :ok <- present(assignment_id, :assignment_id),
          {:ok, assignment} <- fetch_assignment(state, assignment_id),
          :ok <- expected_revision(state, args, {:assignment, assignment_id}),
-         :ok <- validate_review_intent(assignment, disposition, args) do
+         :ok <- validate_review_intent(state, assignment, disposition, args) do
       {:ok,
        %{
          request: Map.delete(normalized, :principal),
@@ -190,17 +209,21 @@ defmodule SymphonyElixir.Managed.Rules do
     end
   end
 
-  defp validate_review_intent(assignment, :accepted, args) do
-    with :ok <- phase_is(assignment.phase, :review) do
+  defp validate_review_intent(_state, assignment, :accepted, args) do
+    with :ok <- phase_is(assignment.phase, :review),
+         :ok <- peer_report_refs_absent?(args) do
       evidence_present(Map.get(args, :evidence, []))
     end
   end
 
-  defp validate_review_intent(_assignment, disposition, args) when disposition in [:waiting, :rework, :blocked] do
-    present(text_value(args, :reason), :reason)
+  defp validate_review_intent(state, assignment, disposition, args) when disposition in [:waiting, :rework, :blocked] do
+    with :ok <- present(text_value(args, :reason), :reason),
+         {:ok, _reports} <- resolve_peer_report_refs(state, assignment, Map.get(args, :peer_report_refs, [])) do
+      :ok
+    end
   end
 
-  defp validate_review_intent(_assignment, disposition, _args), do: {:error, :invalid_disposition, %{disposition: disposition}}
+  defp validate_review_intent(_state, _assignment, disposition, _args), do: {:error, :invalid_disposition, %{disposition: disposition}}
 
   @spec expected_revision(state(), map(), :global | {:assignment, String.t()}) ::
           :ok | {:error, atom(), map()}
@@ -925,7 +948,7 @@ defmodule SymphonyElixir.Managed.Rules do
         review_accepted(assignment, provider_state, evidence, state, context)
 
       disposition in [:waiting, :rework] ->
-        review_deferred(disposition, args)
+        review_deferred(disposition, args, state, assignment)
 
       true ->
         {:error, :invalid_disposition, %{disposition: disposition}}
@@ -946,21 +969,111 @@ defmodule SymphonyElixir.Managed.Rules do
     end
   end
 
-  defp review_deferred(disposition, args) do
+  defp review_deferred(disposition, args, state, assignment) do
     reason = text_value(args, :reason)
     evidence = Map.get(args, :evidence, [])
 
     with :ok <- present(reason, :reason),
-         :ok <- review_feedback_evidence(evidence) do
+         :ok <- review_feedback_evidence(evidence),
+         {:ok, peer_reports} <- resolve_peer_report_refs(state, assignment, Map.get(args, :peer_report_refs, [])) do
       next_phase = if disposition == :waiting, do: :waiting, else: :ready
 
-      updates = %{
-        board_state: next_phase,
-        review_feedback: %{reason: reason, evidence: evidence}
-      }
+      feedback = %{reason: reason, evidence: evidence}
 
+      feedback =
+        case peer_reports do
+          [] -> feedback
+          _ -> Map.put(feedback, :peer_report_refs, Enum.map(peer_reports, &Map.take(&1, [:source_assignment_id, :source_attempt_id, :report_id])))
+        end
+
+      updates = %{board_state: next_phase, review_feedback: feedback}
       response = %{operation: :review, disposition: disposition, reason: reason}
       {:ok, next_phase, updates, response}
+    end
+  end
+
+  defp resolve_peer_report_refs(state, target, refs) when is_map(state) and is_map(target) and is_list(refs) do
+    if length(refs) > 8 do
+      {:error, :invalid_argument, %{argument: :peer_report_refs}}
+    else
+      resolve_peer_reports(state, target, refs)
+    end
+  end
+
+  defp resolve_peer_report_refs(_state, _target, _refs), do: {:error, :invalid_argument, %{argument: :peer_report_refs}}
+
+  defp resolve_peer_reports(state, target, refs) do
+    refs
+    |> Enum.reduce_while({:ok, []}, &resolve_peer_report_ref_result(state, target, &1, &2))
+    |> deduplicate_peer_report_refs()
+  end
+
+  defp resolve_peer_report_ref_result(state, target, ref, {:ok, reports}) do
+    case resolve_peer_report_ref(state, target, ref) do
+      {:ok, report} -> {:cont, {:ok, [report | reports]}}
+      error -> {:halt, error}
+    end
+  end
+
+  defp deduplicate_peer_report_refs({:ok, reports}) do
+    reports =
+      reports
+      |> Enum.reverse()
+      |> Enum.uniq_by(&{&1.source_assignment_id, &1.source_attempt_id, &1.report_id})
+
+    {:ok, reports}
+  end
+
+  defp deduplicate_peer_report_refs(error), do: error
+
+  defp resolve_peer_report_ref(state, target, ref) when is_map(ref) do
+    source_assignment_id = text_value(ref, :source_assignment_id)
+    source_attempt_id = text_value(ref, :source_attempt_id)
+    report_id = text_value(ref, :report_id)
+
+    with :ok <- present(source_assignment_id, :peer_report_refs),
+         :ok <- present(source_attempt_id, :peer_report_refs),
+         :ok <- present(report_id, :peer_report_refs),
+         {:ok, source} <- fetch_assignment(state, source_assignment_id),
+         :ok <- peer_report_scope_allowed?(target, source),
+         %{attempt_id: ^source_attempt_id, report_id: ^report_id} = report <-
+           get_in(source, [:reports, report_key(source_attempt_id, report_id)]) do
+      {:ok,
+       %{
+         source_assignment_id: source_assignment_id,
+         source_attempt_id: source_attempt_id,
+         report_id: report_id,
+         kind: report[:kind],
+         summary: report[:summary],
+         evidence: report[:evidence] || []
+       }}
+    else
+      nil -> {:error, :peer_report_not_found, %{source_assignment_id: source_assignment_id, report_id: report_id}}
+      :error -> {:error, :peer_report_not_found, %{source_assignment_id: source_assignment_id, report_id: report_id}}
+      {:error, _code, _details} = error -> error
+      _ -> {:error, :peer_report_not_found, %{source_assignment_id: source_assignment_id, report_id: report_id}}
+    end
+  end
+
+  defp resolve_peer_report_ref(_state, _target, _ref), do: {:error, :invalid_argument, %{argument: :peer_report_refs}}
+
+  defp peer_report_scope_allowed?(target, source) do
+    target_ownership = Ownership.ownership(target)
+    source_ownership = Ownership.ownership(source)
+
+    if text_value(target, :project_id) == text_value(source, :project_id) and
+         target_ownership.status == :owned and source_ownership.status == :owned and
+         target_ownership.pm_id == source_ownership.pm_id do
+      :ok
+    else
+      {:error, :peer_report_access_denied, %{source_assignment_id: source[:assignment_id]}}
+    end
+  end
+
+  defp peer_report_refs_absent?(args) do
+    case Map.get(args, :peer_report_refs, []) do
+      [] -> :ok
+      _ -> {:error, :invalid_argument, %{argument: :peer_report_refs}}
     end
   end
 
@@ -1593,6 +1706,10 @@ defmodule SymphonyElixir.Managed.Rules do
   defp normalize_key("escalation_reason"), do: :escalation_reason
   defp normalize_key("turn_limit"), do: :turn_limit
   defp normalize_key("issue_body"), do: :issue_body
+  defp normalize_key("peer_report_refs"), do: :peer_report_refs
+  defp normalize_key("source_assignment_id"), do: :source_assignment_id
+  defp normalize_key("source_attempt_id"), do: :source_attempt_id
+  defp normalize_key("report_id"), do: :report_id
   defp normalize_key(key), do: key
 
   defp normalize_map(map) when is_map(map) do
