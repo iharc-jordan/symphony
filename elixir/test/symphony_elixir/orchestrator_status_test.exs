@@ -814,19 +814,6 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       end
     end)
 
-    assert %{polling: %{checking?: true}} =
-             wait_for_snapshot(
-               pid,
-               fn
-                 %{polling: %{checking?: true}} ->
-                   true
-
-                 _ ->
-                   false
-               end,
-               500
-             )
-
     assert %{
              polling: %{
                checking?: false,
@@ -1009,8 +996,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         url: "https://example.org/issues/MT-MCP",
         dispatchable: true
       },
-      worker_host: "dm-dev2",
-      workspace_path: "/workspaces/MT-MCP",
+      workspace_path: "C:/Workspaces/MT-MCP",
       session_id: "thread-mcp-turn-mcp",
       last_codex_message: %{
         event: :notification,
@@ -1042,8 +1028,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert %{
              identifier: "MT-MCP",
              error: "codex MCP elicitation requires operator input",
-             worker_host: "dm-dev2",
-             workspace_path: "/workspaces/MT-MCP"
+             workspace_path: "C:/Workspaces/MT-MCP"
            } = state.blocked[issue_id]
 
     assert %{

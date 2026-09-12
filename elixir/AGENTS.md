@@ -1,17 +1,17 @@
-# Symphony Elixir
+# Codex Orchestration Symphony
 
-This directory contains the Elixir agent orchestration service that polls Linear, creates per-issue workspaces, and runs Codex in app-server mode.
+This directory contains the Windows 11 x64 Symphony scheduler used by Codex Orchestration. It creates local per-assignment workspaces and runs Codex in app-server mode.
 
 ## Environment
 
-- Elixir: `1.19.x` (OTP 28) via `mise`.
+- Elixir: `1.19.x` on OTP 28. Release builds run natively on Windows x64.
 - Install deps: `mix setup`.
 - Main quality gate: `make all` (format check, lint, coverage, dialyzer).
 
 
 ## Codebase-Specific Conventions
 
-- Runtime config is loaded from `WORKFLOW.md` front matter via `SymphonyElixir.Workflow` and `SymphonyElixir.Config`.
+- Policy and prompts are loaded from `WORKFLOW.md`; the installed launcher supplies resolved absolute machine paths before supervisors start.
 - Keep the implementation aligned with [`../SPEC.md`](../SPEC.md) where practical.
   - The implementation may be a superset of the spec.
   - The implementation must not conflict with the spec.
@@ -21,6 +21,7 @@ This directory contains the Elixir agent orchestration service that polls Linear
 - Workspace safety is critical:
   - Never run Codex turn cwd in source repo.
   - Workspaces must stay under configured workspace root.
+  - Reject reparse-point, case, drive, root, and outside-root escapes on every create, reuse, and delete.
 - Orchestrator behavior is stateful and concurrency-sensitive; preserve retry, reconciliation, and cleanup semantics.
 - Simplicity is a project constraint: prefer the smallest coherent design with one clear owner and
   invariant. Push back on extra abstractions, duplicated policy, and speculative flexibility.
@@ -33,8 +34,7 @@ Run targeted tests while iterating, then run full gates before handoff.
 
 - Prefer narrow tests that exercise real OTP processes and observable behavior over mock-only or
   broad end-to-end coverage; prove health with a synchronous call or stable effect, not only a PID.
-- For non-trivial changes, use an adversarial review early to challenge complexity and try to break
-  adjacent lifecycle paths; a reproducible failure blocks landing even if other reviews are clean.
+- For non-trivial changes, exercise concrete adjacent lifecycle failures; a reproducible failure blocks landing.
 - If tests need repeated global restarts or bespoke cleanup, first fix the shared harness or
   ownership boundary.
 

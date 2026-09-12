@@ -25,6 +25,13 @@ defmodule SymphonyElixir.TestSupport do
         only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
 
       setup do
+        previous_worker_host = System.get_env("SYMPHONY_WINDOWS_WORKER_HOST")
+        worker_host = Path.expand("native/symphony_worker_host/target/debug/symphony-worker-host.exe")
+
+        if File.regular?(worker_host) do
+          System.put_env("SYMPHONY_WINDOWS_WORKER_HOST", worker_host)
+        end
+
         workflow_root =
           Path.join(
             System.tmp_dir!(),
@@ -42,6 +49,7 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :workflow_file_path)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+          SymphonyElixir.TestSupport.restore_env("SYMPHONY_WINDOWS_WORKER_HOST", previous_worker_host)
           File.rm_rf(workflow_root)
         end)
 
@@ -101,14 +109,12 @@ defmodule SymphonyElixir.TestSupport do
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
-          worker_ssh_hosts: [],
-          worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
-          codex_command: "codex app-server",
-          codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
+          codex_launcher: Path.join([System.get_env("APPDATA") || System.tmp_dir!(), "npm", "codex.cmd"]),
+          codex_approval_policy: "never",
           codex_thread_sandbox: "workspace-write",
           codex_turn_sandbox_policy: nil,
           codex_turn_timeout_ms: 3_600_000,
@@ -139,13 +145,11 @@ defmodule SymphonyElixir.TestSupport do
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
-    worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
-    worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
-    codex_command = Keyword.get(config, :codex_command)
+    codex_launcher = Keyword.get(config, :codex_launcher)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
     codex_turn_sandbox_policy = Keyword.get(config, :codex_turn_sandbox_policy)
@@ -180,14 +184,13 @@ defmodule SymphonyElixir.TestSupport do
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
-        worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "codex:",
-        "  command: #{yaml_value(codex_command)}",
+        "  launcher: #{yaml_value(codex_launcher)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",
         "  thread_sandbox: #{yaml_value(codex_thread_sandbox)}",
         "  turn_sandbox_policy: #{yaml_value(codex_turn_sandbox_policy)}",
@@ -206,7 +209,7 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value) when is_binary(value) do
-    "\"" <> String.replace(value, "\"", "\\\"") <> "\""
+    "\"" <> (value |> String.replace("\\", "/") |> String.replace("\"", "\\\"")) <> "\""
   end
 
   defp yaml_value(value) when is_integer(value), do: to_string(value)
@@ -239,21 +242,6 @@ defmodule SymphonyElixir.TestSupport do
       hook_entry("before_remove", hook_before_remove)
     ]
     |> Enum.reject(&is_nil/1)
-    |> Enum.join("\n")
-  end
-
-  defp worker_yaml(ssh_hosts, max_concurrent_agents_per_host)
-       when ssh_hosts in [nil, []] and is_nil(max_concurrent_agents_per_host),
-       do: nil
-
-  defp worker_yaml(ssh_hosts, max_concurrent_agents_per_host) do
-    [
-      "worker:",
-      ssh_hosts not in [nil, []] && "  ssh_hosts: #{yaml_value(ssh_hosts)}",
-      !is_nil(max_concurrent_agents_per_host) &&
-        "  max_concurrent_agents_per_host: #{yaml_value(max_concurrent_agents_per_host)}"
-    ]
-    |> Enum.reject(&(&1 in [nil, false]))
     |> Enum.join("\n")
   end
 

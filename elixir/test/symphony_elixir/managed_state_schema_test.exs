@@ -4,9 +4,10 @@ defmodule SymphonyElixir.ManagedStateSchemaTest do
   alias SymphonyElixir.Managed.{Journal, Rules}
 
   test "starts from the current managed-state schema without rewriting its journal record" do
-    path = journal_path("v2")
+    path = store_path("v2")
     state = terminal_state()
     configure_managed_journal!(path)
+    assert SymphonyElixir.PathSafety.same_path?(Config.managed_store_path(), path)
 
     assert {:ok, journal, %{}} = Journal.open(path)
     assert :ok = Journal.append(journal, state)
@@ -27,14 +28,16 @@ defmodule SymphonyElixir.ManagedStateSchemaTest do
     assert loaded.assignments == state.assignments
     assert loaded.requests == state.requests
 
+    :ok = GenServer.stop(pid)
     assert {:ok, reopened, ^state} = Journal.open(path)
     assert :ok = Journal.close(reopened)
   end
 
   test "rejects managed-state version one without appending a replacement record" do
-    path = journal_path("v1")
+    path = store_path("v1")
     state = %{version: 1, control_revision: 4, assignments: %{"old" => %{phase: :accepted}}}
     configure_managed_journal!(path)
+    assert SymphonyElixir.PathSafety.same_path?(Config.managed_store_path(), path)
 
     assert {:ok, journal, %{}} = Journal.open(path)
     assert :ok = Journal.append(journal, state)
@@ -79,8 +82,9 @@ defmodule SymphonyElixir.ManagedStateSchemaTest do
     )
   end
 
-  defp configure_managed_journal!(journal_path) do
+  defp configure_managed_journal!(store_path) do
     path = Workflow.workflow_file_path()
+    store_path = String.replace(store_path, "\\", "/")
 
     workflow =
       path
@@ -91,11 +95,8 @@ defmodule SymphonyElixir.ManagedStateSchemaTest do
         ---
         managed:
           enabled: true
-          journal_path: "#{journal_path}"
+          store_path: "#{store_path}"
           control_token: "managed-state-schema-token"
-          checkout_node: "/bin/true"
-          checkout_helper_path: "/tmp/managed-state-schema-helper"
-          checkout_policy_file: "/tmp/managed-state-schema-policy"
         """,
         global: false
       )
@@ -104,6 +105,6 @@ defmodule SymphonyElixir.ManagedStateSchemaTest do
     WorkflowStore.force_reload()
   end
 
-  defp journal_path(label), do: Path.join(System.tmp_dir!(), "managed-state-schema-#{label}-#{System.unique_integer([:positive])}.log")
+  defp store_path(label), do: Path.join(System.tmp_dir!(), "managed-state-schema-#{label}-#{System.unique_integer([:positive])}.sqlite3")
   defp unique_name(label), do: Module.concat(__MODULE__, String.to_atom("#{label}_#{System.unique_integer([:positive])}"))
 end

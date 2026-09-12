@@ -18,8 +18,6 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
-  @type worker_host :: String.t() | nil
-
   @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:continue, Issue.t()} | {:done, Issue.t()} | {:error, term()}
@@ -30,12 +28,9 @@ defmodule SymphonyElixir.AgentRunner do
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
-    # The orchestrator owns host retries so one worker lifetime never hops machines.
-    worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
+    result = run_local(issue, codex_update_recipient, opts)
 
-    Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
-
-    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+    case result do
       :ok ->
         :ok
 
@@ -50,10 +45,10 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
-    Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
+  defp run_local(issue, codex_update_recipient, opts) do
+    Logger.info("Starting local Windows worker attempt for #{issue_context(issue)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
+    case Workspace.create_for_issue(issue) do
       {:ok, workspace} ->
         try do
           with :ok <- invoke_workspace_preparer(workspace, opts),
@@ -61,15 +56,14 @@ defmodule SymphonyElixir.AgentRunner do
                  send_worker_runtime_info(
                    codex_update_recipient,
                    issue,
-                   worker_host,
                    workspace,
                    Keyword.get(opts, :managed_attempt)
                  ),
-               :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+               :ok <- Workspace.run_before_run_hook(workspace, issue) do
+            run_codex_turns(workspace, issue, codex_update_recipient, opts)
           end
         after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+          Workspace.run_after_run_hook(workspace, issue)
         end
 
       {:error, reason} ->
@@ -98,13 +92,13 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp maybe_scope_update(message, _managed_attempt), do: message
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace, managed_attempt)
+  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, workspace, managed_attempt)
        when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
     send(
       recipient,
       {:worker_runtime_info, issue_id,
        %{
-         worker_host: worker_host,
+         worker_host: nil,
          workspace_path: workspace
        }
        |> maybe_scope_runtime_info(managed_attempt)}
@@ -113,7 +107,7 @@ defmodule SymphonyElixir.AgentRunner do
     :ok
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _managed_attempt), do: :ok
+  defp send_worker_runtime_info(_recipient, _issue, _workspace, _managed_attempt), do: :ok
 
   defp invoke_workspace_preparer(workspace, opts) when is_binary(workspace) do
     preparer = Keyword.get(opts, :workspace_preparer)
@@ -148,13 +142,13 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp maybe_scope_runtime_info(runtime_info, _managed_attempt), do: runtime_info
 
-  defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
+  defp run_codex_turns(workspace, issue, codex_update_recipient, opts) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     remaining_turns = Keyword.get(opts, :remaining_turns, max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
     on_session = Keyword.get(opts, :on_session, &default_callback/1)
     before_turn = Keyword.get(opts, :before_turn, &default_callback/1)
-    app_server_opts = app_server_opts(opts, worker_host)
+    app_server_opts = app_server_opts(opts)
 
     runner_context = %{
       codex_update_recipient: codex_update_recipient,
@@ -319,7 +313,7 @@ defmodule SymphonyElixir.AgentRunner do
     {:error, {:session_stop_failed, stop_reason}}
   end
 
-  defp app_server_opts(opts, worker_host) do
+  defp app_server_opts(opts) do
     opts
     |> Keyword.take([
       :managed_attempt,
@@ -329,7 +323,6 @@ defmodule SymphonyElixir.AgentRunner do
       :resume_thread_id,
       :report_callback
     ])
-    |> Keyword.put(:worker_host, worker_host)
   end
 
   defp before_turn_context(session, workspace, issue, turn_number, max_turns) do
@@ -418,25 +411,6 @@ defmodule SymphonyElixir.AgentRunner do
   defp issue_routable?(%Issue{} = issue) do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
   end
-
-  defp selected_worker_host(nil, []), do: nil
-
-  defp selected_worker_host(preferred_host, configured_hosts) when is_list(configured_hosts) do
-    hosts =
-      configured_hosts
-      |> Enum.map(&String.trim/1)
-      |> Enum.reject(&(&1 == ""))
-      |> Enum.uniq()
-
-    case preferred_host do
-      host when is_binary(host) and host != "" -> host
-      _ when hosts == [] -> nil
-      _ -> List.first(hosts)
-    end
-  end
-
-  defp worker_host_for_log(nil), do: "local"
-  defp worker_host_for_log(worker_host), do: worker_host
 
   defp normalize_issue_state(state_name) when is_binary(state_name) do
     state_name

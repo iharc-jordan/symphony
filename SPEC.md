@@ -487,10 +487,11 @@ hand-maintained enum in this spec. To inspect the installed Codex schema, run
 by `v2/ThreadStartParams.json` and `v2/TurnStartParams.json`. Implementations MAY validate these
 fields locally if they want stricter startup checks.
 
-- `command` (string shell command)
-  - Default: `codex app-server`
-  - The runtime launches this command via `bash -lc` in the workspace directory.
-  - The launched process MUST speak a compatible app-server protocol over stdio.
+- `launcher` (absolute Windows path)
+  - Default: `%APPDATA%\npm\codex.cmd`.
+  - An explicit override MUST be an absolute path naming `codex.cmd`.
+  - The runtime constructs the fixed App Server arguments; workflow content cannot supply a shell
+    command or arbitrary launcher arguments.
 - `approval_policy` (Codex `AskForApproval` value)
   - Default: implementation-defined.
 - `thread_sandbox` (Codex `SandboxMode` value)
@@ -615,7 +616,7 @@ Validation checks:
 - `tracker.kind` is present and supported.
 - The selected adapter accepts `tracker.provider` after documented defaults and `$VAR`
   resolution.
-- `codex.command` is present and non-empty.
+- `codex.launcher` resolves to an absolute path naming `codex.cmd`.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
@@ -639,7 +640,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
-- `codex.command`: shell command string, default `codex app-server`
+- `codex.launcher`: absolute Windows `codex.cmd` path, default `%APPDATA%\npm\codex.cmd`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
@@ -927,10 +928,8 @@ Supported hooks:
 
 Execution contract:
 
-- Execute in a local shell context appropriate to the host OS, with the workspace directory as
-  `cwd`.
-- On POSIX systems, `sh -lc <script>` (or a stricter equivalent such as `bash -lc <script>`) is a
-  conforming default.
+- Execute as a non-interactive PowerShell command with the workspace directory as `cwd`.
+- Run the hook process tree in the same owned Windows Job Object boundary used for Codex workers.
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
 - Log hook start, failures, and timeouts.
 
@@ -983,14 +982,16 @@ Protocol source of truth:
 
 Subprocess launch parameters:
 
-- Command: `codex.command`
-- Invocation: `bash -lc <codex.command>`
+- Launcher: `codex.launcher`
+- Invocation: the runtime-owned structured Windows command processor invocation of
+  `<codex.launcher> app-server`; managed workers add only the fixed
+  `-c features.multi_agent=false -c features.multi_agent_v2=false` arguments.
 - Working directory: workspace path
 - Transport/framing: the protocol transport required by the targeted Codex app-server version
 
 Notes:
 
-- The default command is `codex app-server`.
+- The default launcher is `%APPDATA%\npm\codex.cmd`.
 - Approval policy, sandbox policy, cwd, prompt input, and OPTIONAL tool declarations are supplied
   using fields supported by the targeted Codex app-server version.
 
@@ -1119,7 +1120,7 @@ Optional provider-native agent tool extension:
   without teaching the orchestrator provider semantics.
 - Tracker credentials SHOULD NOT be inherited by the coding-agent child process. An adapter that
   resolves credentials from environment variables MUST declare authentication-related environment
-  names for removal from local and remote child environments. Implementations SHOULD consult current
+  names for removal from local child environments. Implementations SHOULD consult current
   provider and client documentation when identifying credential names and aliases, as these can
   change over time. Literal credentials in a repo-owned `WORKFLOW.md` remain readable to a child
   with workspace access and SHOULD NOT be used when this isolation matters.
@@ -1576,7 +1577,7 @@ Minimum endpoints:
       "issue_id": "abc123",
       "status": "running",
       "workspace": {
-        "path": "/tmp/symphony_workspaces/MT-649"
+        "path": "C:\\\\ProgramData\\\\CodexOrchestration\\\\workspaces\\\\w-a83f5d41f552ab7c62d3511c"
       },
       "attempts": {
         "restart_count": 1,
@@ -1768,13 +1769,13 @@ RECOMMENDED additional hardening for ports:
 - Execute provider-native tracker tools in the Symphony host process with the configured adapter
   credential.
 - Do not pass tracker credentials through the coding-agent child environment. Adapters MUST declare
-  secret environment names so local and remote launchers can remove them from child environments.
+  secret environment names so the local launcher can remove them from child environments.
 - Do not place literal tracker credentials in a repo-owned `WORKFLOW.md` when the child can read
   that workspace; use host-side secret references instead.
 
 ### 15.4 Hook Script Safety
 
-Workspace hooks are arbitrary shell scripts from `WORKFLOW.md`.
+Workspace hooks are arbitrary PowerShell scripts from `WORKFLOW.md`.
 
 Implications:
 
@@ -2093,7 +2094,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `tracker.provider` preserves adapter-owned keys and validates them through the selected adapter
 - `$VAR` resolution works for documented adapter secret keys and path values
 - `~` path expansion works
-- `codex.command` is preserved as a shell command string
+- `codex.launcher` accepts only an absolute path naming `codex.cmd`
 - Per-state concurrency override map normalizes state names and ignores invalid values
 - Prompt template renders `issue` and `attempt`
 - Prompt rendering fails on unknown variables (strict mode)
@@ -2168,7 +2169,8 @@ never dispatchable. GitHub issue blockers are terminal only when their underlyin
 
 ### 17.5 Coding-Agent App-Server Client
 
-- Launch command uses workspace cwd and invokes `bash -lc <codex.command>`
+- Fixed Windows App Server launch uses the workspace cwd and the validated absolute `codex.cmd`
+  path
 - Session startup follows the targeted Codex app-server protocol.
 - Client identity/capability payloads are valid when the targeted Codex app-server protocol requires
   them.
@@ -2249,7 +2251,7 @@ Use the same validation profiles as Section 17:
 - Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
 - Hook timeout config (`hooks.timeout_ms`, default `60000`)
 - Coding-agent app-server subprocess client with the targeted transport/framing protocol
-- Codex launch command config (`codex.command`, default `codex app-server`)
+- Codex launcher config (`codex.launcher`, default `%APPDATA%\npm\codex.cmd`)
 - Strict prompt rendering with `issue` and `attempt` variables
 - Exponential retry queue with continuation retries after normal exit
 - Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
@@ -2277,70 +2279,7 @@ Use the same validation profiles as Section 17:
 - If the OPTIONAL HTTP server is shipped, verify the configured port behavior and loopback/default
   bind expectations on the target environment.
 
-## Appendix A. SSH Worker Extension (OPTIONAL)
-
-This appendix describes a common extension profile in which Symphony keeps one central
-orchestrator but executes worker runs on one or more remote hosts over SSH.
-
-Extension config:
-
-- `worker.ssh_hosts` (list of SSH host strings, OPTIONAL)
-  - When omitted, work runs locally.
-- `worker.max_concurrent_agents_per_host` (positive integer, OPTIONAL)
-  - Shared per-host cap applied across configured SSH hosts.
-
-### A.1 Execution Model
-
-- The orchestrator remains the single source of truth for polling, claims, retries, and
-  reconciliation.
-- `worker.ssh_hosts` provides the candidate SSH destinations for remote execution.
-- Each worker run is assigned to one host at a time, and that host becomes part of the run's
-  effective execution identity along with the issue workspace.
-- `workspace.root` is interpreted on the remote host, not on the orchestrator host.
-- The coding-agent app-server is launched over SSH stdio instead of as a local subprocess, so the
-  orchestrator still owns the session lifecycle even though commands execute remotely.
-- Continuation turns inside one worker lifetime SHOULD stay on the same host and workspace.
-- A remote host SHOULD satisfy the same basic contract as a local worker environment: reachable
-  shell, writable workspace root, coding-agent executable, and any required auth or repository
-  prerequisites.
-
-### A.2 Scheduling Notes
-
-- SSH hosts MAY be treated as a pool for dispatch.
-- Implementations MAY prefer the previously used host on retries when that host is still
-  available.
-- `worker.max_concurrent_agents_per_host` is an OPTIONAL shared per-host cap across configured SSH
-  hosts.
-- When all SSH hosts are at capacity, dispatch SHOULD wait rather than silently falling back to a
-  different execution mode.
-- Implementations MAY fail over to another host when the original host is unavailable before work
-  has meaningfully started.
-- Once a run has already produced side effects, a transparent rerun on another host SHOULD be
-  treated as a new attempt, not as invisible failover.
-
-### A.3 Problems to Consider
-
-- Remote environment drift:
-  - Each host needs the expected shell environment, coding-agent executable, auth, and repository
-    prerequisites.
-- Workspace locality:
-  - Workspaces are usually host-local, so moving an issue to a different host is typically a cold
-    restart unless shared storage exists.
-- Path and command safety:
-  - Remote path resolution, shell quoting, and workspace-boundary checks matter more once execution
-    crosses a machine boundary.
-- Startup and failover semantics:
-  - Implementations SHOULD distinguish host-connectivity/startup failures from in-workspace agent
-    failures so the same ticket is not accidentally re-executed on multiple hosts.
-- Host health and saturation:
-  - A dead or overloaded host SHOULD reduce available capacity, not cause duplicate execution or an
-    accidental fallback to local work.
-- Cleanup and observability:
-  - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
-    happened on the right machine.
-
-
-## Appendix B. Optional managed PM control profile
+## Appendix A. Optional managed PM control profile
 
 An implementation MAY expose a managed control plane in addition to tracker polling.
 This profile MUST preserve the single authoritative orchestrator and its durable journal.

@@ -4,14 +4,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, WindowsWorkerHost, Workspace}
 
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
   @thread_resume_id 4
   @turn_interrupt_id 5
-  @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @managed_default_model "gpt-5.6-luna"
   @managed_default_effort "xhigh"
@@ -21,11 +20,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   You are a Symphony managed worker. The current managed assignment and its latest revision are your work authority. Work only within that assignment and its owned checkout and resources. Ignore inherited scrum-master or delegation guidance: do not create, delegate, or accept other work. Report checkpoints, context needs, and the final result through orchestration_report; stop acting after a terminal report.
   """
   @report_kinds ["result", "checkpoint", "context_needed"]
-  @stop_term_timeout_ms 500
-  @stop_kill_timeout_ms 500
-  @stop_poll_ms 10
   @stop_read_timeout_ms 10_000
-  @scope_identity_timeout_ms 5_000
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -34,7 +29,6 @@ defmodule SymphonyElixir.Codex.AppServer do
           turn_sandbox_policy: map(),
           thread_id: String.t(),
           workspace: Path.t(),
-          worker_host: String.t() | nil,
           dynamic_tool_binding: map(),
           managed_attempt: map() | nil,
           thread_model: String.t() | nil,
@@ -345,22 +339,19 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
-    worker_host = Keyword.get(opts, :worker_host)
     dynamic_tool_binding = DynamicTool.bind()
 
-    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace),
          {:ok, managed_config} <- managed_config(opts),
          {:ok, resume_thread_id} <- resume_thread_id(opts),
-         :ok <- validate_managed_worker_host(worker_host, managed_config),
-         :ok <- validate_managed_runtime(worker_host, managed_config),
-         {:ok, port} <-
-           start_port(expanded_workspace, worker_host, dynamic_tool_binding, managed_config) do
-      metadata = port_metadata(port, worker_host, managed_config, expanded_workspace)
+         :ok <- validate_managed_runtime(managed_config),
+         {:ok, port, metadata} <-
+           start_port(expanded_workspace, dynamic_tool_binding, managed_config) do
       dynamic_tool_binding = bind_managed_report(dynamic_tool_binding, managed_config)
       wire_route = wire_route(opts, managed_config)
 
       with :ok <- validate_managed_metadata(metadata, managed_config),
-           {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+           {:ok, session_policies} <- session_policies(expanded_workspace),
            {:ok, thread_info} <-
              do_start_session(
                port,
@@ -379,7 +370,6 @@ defmodule SymphonyElixir.Codex.AppServer do
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_info.thread_id,
            workspace: expanded_workspace,
-           worker_host: worker_host,
            dynamic_tool_binding: dynamic_tool_binding,
            managed_attempt: managed_attempt_identity(managed_config),
            thread_model: thread_info.model,
@@ -483,7 +473,23 @@ defmodule SymphonyElixir.Codex.AppServer do
              }}
 
           {:error, reason} ->
+            {reason, interruption_drained?} = normalize_turn_error(reason)
+
             Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
+
+            # Ask the protocol endpoint to stop before the Windows Job Object
+            # is closed. The bounded drain preserves the existing ten-second
+            # shutdown window; only then can owned-job termination occur. A
+            # terminal managed report drains in its request handler so the
+            # same completed turn is never interrupted and drained twice.
+            maybe_interrupt_and_drain_turn(
+              port,
+              on_message,
+              metadata,
+              thread_id,
+              turn_id,
+              interruption_drained?
+            )
 
             emit_message(
               on_message,
@@ -528,7 +534,6 @@ defmodule SymphonyElixir.Codex.AppServer do
         metadata: metadata,
         thread_id: thread_id,
         workspace: workspace,
-        worker_host: worker_host,
         managed_attempt: managed_attempt,
         thread_model: thread_model,
         turn_model: turn_model,
@@ -538,7 +543,6 @@ defmodule SymphonyElixir.Codex.AppServer do
     %{
       thread_id: thread_id,
       workspace: workspace,
-      worker_host: worker_host,
       managed_attempt: managed_attempt,
       thread_model: thread_model,
       turn_model: turn_model,
@@ -548,193 +552,47 @@ defmodule SymphonyElixir.Codex.AppServer do
     }
   end
 
-  defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
-    expanded_workspace = Path.expand(workspace)
-    expanded_root = Config.local_workspace_root()
-    expanded_root_prefix = expanded_root <> "/"
+  defp validate_workspace_cwd(workspace) when is_binary(workspace) do
+    case Workspace.validate_owned_workspace(workspace) do
+      {:ok, canonical_workspace} -> {:ok, canonical_workspace}
+      {:error, reason} -> {:error, {:invalid_workspace_cwd, reason}}
+    end
+  end
 
-    with {:ok, canonical_workspace} <- PathSafety.canonicalize(expanded_workspace),
-         {:ok, canonical_root} <- PathSafety.canonicalize(expanded_root) do
-      canonical_root_prefix = canonical_root <> "/"
+  defp start_port(workspace, dynamic_tool_binding, managed_config) do
+    with {:ok, executable, arguments} <- local_launch(workspace, dynamic_tool_binding, managed_config) do
+      WindowsWorkerHost.start(
+        workspace,
+        executable,
+        arguments,
+        managed_attempt_identity(managed_config),
+        tracker_secret_port_env(dynamic_tool_binding)
+      )
+    end
+  end
 
-      cond do
-        canonical_workspace == canonical_root ->
-          {:error, {:invalid_workspace_cwd, :workspace_root, canonical_workspace}}
+  defp local_launch(workspace, dynamic_tool_binding, managed_config) do
+    launcher = Config.settings!().codex.launcher
+    _ = {workspace, dynamic_tool_binding}
 
-        String.starts_with?(canonical_workspace <> "/", canonical_root_prefix) ->
-          {:ok, canonical_workspace}
-
-        String.starts_with?(expanded_workspace <> "/", expanded_root_prefix) ->
-          {:error, {:invalid_workspace_cwd, :symlink_escape, expanded_workspace, canonical_root}}
-
-        true ->
-          {:error, {:invalid_workspace_cwd, :outside_workspace_root, canonical_workspace, canonical_root}}
-      end
+    with true <- is_binary(launcher) and File.regular?(launcher),
+         command_processor when is_binary(command_processor) <-
+           System.get_env("ComSpec") || System.get_env("COMSPEC"),
+         true <- File.regular?(command_processor) do
+      codex_arguments = if is_map(managed_config), do: ["app-server" | managed_cli_overrides()], else: ["app-server"]
+      payload = "\"\"" <> launcher <> "\" " <> Enum.join(codex_arguments, " ") <> "\""
+      {:ok, command_processor, ["/d", "/s", "/c", payload]}
     else
-      {:error, {:path_canonicalize_failed, path, reason}} ->
-        {:error, {:invalid_workspace_cwd, :path_unreadable, path, reason}}
+      _ -> {:error, :codex_launcher_unavailable}
     end
-  end
-
-  defp validate_workspace_cwd(workspace, worker_host)
-       when is_binary(workspace) and is_binary(worker_host) do
-    cond do
-      String.trim(workspace) == "" ->
-        {:error, {:invalid_workspace_cwd, :empty_remote_workspace, worker_host}}
-
-      String.contains?(workspace, ["\n", "\r", <<0>>]) ->
-        {:error, {:invalid_workspace_cwd, :invalid_remote_workspace, worker_host, workspace}}
-
-      true ->
-        {:ok, workspace}
-    end
-  end
-
-  defp start_port(workspace, nil, dynamic_tool_binding, managed_config) do
-    executable = System.find_executable("bash")
-
-    if is_nil(executable) do
-      {:error, :bash_not_found}
-    else
-      port =
-        Port.open(
-          {:spawn_executable, String.to_charlist(executable)},
-          [
-            :binary,
-            :exit_status,
-            :stderr_to_stdout,
-            args: [
-              ~c"-lc",
-              String.to_charlist(local_launch_command(workspace, dynamic_tool_binding, managed_config))
-            ],
-            cd: String.to_charlist(workspace),
-            env: tracker_secret_port_env(dynamic_tool_binding),
-            line: @port_line_bytes
-          ]
-        )
-
-      {:ok, port}
-    end
-  end
-
-  defp start_port(workspace, worker_host, dynamic_tool_binding, managed_config)
-       when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace, dynamic_tool_binding, managed_config)
-    SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
-  end
-
-  defp local_launch_command(workspace, dynamic_tool_binding, managed_config) do
-    launch_command = Config.settings!().codex.command
-
-    process_command =
-      case managed_config do
-        %{} ->
-          managed_process_wrapper(workspace, launch_command <> managed_cli_overrides(), managed_config)
-
-        nil ->
-          "exec #{launch_command}"
-      end
-
-    [
-      tracker_secret_unset_command(dynamic_tool_binding),
-      process_command
-    ]
-    |> Enum.reject(&is_nil/1)
-    |> Enum.join(" && ")
-  end
-
-  defp remote_launch_command(workspace, dynamic_tool_binding, managed_config)
-       when is_binary(workspace) do
-    launch_command = Config.settings!().codex.command
-
-    launch_command =
-      case managed_config do
-        %{} -> launch_command <> managed_cli_overrides()
-        nil -> launch_command
-      end
-
-    [
-      "cd #{shell_escape(workspace)}",
-      tracker_secret_unset_command(dynamic_tool_binding),
-      "exec #{launch_command}"
-    ]
-    |> Enum.reject(&is_nil/1)
-    |> Enum.join(" && ")
-  end
-
-  defp managed_process_wrapper(workspace, launch_command, managed_config) do
-    unit = systemd_unit_for_managed(workspace, managed_config)
-    parent_properties = systemd_parent_properties()
-
-    [
-      "exec systemd-run --user --scope --quiet --collect --unit=#{unit}",
-      parent_properties,
-      "-- #{launch_command}"
-    ]
-    |> Enum.reject(&(&1 == ""))
-    |> Enum.join(" ")
   end
 
   # Symphony owns delegation. All ordinary host tools and configured permission
   # policies remain available to the assigned worker.
-  defp managed_cli_overrides, do: " -c agents.enabled=false"
-
-  defp systemd_unit_for_managed(workspace, %{attempt: attempt, unit_nonce: unit_nonce})
-       when is_binary(workspace) and is_binary(unit_nonce) do
-    unit_identity = [
-      workspace,
-      attempt.assignment_id,
-      to_string(attempt.revision),
-      Integer.to_string(attempt.generation),
-      attempt.attempt_id,
-      unit_nonce
-    ]
-
-    digest =
-      unit_identity
-      |> Enum.join("\0")
-      |> then(&:crypto.hash(:sha256, &1))
-      |> Base.encode16(case: :lower)
-      |> binary_part(0, 16)
-
-    "symphony-managed-#{digest}.scope"
-  end
-
-  defp systemd_unit_for_managed(workspace, _managed_config) when is_binary(workspace) do
-    systemd_unit_for_workspace(workspace)
-  end
-
-  defp systemd_unit_for_workspace(workspace) when is_binary(workspace) do
-    digest = :crypto.hash(:sha256, workspace) |> Base.encode16(case: :lower) |> binary_part(0, 16)
-    "symphony-managed-#{digest}.scope"
-  end
-
-  defp systemd_parent_properties do
-    case systemd_parent_service_unit() do
-      nil -> ""
-      unit -> "--property=BindsTo=#{shell_escape(unit)} --property=PartOf=#{shell_escape(unit)}"
-    end
-  end
-
-  defp systemd_parent_service_unit do
-    configured = System.get_env("SYMPHONY_SYSTEMD_PARENT_UNIT")
-
-    if is_binary(configured) and String.trim(configured) != "" do
-      String.trim(configured)
-    else
-      case File.read("/proc/self/cgroup") do
-        {:ok, cgroup} ->
-          cgroup
-          |> String.trim()
-          |> String.split("/", trim: true)
-          |> Enum.filter(&String.ends_with?(&1, ".service"))
-          |> Enum.reject(&String.starts_with?(&1, "user@"))
-          |> List.last()
-
-        _ ->
-          nil
-      end
-    end
+  @doc false
+  @spec managed_cli_overrides() :: [String.t()]
+  def managed_cli_overrides do
+    ["-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false"]
   end
 
   defp tracker_secret_port_env(dynamic_tool_binding) do
@@ -743,280 +601,37 @@ defmodule SymphonyElixir.Codex.AppServer do
     |> Enum.map(fn name -> {String.to_charlist(name), false} end)
   end
 
-  defp tracker_secret_unset_command(dynamic_tool_binding) do
-    case dynamic_tool_binding.secret_environment_names |> valid_environment_names() do
-      [] -> nil
-      names -> "unset " <> Enum.join(names, " ")
-    end
-  end
-
   defp valid_environment_names(names) do
     Enum.filter(names, fn name ->
       is_binary(name) and String.match?(name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/)
     end)
   end
 
-  defp port_metadata(port, worker_host, managed_config, workspace) when is_port(port) do
-    base_metadata =
-      case :erlang.port_info(port, :os_pid) do
-        {:os_pid, os_pid} -> process_port_metadata(os_pid, worker_host, managed_config, workspace)
-        _ -> managed_scope_metadata(worker_host, managed_config, workspace)
-      end
-
-    case worker_host do
-      host when is_binary(host) -> Map.put(base_metadata, :worker_host, host)
-      _ -> base_metadata
-    end
-  end
-
-  defp process_port_metadata(os_pid, nil, managed_config, workspace) when is_map(managed_config) do
-    unit = systemd_unit_for_managed(workspace, managed_config)
-
-    metadata = %{
-      codex_app_server_pid: to_string(os_pid),
-      systemd_unit: unit,
-      systemd_unit_identity: managed_unit_identity(managed_config),
-      parent_systemd_service: systemd_parent_service_unit()
-    }
-
-    add_scope_identity(metadata, process_identity(os_pid), await_systemd_scope_identity(unit, os_pid))
-  end
-
-  defp process_port_metadata(os_pid, _worker_host, _managed_config, _workspace) do
-    %{codex_app_server_pid: to_string(os_pid), containment: :remote_unverified}
-  end
-
-  defp add_scope_identity(metadata, {:ok, identity}, {:ok, scope_identity}) do
-    metadata
-    |> add_process_identity({:ok, identity})
-    |> Map.merge(%{containment: :systemd_scope, systemd_invocation_id: scope_identity.invocation_id})
-  end
-
-  defp add_scope_identity(metadata, process_result, scope_result) do
-    metadata
-    |> add_process_identity(process_result)
-    |> Map.merge(%{
-      containment: :unverified,
-      containment_error: {:process_or_scope_identity_unavailable, process_result, scope_result}
-    })
-  end
-
-  defp add_process_identity(metadata, {:ok, identity}) do
-    Map.merge(metadata, %{
-      codex_app_server_pgid: to_string(identity.pgid),
-      codex_app_server_start_time: identity.start_time,
-      codex_app_server_boot_id: identity.boot_id,
-      codex_process_identity: identity
-    })
-  end
-
-  defp add_process_identity(metadata, _result), do: metadata
-
-  defp managed_scope_metadata(nil, managed_config, workspace) when is_map(managed_config) do
-    unit = systemd_unit_for_managed(workspace, managed_config)
-
-    %{
-      containment: :unverified,
-      containment_error: :os_pid_unavailable,
-      systemd_unit: unit,
-      systemd_unit_identity: managed_unit_identity(managed_config),
-      parent_systemd_service: systemd_parent_service_unit()
-    }
-  end
-
-  defp managed_scope_metadata(_worker_host, _managed_config, _workspace), do: %{}
   defp validate_managed_metadata(_metadata, nil), do: :ok
 
   defp validate_managed_metadata(
-         %{containment: :systemd_scope, systemd_invocation_id: invocation_id},
+         %{containment: :windows_job, job_name: job_name, child_pid: pid, child_creation_time: creation_time},
          _managed_config
        )
-       when is_binary(invocation_id) and invocation_id != "",
+       when is_binary(job_name) and is_integer(pid) and pid > 0 and is_integer(creation_time) and creation_time > 0,
        do: :ok
 
   defp validate_managed_metadata(%{containment: containment} = metadata, _managed_config),
     do: {:error, {:managed_containment_unverified, containment, Map.get(metadata, :containment_error)}}
 
-  defp validate_managed_metadata(_metadata, _managed_config), do: {:error, :managed_containment_unverified}
-
-  defp managed_unit_identity(%{attempt: attempt} = managed_config) do
-    %{
-      assignment_id: attempt.assignment_id,
-      revision: attempt.revision,
-      generation: attempt.generation,
-      attempt_id: attempt.attempt_id,
-      unit_nonce: Map.get(managed_config, :unit_nonce)
-    }
-  end
-
   defp managed_unit_nonce do
     :crypto.strong_rand_bytes(12) |> Base.encode16(case: :lower)
   end
 
-  defp validate_managed_worker_host(nil, _managed_config), do: :ok
-  defp validate_managed_worker_host(_worker_host, nil), do: :ok
+  defp validate_managed_runtime(nil), do: :ok
 
-  defp validate_managed_worker_host(worker_host, _managed_config) when is_binary(worker_host) do
-    {:error, {:managed_remote_worker_unsupported, worker_host}}
-  end
-
-  defp validate_managed_runtime(_worker_host, nil), do: :ok
-
-  defp validate_managed_runtime(nil, _managed_config) do
-    if System.find_executable("systemd-run") do
+  defp validate_managed_runtime(_managed_config) do
+    if WindowsWorkerHost.helper_available?() do
       :ok
     else
       {:error, :managed_containment_unavailable}
     end
   end
-
-  defp validate_managed_runtime(_worker_host, _managed_config), do: :ok
-
-  defp process_identity(pid) when is_integer(pid) and pid > 0 do
-    with {:ok, boot_id} <- File.read("/proc/sys/kernel/random/boot_id"),
-         {:ok, stat} <- read_proc_stat(pid),
-         true <- stat.pgid > 0 do
-      {:ok,
-       %{
-         pid: pid,
-         pgid: stat.pgid,
-         start_time: stat.start_time,
-         boot_id: String.trim(boot_id)
-       }}
-    else
-      false -> {:error, :invalid_process_group}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp process_identity(_pid), do: {:error, :invalid_process_id}
-
-  defp await_systemd_scope_identity(unit, pid) when is_binary(unit) and is_integer(pid) do
-    deadline = System.monotonic_time(:millisecond) + @scope_identity_timeout_ms
-    await_systemd_scope_identity_until(unit, pid, deadline)
-  end
-
-  defp await_systemd_scope_identity_until(unit, pid, deadline) do
-    expired = System.monotonic_time(:millisecond) >= deadline
-
-    case systemd_scope_snapshot(unit) do
-      {:ok, %{invocation_id: invocation_id} = identity}
-      when is_binary(invocation_id) and invocation_id != "" ->
-        {:ok, identity}
-
-      _ when expired ->
-        {:error, :scope_invocation_unavailable}
-
-      _ ->
-        Process.sleep(@stop_poll_ms)
-        await_systemd_scope_identity_until(unit, pid, deadline)
-    end
-  end
-
-  defp systemd_scope_identity(unit) when is_binary(unit) do
-    case systemd_scope_snapshot(unit) do
-      {:ok, %{active_state: state, invocation_id: invocation_id} = identity}
-      when state in [:active, :activating, :deactivating] and is_binary(invocation_id) and
-             invocation_id != "" ->
-        {:ok, identity}
-
-      {:ok, %{active_state: state}} when state in [:inactive, :failed] ->
-        {:error, :not_found}
-
-      {:ok, _identity} ->
-        {:error, :scope_invocation_unavailable}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp systemd_scope_snapshot(unit) when is_binary(unit) do
-    case System.cmd(
-           "systemctl",
-           [
-             "--user",
-             "show",
-             unit,
-             "--property=ActiveState",
-             "--property=InvocationID",
-             "--no-pager"
-           ],
-           stderr_to_stdout: true
-         ) do
-      {output, 0} ->
-        properties =
-          output
-          |> String.split("\n", trim: true)
-          |> Enum.reduce(%{}, &put_systemd_property/2)
-
-        with {:ok, active_state} <- systemd_active_state(Map.get(properties, "ActiveState")) do
-          {:ok,
-           %{
-             active_state: active_state,
-             invocation_id: Map.get(properties, "InvocationID", "")
-           }}
-        end
-
-      {output, _status} when is_binary(output) ->
-        if systemd_unit_not_found?(output), do: {:error, :not_found}, else: {:error, :systemd_query_failed}
-
-      _ ->
-        {:error, :systemd_query_failed}
-    end
-  rescue
-    _error -> {:error, :systemd_query_failed}
-  end
-
-  defp put_systemd_property(line, properties) do
-    case String.split(line, "=", parts: 2) do
-      [key, value] -> Map.put(properties, key, value)
-      _ -> properties
-    end
-  end
-
-  defp systemd_active_state("active"), do: {:ok, :active}
-  defp systemd_active_state("activating"), do: {:ok, :activating}
-  defp systemd_active_state("deactivating"), do: {:ok, :deactivating}
-  defp systemd_active_state("failed"), do: {:ok, :failed}
-  defp systemd_active_state("inactive"), do: {:ok, :inactive}
-  defp systemd_active_state(_state), do: {:error, :invalid_systemd_state}
-
-  defp systemd_unit_not_found?(output) when is_binary(output) do
-    String.match?(output, ~r/(unit .* (not loaded|not found)|could not be found)/i)
-  end
-
-  defp read_proc_stat(pid) do
-    with {:ok, contents} <- File.read("/proc/#{pid}/stat") do
-      parse_proc_stat(contents)
-    end
-  end
-
-  defp parse_proc_stat(contents) do
-    case Regex.run(~r/^\s*\d+\s+\((.*)\)\s+(.*)$/s, contents, capture: :all_but_first) do
-      [_comm, fields] -> parse_proc_fields(String.split(fields))
-      _ -> {:error, :invalid_process_stat}
-    end
-  end
-
-  defp parse_proc_fields(values) do
-    with {:ok, pgid} <- parse_proc_integer(Enum.at(values, 2)),
-         {:ok, start_time} <- parse_proc_integer(Enum.at(values, 19)),
-         state when is_binary(state) <- Enum.at(values, 0) do
-      {:ok, %{pgid: pgid, start_time: start_time, state: state}}
-    else
-      _ -> {:error, :invalid_process_stat}
-    end
-  end
-
-  defp parse_proc_integer(value) when is_binary(value) do
-    case Integer.parse(value) do
-      {integer, ""} -> {:ok, integer}
-      _ -> {:error, :invalid_process_stat}
-    end
-  end
-
-  defp parse_proc_integer(_value), do: {:error, :invalid_process_stat}
 
   defp send_initialize(port) do
     payload = %{
@@ -1049,12 +664,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp session_policies(workspace, nil) do
+  defp session_policies(workspace) do
     Config.codex_runtime_settings(workspace)
-  end
-
-  defp session_policies(workspace, worker_host) when is_binary(worker_host) do
-    Config.codex_runtime_settings(workspace, remote: true)
   end
 
   defp do_start_session(
@@ -1291,6 +902,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
+
+      {:symphony_stop, reason} ->
+        {:error, {:stop_requested, reason}}
     after
       timeout_ms ->
         {:error, :turn_timeout}
@@ -1460,10 +1074,12 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:approval_required, payload}}
 
       {:stop, reason} ->
+        {public_reason, _interruption_drained?} = normalize_turn_error(reason)
+
         emit_message(
           on_message,
           :turn_ended_with_error,
-          %{payload: payload, raw: payload_string, reason: reason},
+          %{payload: payload, raw: payload_string, reason: public_reason},
           metadata
         )
 
@@ -1559,7 +1175,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         )
 
         drain_interrupted_turn(port, on_message, metadata, report_thread_id, report_turn_id)
-        {:stop, {:orchestration_report_failed, reason}}
+        {:stop, {:orchestration_report_failed, reason, :interruption_drained}}
 
       {:error, {:orchestration_report, reason}} ->
         result = normalize_dynamic_tool_result({:error, reason})
@@ -1610,6 +1226,24 @@ defmodule SymphonyElixir.Codex.AppServer do
          _tool_executor
        ) do
     :unhandled
+  end
+
+  defp normalize_turn_error({:orchestration_report_terminal, _report} = reason),
+    do: {reason, true}
+
+  defp normalize_turn_error({:orchestration_report_failed, reason, :interruption_drained}),
+    do: {{:orchestration_report_failed, reason}, true}
+
+  defp normalize_turn_error(reason), do: {reason, false}
+
+  defp maybe_interrupt_and_drain_turn(_port, _on_message, _metadata, _thread_id, _turn_id, true), do: :ok
+
+  defp maybe_interrupt_and_drain_turn(port, on_message, metadata, thread_id, turn_id, false) do
+    interrupt_turn(port, thread_id, turn_id)
+
+    if :erlang.port_info(port) != :undefined do
+      drain_interrupted_turn(port, on_message, metadata, thread_id, turn_id)
+    end
   end
 
   defp interrupt_turn(port, thread_id, turn_id)
@@ -1829,275 +1463,37 @@ defmodule SymphonyElixir.Codex.AppServer do
         :ok
       end
 
-    close_result = close_port(port)
-
-    case {stop_result, close_result} do
-      {:ok, :ok} ->
-        :ok
-
-      {{:error, reason}, _} ->
-        {:error, {:process_stop_unconfirmed, reason}}
-    end
-  end
-
-  defp managed_process_metadata?(%{systemd_unit: unit}) when is_binary(unit) and unit != "", do: true
-  defp managed_process_metadata?(_metadata), do: false
-
-  defp stop_recorded_metadata(%{
-         containment: :systemd_scope,
-         systemd_unit: unit,
-         systemd_invocation_id: invocation_id,
-         codex_process_identity: identity
-       })
-       when is_binary(unit) and is_map(identity) and is_binary(invocation_id) and invocation_id != "" do
-    stop_systemd_scope(unit, identity, invocation_id)
-  end
-
-  defp stop_recorded_metadata(%{systemd_unit: unit, codex_process_identity: identity})
-       when is_binary(unit) and is_map(identity) do
-    stop_systemd_scope_without_invocation(unit, identity)
-  end
-
-  defp stop_recorded_metadata(%{containment: :systemd_scope}),
-    do: {:error, :missing_systemd_invocation_identity}
-
-  defp stop_recorded_metadata(%{containment: :unverified, systemd_unit: unit} = metadata)
-       when is_binary(unit) and unit != "",
-       do: stop_unverified_systemd_scope(unit, metadata)
-
-  defp stop_recorded_metadata(%{containment: :unverified} = metadata),
-    do: {:error, {:process_stop_unconfirmed, Map.get(metadata, :containment_error)}}
-
-  defp stop_recorded_metadata(%{containment: :remote_unverified}),
-    do: {:error, :remote_process_stop_unverified}
-
-  defp stop_recorded_metadata(_metadata), do: {:error, :recorded_process_stop_unsupported}
-
-  defp stop_unverified_systemd_scope(unit, metadata) do
-    case systemd_scope_identity(unit) do
-      {:error, :not_found} ->
-        :ok
-
-      {:ok, _identity} ->
-        {:error, {:process_stop_unconfirmed, Map.get(metadata, :containment_error)}}
-
-      {:error, reason} ->
-        {:error, {:process_stop_unconfirmed, reason}}
-    end
-  end
-
-  defp stop_systemd_scope(unit, %{pid: pid} = identity, invocation_id)
-       when is_binary(unit) and is_integer(pid) and is_binary(invocation_id) do
-    case process_identity(pid) do
-      {:ok, ^identity} ->
-        stop_verified_systemd_scope(unit, identity, invocation_id)
-
-      {:ok, current_identity} ->
-        {:error, {:process_identity_changed, identity, current_identity}}
-
-      {:error, reason} when reason in [:enoent, :esrch] ->
-        stop_verified_systemd_scope(unit, identity, invocation_id)
-
-      {:error, reason} ->
-        {:error, {:process_identity_unreadable, identity, reason}}
-    end
-  end
-
-  defp stop_systemd_scope(_unit, _identity, _invocation_id), do: {:error, :invalid_process_identity}
-
-  defp stop_verified_systemd_scope(unit, identity, invocation_id) do
-    case verify_systemd_scope_identity(unit, invocation_id) do
-      :ok -> terminate_systemd_scope(unit, identity, invocation_id)
-      {:error, :not_found} -> :ok
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp stop_systemd_scope_without_invocation(unit, %{pid: pid} = identity)
-       when is_binary(unit) and is_integer(pid) do
-    case process_identity(pid) do
-      {:ok, ^identity} ->
-        with :ok <- verify_process_in_systemd_unit(pid, unit) do
-          terminate_systemd_scope_without_invocation(unit, identity)
-        end
-
-      {:ok, current_identity} ->
-        {:error, {:process_identity_changed, identity, current_identity}}
-
-      {:error, reason} when reason in [:enoent, :esrch] ->
-        case systemd_scope_snapshot(unit) do
-          {:error, :not_found} -> :ok
-          {:ok, %{active_state: state}} when state in [:inactive, :failed] -> :ok
-          other -> {:error, {:process_stop_unconfirmed, {:process_gone_scope_active, unit, other}}}
-        end
-
-      {:error, reason} ->
-        {:error, {:process_identity_unreadable, identity, reason}}
-    end
-  end
-
-  defp stop_systemd_scope_without_invocation(_unit, _identity),
-    do: {:error, :invalid_process_identity}
-
-  defp verify_process_in_systemd_unit(pid, unit) do
-    case File.read("/proc/#{pid}/cgroup") do
-      {:ok, cgroup} ->
-        path = cgroup |> String.trim() |> String.split(":", parts: 3) |> List.last()
-
-        if is_binary(path) and (path == "/#{unit}" or String.ends_with?(path, "/#{unit}")) do
-          :ok
-        else
-          {:error, {:process_unit_mismatch, pid, unit, path}}
-        end
-
-      {:error, reason} ->
-        {:error, {:process_cgroup_unreadable, pid, unit, reason}}
-    end
-  end
-
-  defp terminate_systemd_scope_without_invocation(unit, identity) do
-    await_exit = fn timeout -> await_systemd_scope_exit_without_invocation(unit, identity, timeout) end
-    terminate_scope(unit, await_exit, fn -> :ok end)
-  end
-
-  defp terminate_scope(unit, await_exit, verify_identity) do
-    case signal_systemd_scope(unit, "TERM") do
-      :ok -> finish_scope_termination(unit, await_exit, verify_identity)
-      {:error, :not_found} -> :ok
-      {:error, reason} -> {:error, {:scope_signal_failed, "TERM", unit, reason}}
-    end
-  end
-
-  defp finish_scope_termination(unit, await_exit, verify_identity) do
-    case await_exit.(@stop_term_timeout_ms) do
+    case stop_result do
       :ok ->
+        close_port(port)
         :ok
-
-      {:error, active} ->
-        with :ok <- verify_identity.() do
-          kill_remaining_scope(unit, await_exit, active)
-        end
-    end
-  end
-
-  defp kill_remaining_scope(unit, await_exit, active) do
-    case signal_systemd_scope(unit, "KILL") do
-      :ok -> confirm_scope_killed(unit, await_exit.(@stop_kill_timeout_ms), active)
-      {:error, :not_found} -> :ok
-      {:error, reason} -> {:error, {:scope_signal_failed, "KILL", unit, reason}}
-    end
-  end
-
-  defp confirm_scope_killed(_unit, :ok, _active), do: :ok
-
-  defp confirm_scope_killed(unit, {:error, remaining}, active),
-    do: {:error, %{unit: unit, active: active, remaining: remaining}}
-
-  defp await_systemd_scope_exit_without_invocation(unit, identity, timeout_ms) do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-    await_systemd_scope_exit_without_invocation_until(unit, identity, deadline)
-  end
-
-  defp await_systemd_scope_exit_without_invocation_until(unit, identity, deadline) do
-    scope_result = systemd_scope_snapshot(unit)
-    process_state = process_identity(identity.pid)
-
-    cond do
-      systemd_scope_exited?(scope_result, process_state) ->
-        :ok
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        {:error, %{scope: scope_result, process_state: process_state}}
-
-      true ->
-        Process.sleep(@stop_poll_ms)
-        await_systemd_scope_exit_without_invocation_until(unit, identity, deadline)
-    end
-  end
-
-  defp verify_systemd_scope_identity(unit, invocation_id) do
-    case systemd_scope_identity(unit) do
-      {:ok, %{invocation_id: ^invocation_id}} ->
-        :ok
-
-      {:ok, %{invocation_id: current_invocation_id}} ->
-        {:error, {:systemd_invocation_changed, invocation_id, current_invocation_id}}
-
-      {:error, :not_found} ->
-        {:error, :not_found}
 
       {:error, reason} ->
-        {:error, {:systemd_invocation_unverified, invocation_id, reason}}
+        # Do not close a port when the recorded identity no longer verifies:
+        # closing its helper would kill whichever job currently owns that port.
+        {:error, {:process_stop_unconfirmed, reason}}
     end
   end
 
-  defp terminate_systemd_scope(unit, identity, invocation_id) do
-    await_exit = fn timeout -> await_systemd_scope_exit(unit, identity, invocation_id, timeout) end
-    verify_identity = fn -> verify_systemd_scope_identity(unit, invocation_id) end
-    terminate_scope(unit, await_exit, verify_identity)
-  end
-
-  defp signal_systemd_scope(unit, signal) when is_binary(unit) do
-    case System.cmd("systemctl", ["--user", "kill", "--kill-who=all", "--signal=#{signal}", unit], stderr_to_stdout: true) do
-      {_output, 0} ->
-        :ok
-
-      {output, status} ->
-        if systemd_unit_not_found?(output) do
-          {:error, :not_found}
-        else
-          {:error, {status, String.trim(output)}}
-        end
-    end
-  rescue
-    error -> {:error, {:exception, Exception.message(error)}}
-  end
-
-  defp await_systemd_scope_exit(unit, identity, invocation_id, timeout_ms) do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-    await_systemd_scope_exit_until(unit, identity, invocation_id, deadline)
-  end
-
-  defp await_systemd_scope_exit_until(unit, identity, invocation_id, deadline) do
-    scope_result = systemd_scope_snapshot(unit)
-    process_state = process_identity(identity.pid)
-
-    cond do
-      scope_result in [{:error, :not_found}] and process_gone?(process_state) ->
-        :ok
-
-      systemd_scope_exited?(scope_result, process_state) ->
-        :ok
-
-      systemd_scope_identity_changed?(scope_result, invocation_id) ->
-        {:error, %{reason: :systemd_invocation_changed, scope: scope_result}}
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        {:error, %{scope: scope_result, process_state: process_state}}
-
-      true ->
-        Process.sleep(@stop_poll_ms)
-        await_systemd_scope_exit_until(unit, identity, invocation_id, deadline)
-    end
-  end
-
-  defp systemd_scope_exited?({:error, :not_found}, process_state), do: process_gone?(process_state)
-
-  defp systemd_scope_exited?({:ok, %{active_state: state}}, process_state)
-       when state in [:inactive, :failed],
-       do: process_gone?(process_state)
-
-  defp systemd_scope_exited?(_scope_result, _process_state), do: false
-
-  defp process_gone?({:error, reason}) when reason in [:enoent, :esrch], do: true
-  defp process_gone?(_process_state), do: false
-
-  defp systemd_scope_identity_changed?({:ok, %{invocation_id: current_invocation_id}}, invocation_id)
-       when is_binary(current_invocation_id) and current_invocation_id != "" and
-              current_invocation_id != invocation_id,
+  defp managed_process_metadata?(%{containment: :windows_job, job_name: job_name})
+       when is_binary(job_name) and job_name != "",
        do: true
 
-  defp systemd_scope_identity_changed?(_scope_result, _invocation_id), do: false
+  defp managed_process_metadata?(_metadata), do: false
+
+  defp stop_recorded_metadata(
+         %{
+           containment: :windows_job,
+           job_name: job_name,
+           child_pid: pid,
+           child_creation_time: creation_time
+         } = metadata
+       )
+       when is_binary(job_name) and is_integer(pid) and is_integer(creation_time) do
+    WindowsWorkerHost.stop_recorded(metadata)
+  end
+
+  defp stop_recorded_metadata(_metadata), do: {:error, :recorded_process_stop_unsupported}
 
   defp close_port(port) when is_port(port) do
     case :erlang.port_info(port) do
@@ -2130,9 +1526,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     on_message.(message)
   end
 
-  defp metadata_from_message(port, payload) do
-    port |> port_metadata(nil, nil, nil) |> maybe_set_usage(payload)
-  end
+  defp metadata_from_message(_port, payload), do: maybe_set_usage(%{}, payload)
 
   defp maybe_set_usage(metadata, payload) when is_map(payload) do
     usage = Map.get(payload, "usage") || Map.get(payload, :usage)
@@ -2145,10 +1539,6 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_set_usage(metadata, _payload), do: metadata
-
-  defp shell_escape(value) when is_binary(value) do
-    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
-  end
 
   defp default_on_message(_message), do: :ok
 

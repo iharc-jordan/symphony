@@ -55,7 +55,7 @@ defmodule Mix.Tasks.PrBody.Check do
 
   defp read_template_candidate(path) do
     case File.read(path) do
-      {:ok, content} -> {:ok, path, content}
+      {:ok, content} -> {:ok, path, normalize_newlines(content)}
       {:error, _reason} -> nil
     end
   end
@@ -69,7 +69,7 @@ defmodule Mix.Tasks.PrBody.Check do
 
   defp read_file(path) do
     case File.read(path) do
-      {:ok, content} -> {:ok, content}
+      {:ok, content} -> {:ok, normalize_newlines(content)}
       {:error, reason} -> {:error, "Unable to read #{path}: #{inspect(reason)}"}
     end
   end
@@ -213,4 +213,6 @@ defmodule Mix.Tasks.PrBody.Check do
     |> Enum.filter(&(&1 != current_heading))
     |> Enum.map(&("\n" <> &1))
   end
+
+  defp normalize_newlines(content), do: String.replace(content, "\r\n", "\n")
 end

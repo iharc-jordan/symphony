@@ -118,7 +118,15 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
   defp managed_server(opts \\ []) do
     name = Module.concat(__MODULE__, :"server_#{System.unique_integer([:positive])}")
     path = Path.join(System.tmp_dir!(), "managed-orchestrator-#{System.unique_integer([:positive])}.log")
-    {:ok, pid} = Orchestrator.start_link(name: name, managed_effects: SymphonyElixir.ManagedReviewEffectsStub)
+    {:ok, task_supervisor} = Task.Supervisor.start_link()
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        task_supervisor: task_supervisor,
+        managed_effects: SymphonyElixir.ManagedReviewEffectsStub
+      )
+
     {:ok, journal, %{}} = Journal.open(path, name: String.to_atom("managed_test_#{System.unique_integer([:positive])}"))
 
     :sys.replace_state(pid, fn state ->
@@ -128,12 +136,22 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     end)
 
     on_exit(fn ->
-      if Process.alive?(pid), do: Process.exit(pid, :normal)
-      File.rm(path)
-      File.rm(path <> ".checkpoint")
+      stop_if_alive(pid)
+      stop_if_alive(task_supervisor)
+      Enum.each([path, path <> "-wal", path <> "-shm"], &File.rm/1)
     end)
 
     {pid, path}
+  end
+
+  defp stop_if_alive(pid) when is_pid(pid) do
+    if Process.alive?(pid) do
+      try do
+        GenServer.stop(pid)
+      catch
+        :exit, _reason -> :ok
+      end
+    end
   end
 
   defp managed_usage_update(attempt, input, output, total) do
@@ -152,39 +170,57 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     }
   end
 
+  defp git_output!(git, arguments) do
+    case System.cmd(git, arguments, stderr_to_stdout: true) do
+      {output, 0} -> String.trim(output)
+      {output, status} -> raise "git fixture command failed (#{status}) #{inspect(arguments)}: #{output}"
+    end
+  end
+
+  defp checkout_fixture_repository!(root) do
+    git = System.find_executable("git") || raise "git executable is required for managed checkout test"
+    source = Path.join(root, "source")
+    remote = Path.join(root, "remote.git")
+
+    File.mkdir_p!(source)
+    git_output!(git, ["init", source])
+    File.write!(Path.join(source, "fixture.txt"), "managed checkout fixture\n")
+    git_output!(git, ["-C", source, "add", "fixture.txt"])
+
+    git_output!(git, [
+      "-C",
+      source,
+      "-c",
+      "user.email=fixture@example.test",
+      "-c",
+      "user.name=Managed Checkout Fixture",
+      "commit",
+      "-m",
+      "fixture"
+    ])
+
+    base_commit = git_output!(git, ["-C", source, "rev-parse", "HEAD"])
+    git_output!(git, ["init", "--bare", remote])
+    git_output!(git, ["-C", source, "remote", "add", "origin", remote])
+    git_output!(git, ["-C", source, "push", "origin", "HEAD"])
+    %{git: git, remote: remote, base_commit: base_commit}
+  end
+
   for scenario <- [:fresh, :resume, :escalate] do
     @dispatch_scenario scenario
     test "managed dispatch prepares the checkout with the required session mode: #{scenario}" do
-      root = Path.join(System.tmp_dir!(), "managed-dispatch-checkout-#{System.unique_integer([:positive])}")
+      root = Path.join(System.tmp_dir!(), "managed-dispatch-checkout-#{Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)}")
       workspaces = Path.join(root, "workspaces")
-      control = Path.join(root, "control")
-      policy = Path.join(control, "policy.json")
-      helper = Path.join(control, "helper.py")
-      codex = Path.join(control, "fake_codex.py")
-      File.mkdir_p!(control)
-      File.write!(policy, Jason.encode!(%{control_root: control, workspace_root: workspaces}))
 
-      File.write!(helper, """
-      import json, os, pathlib, sys
-      assert sys.argv[1] == 'checkout'
-      payload = json.loads(pathlib.Path(sys.argv[3]).read_text())
-      payload['context'] = json.loads(os.environ['SYMPHONY_ISSUE_CONTEXT'])
-      pathlib.Path('dispatch-helper-proof.json').write_text(json.dumps(payload))
-      sys.exit(#{if @dispatch_scenario != :fresh, do: 0, else: 7})
-      """)
+      # Stop the ordinary scheduler before its configuration changes to this
+      # fixture. Its unmanaged dispatch path cannot satisfy this assertion.
+      default_orchestrator = Process.whereis(SymphonyElixir.Orchestrator)
 
-      File.write!(codex, """
-      import json, pathlib, sys
-      for line in sys.stdin:
-          message = json.loads(line)
-          method = message.get('method')
-          if method == 'initialize':
-              print(json.dumps({'id': message['id'], 'result': {}}), flush=True)
-          elif method in ['thread/start', 'thread/resume']:
-              pathlib.Path('thread-request-proof.json').write_text(json.dumps(message))
-              print(json.dumps({'id': message['id'], 'error': {'code': -32000, 'message': 'Fixture captured request'}}), flush=True)
-              sys.exit(7)
-      """)
+      if is_pid(default_orchestrator) do
+        :ok = Supervisor.terminate_child(SymphonyElixir.AgentRuntimeSupervisor, SymphonyElixir.Orchestrator)
+      end
+
+      %{remote: remote, base_commit: base_commit} = checkout_fixture_repository!(root)
 
       File.write!(Workflow.workflow_file_path(), """
       ---
@@ -196,17 +232,20 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
         interval_ms: 60000
       workspace:
         root: #{workspaces}
-      codex:
-        command: #{System.find_executable("python3")} #{codex}
-      managed:
-        checkout_node: #{System.find_executable("python3")}
-        checkout_helper_path: #{helper}
-        checkout_policy_file: #{policy}
       ---
-      Disposable helper dispatch test.
+      Direct Git managed checkout test.
       """)
 
       :ok = WorkflowStore.force_reload()
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+
+        if is_pid(default_orchestrator) and is_nil(Process.whereis(SymphonyElixir.Orchestrator)) do
+          assert {:ok, _pid} =
+                   Supervisor.restart_child(SymphonyElixir.AgentRuntimeSupervisor, SymphonyElixir.Orchestrator)
+        end
+      end)
 
       issue = %Issue{
         id: "item-1",
@@ -214,10 +253,32 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
         title: "Checkout fixture",
         state: "READY",
         dispatchable: true,
-        native_ref: %{"project_item_id" => "item-1", "issue_id" => "I_fixture", "issue_number" => 5, "repository" => %{"name_with_owner" => "acme/example"}}
+        native_ref: %{
+          "project_item_id" => "item-1",
+          "issue_id" => "I_fixture",
+          "issue_number" => 5,
+          "repository" => %{"id" => "R_fixture", "name_with_owner" => "acme/example", "url" => remote}
+        }
       }
 
       Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      previous_state_root = Application.get_env(:symphony_elixir, :managed_state_root)
+      Application.put_env(:symphony_elixir, :managed_state_root, Path.join(root, "managed-state"))
+
+      previous_managed_mode = Application.get_env(:symphony_elixir, :managed_mode)
+      Application.put_env(:symphony_elixir, :managed_mode, true)
+
+      on_exit(fn ->
+        if is_nil(previous_state_root),
+          do: Application.delete_env(:symphony_elixir, :managed_state_root),
+          else: Application.put_env(:symphony_elixir, :managed_state_root, previous_state_root)
+
+        if is_nil(previous_managed_mode),
+          do: Application.delete_env(:symphony_elixir, :managed_mode),
+          else: Application.put_env(:symphony_elixir, :managed_mode, previous_managed_mode)
+      end)
+
       {pid, _path} = managed_server(disabled: true)
 
       on_exit(fn ->
@@ -226,10 +287,10 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
       end)
 
       assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
-      args = %{enrollment_args() | base_commit: String.duplicate("a", 40)}
+      args = %{enrollment_args() | base_commit: base_commit}
       assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: args})
 
-      if @dispatch_scenario != :fresh do
+      if @dispatch_scenario == :resume do
         :sys.replace_state(pid, fn state ->
           data =
             update_in(state.managed.data, [:assignments, "item-1"], fn assignment ->
@@ -240,71 +301,58 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
         end)
       end
 
-      if @dispatch_scenario == :escalate do
-        changes = %{route: %{model: "gpt-5.6-terra", effort: "xhigh"}, escalation_reason: "Complex diagnosis"}
-        args = %{assignment_id: "item-1", expected_revision: 1, changes: changes}
-        assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "escalate", operation: :revise, args: args})
-      end
-
       :sys.replace_state(pid, fn state ->
-        data = %{state.managed.data | disabled: false}
+        data =
+          update_in(state.managed.data, [:assignments, "item-1"], fn assignment ->
+            updates = %{
+              attempt_id: "fixture-attempt-#{System.unique_integer([:positive])}",
+              generation: Map.get(assignment, :generation, 1),
+              phase: :active
+            }
+
+            updates =
+              if @dispatch_scenario == :escalate do
+                Map.merge(updates, %{
+                  route: %{model: "gpt-5.6-terra", effort: "xhigh"},
+                  escalation_reason: "Complex diagnosis"
+                })
+              else
+                updates
+              end
+
+            Map.merge(assignment, updates)
+          end)
+
         %{state | managed: %{state.managed | data: data}}
       end)
 
-      send(pid, :run_poll_cycle)
+      run_options = pid |> :sys.get_state() |> Orchestrator.managed_run_options_for_test(issue)
+      assert is_function(run_options[:workspace_preparer], 1)
+      assert %{assignment_id: "item-1", attempt_id: attempt_id} = run_options[:managed_attempt]
+      assert is_binary(attempt_id)
+      assert run_options[:max_turns] == 20
+      assert run_options[:remaining_turns] == 20
 
-      proof =
-        Enum.find_value(1..100, fn _ ->
-          case Path.wildcard(Path.join(workspaces, "*/dispatch-helper-proof.json")) do
-            [path] ->
-              path
-
-            [] ->
-              Process.sleep(20)
-              nil
-          end
-        end)
-
-      assert is_binary(proof), "managed dispatch must invoke the real preparer before starting Codex"
-      payload = proof |> File.read!() |> Jason.decode!()
-      assert payload["assignment_id"] == "item-1"
-      assert payload["base_commit"] == args.base_commit
-      assert payload["revision"] == if(@dispatch_scenario == :escalate, do: 2, else: 1)
-      assert payload["generation"] == if(@dispatch_scenario != :fresh, do: 2, else: 1)
-      assert payload["context"]["native_ref"]["issue_id"] == "I_fixture"
-      assert {:ok, snapshot} = Control.state(pid)
-      assert payload["attempt_id"] == snapshot.assignments["item-1"].attempt_id
-
-      if @dispatch_scenario != :fresh do
-        request_path = Path.join(Path.dirname(proof), "thread-request-proof.json")
-
-        assert Enum.any?(1..250, fn _ ->
-                 if File.exists?(request_path),
-                   do: true,
-                   else:
-                     (
-                       Process.sleep(20)
-                       false
-                     )
-               end),
-               "managed recovery must reach the AppServer thread request"
-
-        request = request_path |> File.read!() |> Jason.decode!()
-
-        if @dispatch_scenario == :resume do
-          assert request["method"] == "thread/resume"
-          assert request["params"]["threadId"] == "stored-thread"
-          assert request["params"]["model"] == "gpt-5.6-luna"
-        else
-          assert request["method"] == "thread/start"
-          refute Map.has_key?(request["params"], "threadId")
-          assert request["params"]["model"] == "gpt-5.6-terra"
-        end
-
-        assert request["id"] == if(@dispatch_scenario == :resume, do: 4, else: 2)
-        assert request["params"]["sandbox"] == "workspace-write"
-        refute Map.has_key?(request["params"], "permissions")
+      if @dispatch_scenario == :resume do
+        assert run_options[:resume_thread_id] == "stored-thread"
+      else
+        refute Keyword.has_key?(run_options, :resume_thread_id)
       end
+
+      assert run_options[:model] == if(@dispatch_scenario == :escalate, do: "gpt-5.6-terra", else: "gpt-5.6-luna")
+      assert run_options[:effort] == "xhigh"
+      assert :sys.get_state(pid).running == %{}
+      assert :sys.get_state(pid).managed.data.disabled == true
+
+      # The runner creates the workspace before invoking the managed checkout.
+      # Prove the safety boundary has recorded ownership before exercising the
+      # real Git preparer, so a failure below is not mistaken for a Git error.
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert {:ok, ^workspace} = Workspace.validate_owned_workspace(workspace)
+      assert :ok = run_options[:workspace_preparer].(workspace)
+
+      assert git_output!(System.find_executable("git"), ["-C", workspace, "rev-parse", "HEAD"]) == args.base_commit
+      assert git_output!(System.find_executable("git"), ["-C", workspace, "remote", "get-url", "origin"]) == remote
 
       GenServer.stop(pid)
     end
@@ -517,6 +565,49 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     assert assignment.turns_reserved == 2
     assert assignment.last_report.report_id == "r1"
     assert assignment.last_report.summary == "done"
+  end
+
+  test "managed run options use the assignment lifetime budget without the default twenty-turn ceiling" do
+    {pid, _path} = managed_server()
+    issue = %Issue{id: "item-1", identifier: "acme/example#5", state: "ACTIVE"}
+
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind-budget", operation: :bind_project, args: binding_args()})
+    assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll-budget", operation: :enroll, args: enrollment_args()})
+
+    :sys.replace_state(pid, fn state ->
+      assignment =
+        state.managed.data.assignments["item-1"]
+        |> Map.merge(%{
+          revision: 1,
+          generation: 1,
+          attempt_id: "attempt-budget",
+          turn_limit: 30,
+          turns_reserved: 0
+        })
+
+      put_in(state.managed.data.assignments["item-1"], assignment)
+    end)
+
+    state = :sys.get_state(pid)
+    options = Orchestrator.managed_run_options_for_test(state, issue)
+    assert options[:max_turns] == 30
+    assert options[:remaining_turns] == 30
+
+    :sys.replace_state(pid, fn current ->
+      put_in(current.managed.data.assignments["item-1"].turns_reserved, 20)
+    end)
+
+    options = pid |> :sys.get_state() |> Orchestrator.managed_run_options_for_test(issue)
+    assert options[:max_turns] == 30
+    assert options[:remaining_turns] == 10
+
+    :sys.replace_state(pid, fn current ->
+      put_in(current.managed.data.assignments["item-1"].turns_reserved, 30)
+    end)
+
+    options = pid |> :sys.get_state() |> Orchestrator.managed_run_options_for_test(issue)
+    assert options[:max_turns] == 30
+    assert options[:remaining_turns] == 0
   end
 
   test "managed reports are idempotent per attempt and local report id" do
@@ -757,9 +848,8 @@ defmodule SymphonyElixir.ManagedOrchestratorDeferredReportTest do
     end)
 
     on_exit(fn ->
-      if Process.alive?(pid), do: Process.exit(pid, :normal)
-      File.rm(path)
-      File.rm(path <> ".checkpoint")
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      Enum.each([path, path <> "-wal", path <> "-shm"], &File.rm/1)
     end)
 
     assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
@@ -767,6 +857,7 @@ defmodule SymphonyElixir.ManagedOrchestratorDeferredReportTest do
 
     attempt = %{assignment_id: "item-1", revision: 1, generation: 1, attempt_id: "attempt-1"}
     fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+
     ref = make_ref()
 
     :sys.replace_state(pid, fn state ->
@@ -836,16 +927,25 @@ defmodule SymphonyElixir.ManagedOrchestratorDeferredReportTest do
     end)
 
     on_exit(fn ->
-      if Process.alive?(pid), do: Process.exit(pid, :normal)
-      File.rm(path)
-      File.rm(path <> ".checkpoint")
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      Enum.each([path, path <> "-wal", path <> "-shm"], &File.rm/1)
     end)
 
     assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
     assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "enroll", operation: :enroll, args: enrollment_args()})
 
     attempt = %{assignment_id: "item-1", revision: 1, generation: 1, attempt_id: "attempt-1"}
-    fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+    parent = self()
+
+    fake_pid =
+      spawn(fn ->
+        receive do
+          message ->
+            send(parent, {:worker_control, message})
+            Process.sleep(:infinity)
+        end
+      end)
+
     ref = make_ref()
 
     :sys.replace_state(pid, fn state ->
@@ -894,6 +994,7 @@ defmodule SymphonyElixir.ManagedOrchestratorDeferredReportTest do
 
     assert pending.pending == true
     assert pending.stop_pending == true
+    assert_receive {:worker_control, {:symphony_stop, :managed_stop_pending}}, 1_000
 
     send(pid, {:DOWN, ref, :process, fake_pid, {:managed_agent_guard_stop, :managed_stop_pending}})
     _ = Control.state(pid)
@@ -952,7 +1053,14 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
   defp managed_server do
     name = Module.concat(__MODULE__, :"server_#{System.unique_integer([:positive])}")
     path = Path.join(System.tmp_dir!(), "managed-orchestrator-#{System.unique_integer([:positive])}.log")
-    {:ok, pid} = Orchestrator.start_link(name: name, managed_effects: SymphonyElixir.ManagedReviewEffectsStub)
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: name,
+        managed_effects: SymphonyElixir.ManagedReviewEffectsStub,
+        schedule_initial_tick: false
+      )
+
     {:ok, journal, %{}} = Journal.open(path, name: String.to_atom("managed_test_#{System.unique_integer([:positive])}"))
 
     :sys.replace_state(pid, fn state ->
@@ -960,9 +1068,8 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     end)
 
     on_exit(fn ->
-      if Process.alive?(pid), do: Process.exit(pid, :normal)
-      File.rm(path)
-      File.rm(path <> ".checkpoint")
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      Enum.each([path, path <> "-wal", path <> "-shm"], &File.rm/1)
     end)
 
     {pid, path}
@@ -979,9 +1086,8 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     end)
 
     on_exit(fn ->
-      if Process.alive?(pid), do: Process.exit(pid, :normal)
-      File.rm(path)
-      File.rm(path <> ".checkpoint")
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      Enum.each([path, path <> "-wal", path <> "-shm"], &File.rm/1)
     end)
 
     assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
@@ -1023,9 +1129,8 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     end)
 
     on_exit(fn ->
-      if Process.alive?(pid), do: Process.exit(pid, :normal)
-      File.rm(path)
-      File.rm(path <> ".checkpoint")
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      Enum.each([path, path <> "-wal", path <> "-shm"], &File.rm/1)
     end)
 
     assert {:ok, _} = SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{request_id: "bind", operation: :bind_project, args: binding_args()})
@@ -1143,20 +1248,16 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
   end
 
   defp stop_revision_polling(pid) do
-    assert Enum.any?(1..20, fn _attempt ->
-             case :sys.get_state(pid).poll_check_in_progress do
-               false ->
-                 true
-
-               true ->
-                 Process.sleep(5)
-                 false
-             end
-           end)
-
     :sys.replace_state(pid, fn state ->
       if is_reference(state.tick_timer_ref), do: Process.cancel_timer(state.tick_timer_ref)
-      %{state | tick_timer_ref: nil, tick_token: nil, poll_interval_ms: :timer.hours(1)}
+
+      %{
+        state
+        | tick_timer_ref: nil,
+          tick_token: nil,
+          poll_interval_ms: :timer.hours(1),
+          poll_check_in_progress: false
+      }
     end)
   end
 
@@ -1596,7 +1697,8 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     {:ok, restarted_pid} =
       Orchestrator.start_link(
         name: name,
-        managed_effects: SymphonyElixir.ManagedRequirementsTransitionStub
+        managed_effects: SymphonyElixir.ManagedRequirementsTransitionStub,
+        schedule_initial_tick: false
       )
 
     journal_name = String.to_atom("managed_cold_restart_#{System.unique_integer([:positive])}")
@@ -1929,9 +2031,8 @@ defmodule SymphonyElixir.ManagedOrchestratorSourceReconciliationTest do
     {:ok, journal, %{}} = Journal.open(path, name: String.to_atom("managed_source_#{System.unique_integer([:positive])}"))
 
     on_exit(fn ->
-      if Process.alive?(pid), do: Process.exit(pid, :normal)
-      File.rm(path)
-      File.rm(path <> ".checkpoint")
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      Enum.each([path, path <> "-wal", path <> "-shm"], &File.rm/1)
     end)
 
     :sys.replace_state(pid, fn state ->
@@ -2081,9 +2182,8 @@ defmodule SymphonyElixir.ManagedOrchestratorUsageRecoveryTest do
     end)
 
     on_exit(fn ->
-      if Process.alive?(pid), do: Process.exit(pid, :normal)
-      File.rm(path)
-      File.rm(path <> ".checkpoint")
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      Enum.each([path, path <> "-wal", path <> "-shm"], &File.rm/1)
     end)
 
     state = :sys.get_state(pid)
@@ -2151,9 +2251,8 @@ defmodule SymphonyElixir.ManagedOperatorTakeoverRecoveryTest do
     end)
 
     on_exit(fn ->
-      if Process.alive?(pid), do: Process.exit(pid, :normal)
-      File.rm(path)
-      File.rm(path <> ".checkpoint")
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      Enum.each([path, path <> "-wal", path <> "-shm"], &File.rm/1)
     end)
 
     pid

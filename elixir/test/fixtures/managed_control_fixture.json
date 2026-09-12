@@ -1,8 +1,8 @@
 {
   "workflow_managed": {
     "enabled": true,
-    "journal_path": "/home/example/.local/state/codex-orchestration/journal.log",
-    "control_token_file": "/home/example/.config/codex-orchestration/control.token",
+    "store_path": "C:\\Users\\example\\AppData\\Local\\CodexOrchestration\\state\\managed.sqlite3",
+    "control_token_file": "C:\\Users\\example\\AppData\\Local\\CodexOrchestration\\config\\control.token",
     "event_limit": 100,
     "event_wait_ms": 5000
   },

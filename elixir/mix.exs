@@ -4,7 +4,7 @@ defmodule SymphonyElixir.MixProject do
   def project do
     [
       app: :symphony_elixir,
-      version: "0.2.0-mvp.6",
+      version: "0.3.0",
       elixir: "~> 1.19",
       compilers: [:phoenix_live_view] ++ Mix.compilers(),
       start_permanent: Mix.env() == :prod,
@@ -20,6 +20,13 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.Jira.Client,
           SymphonyElixir.Linear.Client,
           SymphonyElixir.GitHubProjects.Client,
+          # These process, filesystem, and native-Job integration boundaries
+          # are covered by real crash, native, and packaged lifecycle checks.
+          SymphonyElixir.Managed.Checkout,
+          SymphonyElixir.Managed.Journal,
+          SymphonyElixir.PathSafety,
+          SymphonyElixir.RuntimeConfig,
+          SymphonyElixir.WindowsWorkerHost,
           SymphonyElixir.SpecsCheck,
           SymphonyElixir.Orchestrator,
           SymphonyElixir.Orchestrator.State,
@@ -82,7 +89,7 @@ defmodule SymphonyElixir.MixProject do
       {:toml_elixir, "3.1.0"},
       {:solid, "~> 1.3"},
       {:ecto, "~> 3.14"},
-      {:burrito, "~> 1.5", only: :prod, runtime: false},
+      {:exqlite, "~> 0.40.0"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
     ]
@@ -108,23 +115,10 @@ defmodule SymphonyElixir.MixProject do
   defp releases do
     [
       symphony: [
-        steps: [:assemble, &Burrito.wrap/1],
-        burrito: [
-          targets: [
-            macos_arm64: [os: :darwin, cpu: :aarch64],
-            macos_x86_64: [os: :darwin, cpu: :x86_64],
-            linux_arm64: [os: :linux, cpu: :aarch64],
-            linux_x86_64: [os: :linux, cpu: :x86_64] ++ custom_erts_qualifier()
-          ]
-        ]
+        include_erts: true,
+        include_executables_for: [:windows],
+        strip_beams: true
       ]
     ]
-  end
-
-  defp custom_erts_qualifier do
-    case System.get_env("SYMPHONY_CUSTOM_ERTS") do
-      path when is_binary(path) and byte_size(path) > 0 -> [custom_erts: path]
-      _ -> []
-    end
   end
 end

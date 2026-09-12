@@ -42,7 +42,7 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
           title: "Live task",
           ownership: %{pm_id: "pm-one", status: :owned, ownership_revision: 3},
           worker_id: "worker-1",
-          worker_host: "node-a",
+          worker_host: nil,
           worker_active: true,
           worker_activity: "<running & verifying>",
           turn_model: "gpt-5.6-luna",
@@ -201,7 +201,7 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
 
     assert assignments["active"].worker == %{
              id: "worker-1",
-             host: "node-a",
+             host: nil,
              active: true,
              activity: "<running & verifying>"
            }

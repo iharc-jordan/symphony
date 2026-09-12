@@ -18,7 +18,7 @@ defmodule SymphonyElixir.ManagedOwnershipHttpTest do
 
     name = Module.concat(__MODULE__, :"server_#{System.unique_integer([:positive])}")
     {:ok, pid} = Orchestrator.start_link(name: name)
-    {:ok, journal, %{}} = Journal.open(Path.join(root, "managed.log"))
+    {:ok, journal, %{}} = Journal.open(Path.join(root, "managed.sqlite3"))
 
     :sys.replace_state(pid, fn state ->
       %{state | managed: %{journal: journal, data: Rules.new(paused: true), effects: __MODULE__}, poll_check_in_progress: true}

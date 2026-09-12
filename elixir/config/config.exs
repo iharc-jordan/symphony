@@ -2,6 +2,10 @@ import Config
 
 config :phoenix, :json_library, Jason
 
+# The Windows release does not use colocated LiveView JavaScript. Disabling the
+# unused node_modules symlink keeps normal, least-privilege Windows builds clean.
+config :phoenix_live_view, :colocated_js, disable_symlink_warning: true
+
 config :symphony_elixir, SymphonyElixirWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,
   url: [host: "localhost"],

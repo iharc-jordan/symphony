@@ -150,7 +150,7 @@ defmodule SymphonyElixir.HookContextTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "printf '%s' \"$SYMPHONY_ISSUE_CONTEXT\" > #{context_path}"
+        hook_after_create: "[System.IO.File]::WriteAllText('#{String.replace(context_path, "'", "''")}', $env:SYMPHONY_ISSUE_CONTEXT)"
       )
 
       issue = %{
@@ -183,7 +183,7 @@ defmodule SymphonyElixir.HookContextTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_before_remove: "printf '%s' \"$SYMPHONY_ISSUE_CONTEXT\" > #{context_path}"
+        hook_before_remove: "[System.IO.File]::WriteAllText('#{String.replace(context_path, "'", "''")}', $env:SYMPHONY_ISSUE_CONTEXT)"
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-REMOVE")
@@ -204,7 +204,7 @@ defmodule SymphonyElixir.HookContextTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "touch #{Path.join(test_root, "ran")}"
+        hook_after_create: "[System.IO.File]::WriteAllText('#{String.replace(Path.join(test_root, "ran"), "'", "''")}', 'ran')"
       )
 
       issue = %{

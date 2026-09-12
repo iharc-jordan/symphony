@@ -1,547 +1,141 @@
-# Symphony Elixir
+# Symphony Elixir for Codex Orchestration
 
-This directory contains the current Elixir/OTP implementation of Symphony, based on
-[`SPEC.md`](../SPEC.md) at the repository root.
+This directory contains the native Windows 11 x64 Symphony runtime paired with the Codex
+Orchestration plugin. Symphony polls or receives managed work, creates one local workspace per
+assignment, and runs Codex App Server inside an owned Windows Job Object.
 
-> [!WARNING]
-> Symphony Elixir is prototype software intended for evaluation only and is presented as-is.
-> We recommend implementing your own hardened version based on `SPEC.md`.
+The supported installed path is the paired `0.3.0` plugin and runtime release. End users do not
+install Erlang, Elixir, Rust, WSL, SSH services, or a second Codex copy. The plugin resolves the
+installed `%APPDATA%\npm\codex.cmd`, creates the protected local configuration, installs the hidden
+least-privilege Task Scheduler task, and downloads the pinned Windows runtime ZIP.
 
-## Screenshot
+## Runtime layout
 
-![Symphony Elixir screenshot](../.github/media/elixir-screenshot.png)
+The installed launcher supplies absolute paths before the OTP supervisors start:
 
-## How it works
+- workflow: `%LOCALAPPDATA%\CodexOrchestration\config\WORKFLOW.md`
+- SQLite state: `%LOCALAPPDATA%\CodexOrchestration\state\managed.sqlite3`
+- logs: `%LOCALAPPDATA%\CodexOrchestration\logs`
+- workspaces: `%LOCALAPPDATA%\CodexOrchestration\workspaces`
+- immutable releases: `%LOCALAPPDATA%\CodexOrchestration\releases\<version>`
 
-1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, GitHub Projects, Jira
-   Cloud, Asana, and GitLab)
-2. Creates a workspace per issue
-3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
-   workspace
-4. Sends a workflow prompt to Codex
-5. Keeps Codex working on the issue until the work is done
+The HTTP control server binds only to `127.0.0.1` and requires the protected installation token.
+The native MCP bridge is the supported control client.
 
-During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
-Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
-`jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
-tools with configured host-side auth and removes declared tracker-token environment variables from
-the Codex child, so the agent does not need a second tracker login.
+## Workflow configuration
 
-If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
-Symphony stops the active agent for that issue and cleans up matching workspaces.
-
-If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
-issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
-entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
-tracker issue can become a dispatch candidate again after restart.
-
-## How to use it
-
-1. Make sure your codebase is set up to work well with agents: see
-   [Harness engineering](https://openai.com/index/harness-engineering/).
-2. Get a new personal token in Linear via Settings → Security & access → Personal API keys, and
-   set it as the `LINEAR_API_KEY` environment variable.
-3. Copy this directory's `WORKFLOW.md` to your repo.
-4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
-   - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
-     operations such as comment editing or upload flows.
-5. Customize the copied `WORKFLOW.md` file for your project.
-   - To get your project's slug, right-click the project and copy its URL. The slug is part of the
-     URL.
-   - When creating a workflow based on this repo, note that it depends on non-standard Linear
-     issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
-     Team Settings → Workflow in Linear.
-6. Follow the instructions below to install the required runtime dependencies and start the service.
-
-## Prerequisites
-
-We recommend using [mise](https://mise.jdx.dev/) to manage Elixir/Erlang versions.
-
-```bash
-mise install
-mise exec -- elixir --version
-```
-
-## Run
-
-```bash
-git clone https://github.com/openai/symphony
-cd symphony/elixir
-mise trust
-mise install
-mise exec -- mix setup
-mise exec -- mix build
-mise exec -- ./bin/symphony ./WORKFLOW.md
-```
-
-## Burrito releases
-
-Symphony ships self-contained executables built with
-[Burrito](https://github.com/burrito-elixir/burrito). They embed Erlang/OTP, Elixir, and Symphony,
-but still expect `codex`, `git`, and the selected tracker credentials on the target machine.
-
-Supported release targets:
-
-- `macos_arm64`
-- `macos_x86_64`
-- `linux_arm64`
-- `linux_x86_64`
-
-`v*` tags publish all four targets with checksums. A manual workflow run builds the same
-artifacts without creating a release.
-
-For the reviewed Linux x86_64 release path, run `scripts/build-linux-x86_64-custom-erts.sh` with
-`SYMPHONY_CUSTOM_ERTS` set to the reviewed OTP 28.5 ERTS `.tar.gz` and
-`SYMPHONY_CUSTOM_ERTS_SHA256` set to its verified digest. The pinned build toolchain is
-Erlang/OTP 28.5, Elixir 1.19.5-otp-28, Zig 0.15.2, and Burrito 1.5.0. This release path is
-for Ubuntu 24.04 (noble) x86_64 hosts and requires the host `libcrypto.so.3` supplied by
-`libssl3t64`; other Burrito targets remain unchanged.
-
-
-Burrito production executables reuse an existing extraction when the application version is
-unchanged. Bump the project version for every changed binary release so an upgrade selects a fresh
-extraction directory; retain the prior versioned executable when rollback is required.
-
-After downloading the executable for your platform from a release:
-
-```bash
-chmod +x ./symphony-v0.0.1-macos_arm64
-./symphony-v0.0.1-macos_arm64 ./WORKFLOW.md
-```
-
-## Configuration
-
-Pass a custom workflow file path to `./bin/symphony` when starting the service:
-
-```bash
-./bin/symphony /path/to/custom/WORKFLOW.md
-```
-
-If no path is passed, Symphony defaults to `./WORKFLOW.md`.
-
-Optional flags:
-
-- `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
-- `--port` also starts the Phoenix observability service (default: disabled)
-
-The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
-Codex session prompt.
-
-Minimal example:
+`WORKFLOW.md` contains YAML front matter followed by the worker prompt. A minimal GitHub Projects
+managed workflow is:
 
 ```md
 ---
 tracker:
-  kind: linear
+  kind: github_projects
   provider:
-    project_slug: "..."
-workspace:
-  root: ~/code/workspaces
+    owner_type: user
+    owner: your-account
+    project_number: 1
+    token: $GITHUB_TOKEN
+  active_states: [READY, IN PROGRESS]
+  terminal_states: [DONE, CANCELLED]
+polling:
+  interval_ms: 30000
 hooks:
   after_create: |
-    git clone git@github.com:your-org/your-repo.git .
+    git clone --depth 1 $env:SOURCE_REPOSITORY_URL .
+  timeout_ms: 60000
 agent:
   max_concurrent_agents: 10
-  max_concurrent_agents_by_state: {}
   max_turns: 20
 codex:
-  command: codex app-server
+  launcher: C:\Users\you\AppData\Roaming\npm\codex.cmd
+  approval_policy:
+    reject:
+      sandbox_approval: true
+      rules: true
+      mcp_elicitations: true
+  thread_sandbox: workspace-write
+  turn_sandbox_policy:
+    type: workspaceWrite
+    networkAccess: true
+managed:
+  enabled: true
 ---
 
-You are working on an issue from the configured tracker {{ issue.identifier }}.
-
-Title: {{ issue.title }} Body: {{ issue.description }}
+Complete assignment {{ issue.identifier }} in the provided workspace.
 ```
 
-Notes:
+The plugin writes `codex.launcher`; workflow authors cannot supply an arbitrary shell command or
+launcher arguments. Symphony constructs the fixed `app-server` invocation and disables Codex
+subagent delegation for managed workers because Symphony owns assignment scheduling.
 
-- If a value is missing, defaults are used.
-- `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
-  `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
-  `api_key`, `project_slug`, and `assignee` aliases for compatibility.
-- `tracker.required_labels` is optional. When set, an issue must have every
-  configured label to dispatch or continue running. Label matching ignores
-  case and surrounding whitespace. A blank configured label matches no issue.
-- Safer Codex defaults are used when policy fields are omitted:
-  - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
-  - `codex.thread_sandbox` defaults to `workspace-write`
-  - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
-- `codex.turn_timeout_ms` is the maximum silence interval while a turn is streaming. Each
-  app-server update resets it; it is not a total turn runtime cap.
-- Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
-- Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
-- When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
-  unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
-  Symphony validation.
-- Managed workers use the host's configured permissions, MCP servers, apps, and plugins. Symphony
-  does not build a custom permission profile or scan/disable configured MCP servers; it only
-  sets `agents.enabled=false` so delegation remains owned by Symphony. Protocol approval and
-  user-input requests fail the run without a synthetic response.
-- A private trusted-host workflow may explicitly use full access:
+Important settings:
 
-  ```md
-  codex:
-    thread_sandbox: danger-full-access
-    turn_sandbox_policy: {type: dangerFullAccess}
-  ```
+- `tracker.kind` selects the provider adapter. Managed assignments use GitHub Projects and the
+  repository recorded by the enrolled Project item.
+- `tracker.provider` owns provider endpoint, scope, and credential references.
+- `agent.max_concurrent_agents` is the global cap; positive entries in
+  `agent.max_concurrent_agents_by_state` override it for named states.
+- `agent.max_turns` limits continuation turns for one worker attempt.
+- `codex.approval_policy`, `thread_sandbox`, and `turn_sandbox_policy` pass through to the installed
+  Codex App Server protocol.
+- `codex.read_timeout_ms`, `turn_timeout_ms`, and `stall_timeout_ms` bound protocol reads and worker
+  silence.
+- `managed.usage_limit_tokens` is optional. When set, persisted accounting must prove remaining
+  headroom before dispatch.
+- `managed.store_path` is the single SQLite state file used outside the installed launcher; the
+  installed Windows service fixes it to `%LOCALAPPDATA%\CodexOrchestration\state\managed.sqlite3`.
 
-  Choose that policy in the host configuration; `approval_policy: never` does not make Symphony
-  answer a protocol approval request.
-- With a `workspaceWrite` turn policy, workflows that resolve external hosts should set
-  `networkAccess: true` in that policy. A `dangerFullAccess` policy needs no additional network field.
-- `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
-  invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
-- `agent.max_concurrent_agents` is the effective global concurrency limit. Use the exact key
-  `agent.max_concurrent_agents_by_state` for positive per-state overrides; states not listed there
-  use the global fallback. The dashboard and managed-state diagnostics expose the global limit,
-  configured per-state overrides, and that fallback explicitly.
-- If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
-  identifier, title, and body.
-- Every configured workspace hook receives `SYMPHONY_ISSUE_CONTEXT`, a UTF-8 JSON object with exactly
-  `id`, `identifier`, and `native_ref`. The context excludes issue title/body and executable or
-  credential settings. `native_ref` is reserved for non-secret provider identity/location metadata;
-  invalid content, authentication, credential, payload, and executable keys are rejected. The
-  serialized value is limited to 16 KiB; an oversized context rejects the hook instead of being
-  truncated. Hooks run for workspace removal without an issue context receive `null` for all three
-  values. `after_create` and `before_run` keep their existing failure behavior, while
-  `after_run` and `before_remove` continue to ignore hook failures.
-- Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
-  `git clone ... .` there, along with any other setup commands you need.
-- If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
-  the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
-- For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or
-  when value is `$LINEAR_API_KEY`. The legacy flat `tracker.api_key` alias behaves the same way.
-- Do not put a literal tracker token in a repo-owned `WORKFLOW.md` if Codex can read that
-  workspace. Use `$VAR`/host-side secret references so Symphony can keep the token out of the
-  child environment.
-- For path values, `~` is expanded to the home directory.
-- For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
-  while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
-  launched shell.
+Tracker credentials stay in the Symphony host process and are removed from the Codex child
+environment. Do not place literal credentials in a repository-owned workflow; use `$VAR`
+references.
 
-```yaml
-tracker:
-  provider:
-    api_key: $LINEAR_API_KEY
-workspace:
-  root: $SYMPHONY_WORKSPACE_ROOT
-hooks:
-  after_create: |
-    git clone --depth 1 "$SOURCE_REPO_URL" .
-codex:
-  command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
+Workspace hooks are non-interactive PowerShell. The hook receives `SYMPHONY_ISSUE_CONTEXT`, a
+bounded UTF-8 JSON object containing only `id`, `identifier`, and provider-native identity metadata.
+Hook and worker descendants share the same Job Object containment and bounded shutdown path.
+
+## Native safety boundaries
+
+- Workspace create, reuse, hooks, and deletion revalidate canonical descendant paths and reject
+  junctions or other reparse points.
+- Managed checkout uses the enrolled GitHub repository URL and base commit. There is no remote shell
+  or alternate worker-host path.
+- A worker identity records the Job name, PID, process creation time, and attempt. Stop validates
+  process identity and Job membership before terminating that Job.
+- Managed state is one versioned SQLite snapshot row on one connection. Writes use a transaction;
+  lock, corruption, and write failures are surfaced rather than replayed as success.
+
+## Build from source
+
+Source builds require Windows x64, Erlang/OTP `28.5.0.6`, Elixir `1.19.6`, Rust, Git, and PowerShell
+7:
+
+```powershell
+mix deps.get
+mix compile --warnings-as-errors
+mix test
+.\scripts\build-windows-release.ps1
 ```
 
-- If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
-- If a later reload fails, Symphony keeps running with the last known good workflow and logs the
-  reload error until the file is fixed.
-- `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+The build creates `dist\symphony-<version>-windows-x64.zip`, its SHA-256 file, and
+`dist\release-manifest.json`. The ZIP contains a standard Mix release with embedded
+ERTS, `bin\symphony.bat`, and `bin\symphony-worker-host.exe`; Erlang distribution is
+disabled and no release cookie file is shipped. The installed controller is owned
+by the native Windows Job helper, so stopping its Scheduled Task terminates the
+complete controller process tree without Erlang RPC.
 
-### Managed control plane
+Focused Windows checks:
 
-Managed mode is an opt in control plane for GitHub Projects assignments. It journals
-control requests and provider effects and prepares workers through the configured trusted
-checkout helper. See [managed checkout preparation](docs/managed-checkout.md) for the private
-policy file, path boundaries, and per-attempt input contract.
-
-The version two control contract has these boundaries:
-
-- The loopback HTTP boundary authenticates an operator credential or a task-specific PM
-  capability. The native MCP bridge derives the PM capability from Codex's per-call thread
-  identity; caller-supplied PM IDs do not authorize mutations.
-- Operators register each Project binding and its permitted repositories. PM controls name
-  their Project explicitly. One PM can manage several Projects and repositories; several PMs
-  can share a Project while each assignment has exactly one responsible PM.
-- Assignment changes compare both the work revision and ownership revision. Handoff and
-  assignment pause/resume accept an exact `assignments` list containing `assignment_id`,
-  `expected_revision`, and `expected_ownership_revision`. Ownership transfer preserves the
-  active attempt and worker task; pausing prevents new dispatch and lets active work finish.
-- Enrollment verifies the live Project item, READY status, repository, and issue identity.
-  Resources are typed `{kind, authority, identity, access}` references. GitHub's native issue
-  and repository IDs prevent enrollment of a second card for the same underlying issue.
-- Pending provider effects retain their originating principal and Project binding. Recovery
-  revalidates those fences before a write. Managed state must use control-contract version two;
-  the runtime rejects older state rather than converting or replaying it. The journal record
-  envelope remains version one.
-- A binding may specify `projection_field_id`, an existing text field belonging to that
-  Project. Summary updates run outside the control request, expose pending/failed/synced
-  status, and never replace issue requirements or the workflow Status field.
-- A terminal worker report ends permission to execute tools. The runtime interrupts the
-  turn and briefly drains final usage notifications; incomplete telemetry is marked explicitly.
-- Reports are identified by the trusted attempt ID and local report ID. An identical retry
-  is idempotent; changed content under that same key is rejected. A later attempt can reuse
-  the local ID. Successful REVIEW projection is reconciled once, including on worker exit.
-- Review feedback may carry up to eight `peer_report_refs` with `source_assignment_id`,
-  `source_attempt_id`, and `report_id`. Sources must belong to the same Project and current PM.
-  Canonical reports resolve into a bounded findings block on the next worker turn. These
-  findings are evidence, cannot grant authority or change scope, and clear on material revision.
-- Managed routes may select the `gpt-5.6-sol` (Sol) route; the default managed route remains
-  `gpt-5.6-luna` with `xhigh` effort, and every accepted route is recorded with its model and effort.
-- Managed session start and resume reads use the configured `codex.read_timeout_ms` (default `60000`
-  ms). The stop/interrupt read remains separately bounded at `10000` ms so a slow startup does not
-  extend shutdown handling.
-- A worker `context_needed` report enters `WAITING`. If the PM now has the missing completion evidence,
-  accept that waiting outcome through the existing `review` operation with its accepted `evidence`
-  argument and the existing expected revision, ownership-revision, and Project fences; a waiting
-  acceptance rejects `peer_report_refs`, does not require a `reason`, and is terminal. If the missing
-  context is not yet resolved, use `rework` to return the retained assignment to dispatchable work.
-  No new report or control protocol is required.
-- Managed assignments start with an initial turn limit of `20`. An operator can extend the absolute
-  limit through `revise` using `changes.turn_limit` in the inclusive range `1..100`, strictly above
-  the current limit, and a required non-empty `changes.turn_limit_reason`; the field is not a
-  per-request increment.
-- `GET /api/v1/managed/state` defaults to compact `view=summary`. Optional `project_id`,
-  `assignment_id`, and `include_history=true` select records. `view=detail` requires an
-  assignment ID for complete reports; `view=full` is deliberate diagnostic access. The
-  projection uses existing read authentication and adds no new Project access-control claim.
-- Managed usage persists cumulative source-thread watermarks and counts each new delta once
-  across resumes and restarts. Assignment runtime adds completed attempts and the active run.
-  Legacy totals without sufficient evidence are unavailable; a configured token cap holds
-  dispatch when historical accounting cannot support it. A service without a cap can continue.
-- Startup response timeouts include the pending method, stage, elapsed milliseconds, and
-  configured timeout. Unrelated output cannot extend that request's deadline.
-
-Project bindings and ownership belong to the journal, not to a second scheduler or database.
-The workflow's tracker credentials remain the provider credential authority. Keep the control
-secret, journal, checkout policy, and stable checkout helper outside the plugin cache.
-
-### Linear adapter profile
-
-- Config: use `tracker.kind: linear` with `tracker.provider.endpoint` (default
-  `https://api.linear.app/graphql`), `api_key` (defaults to `LINEAR_API_KEY` and accepts
-  `$VAR`), required `project_slug`, and optional `assignee` (a Linear user ID or `me`,
-  defaulting to `LINEAR_ASSIGNEE`).
-  The legacy flat `tracker.endpoint`, `api_key`, `project_slug`, and `assignee` aliases remain
-  supported. `required_labels`, `active_states`, and `terminal_states` stay under `tracker`.
-- Scope and paging: candidate reads filter the configured project slug and requested state names,
-  following Linear pages of 50. ID refreshes are also project-scoped and batch up to 50 IDs. Empty
-  state/ID lists return `{:ok, []}` without a Linear request.
-- Identity and normalization: `issue.id` is the Linear issue ID and `issue.native_ref` is currently
-  `nil`. Records missing a nonblank ID, identifier, title, or state are dropped from candidate
-  pages and fail ID refreshes. State keeps Linear's spelling; integer priorities are preserved and
-  other priority values become `nil`; RFC 3339 timestamps are parsed and unusable timestamps become
-  `nil`. Labels are trimmed, lowercased, deduplicated, and blanks are dropped; blockers come from
-  inverse `blocks` relations.
-- Dispatchability: the adapter marks an issue dispatchable only when optional assignee routing
-  matches and a `Todo` issue has no non-terminal blocker. The generic scheduler then applies
-  active/terminal states, required labels, claims, retries, and concurrency.
-- Tool: the Linear adapter advertises `linear_graphql`, accepting either a raw query string or an
-  object with nonblank `query` and optional object `variables`. Symphony executes it host-side
-  with the session-bound endpoint/token and strips declared token environment variables from the
-  Codex child. `project_slug` scopes scheduler reads, not raw tool calls; the tool can access
-  whatever the configured Linear token can access.
-- Responsibility and errors: `linear_graphql` adds no idempotency key, retry, scope guard, or
-  rate-limit policy, so workflows own idempotent mutations and handling provider errors. Read/config
-  failures use `{:error, :missing_linear_api_token}`, `{:error, :missing_linear_project_slug}`,
-  `{:error, :invalid_linear_endpoint}`, `{:error, :invalid_linear_assignee}`,
-  `{:error, :missing_linear_viewer_identity}`, `{:error, {:linear_api_status, status}}`,
-  `{:error, {:linear_api_request, reason}}`, `{:error, {:linear_graphql_errors, errors}}`,
-  `{:error, :linear_unknown_payload}`, or `{:error, :linear_missing_end_cursor}`. Tool results
-  are maps with `"success"`, JSON-string `"output"`, and text `"contentItems"`; invalid
-  arguments, missing auth, and transport failures return `"success" => false` with
-  `{"error": {"message": ...}}`, while top-level GraphQL errors preserve the response body with
-  `"success" => false`.
-  For portable reporting, map missing/invalid token, project, endpoint, assignee, or viewer errors
-  to `tracker_config` or `tracker_auth`, request failures to `tracker_transport`, non-200 responses to
-  `tracker_response` (`429` is `tracker_rate_limited`), GraphQL/unknown payload failures to
-  `tracker_payload`, and missing cursors to `tracker_pagination`; logs and tool responses carry the
-  human-readable provider detail.
-
-### GitHub Issues adapter
-
-- Config: use `tracker.kind: github` with required `tracker.provider.repo` in `owner/repo` form,
-  optional `token` (defaults to `GITHUB_TOKEN` and accepts `$VAR`), and optional `api_url`
-  (default `https://api.github.com`, HTTPS only). Set explicit `active_states` and
-  `terminal_states`; active entries may be `open` and terminal entries may be `closed`.
-- Reads and identity: polling is scoped to the configured repository; `issue.id` is the
-  repository issue number, `issue.identifier` is `GH-<number>`, hidden or deleted `404` issues are
-  omitted on refresh, and pull requests returned by the Issues API are not dispatchable.
-- Tool and auth: `github_api` accepts a relative REST `path` plus optional `params` and JSON
-  `body`; Symphony executes it host-side with the session-bound token, removes configured tracker
-  credentials and provider authentication aliases from the Codex child, and leaves raw tool access
-  limited by that token's GitHub permissions.
-
-### GitHub Projects adapter
-
-- Config: use `tracker.kind: github_projects` with `tracker.provider.owner_type` (`org` or `user`), `owner`, `project_number`, optional `status_field_name` (default `Status`), optional `graphql_url` (default `https://api.github.com/graphql`), and `token` (defaults to `GITHUB_TOKEN` and accepts `$VAR`). Keep `active_states`, `terminal_states`, and `required_labels` under `tracker`.
-- Scope and identity: reads are scoped to the configured Projects V2 board. Items use the ProjectV2Item node ID as `issue.id`; `issue.identifier` is `owner/repository#number`. `native_ref` retains `project_id`, `project_item_id`, the underlying global `issue_id`, repository metadata, issue number, and content type.
-- Reads: project fields, options, and items use GraphQL connections with page cursors. The Status field is resolved by name. Archived items, draft issues, and items with missing content or status are omitted from candidate reads and fail an ID refresh as malformed. Pull requests remain visible with `dispatchable: false`; closed underlying issues are never dispatchable.
-- Blockers: Issue `blockedBy` connections are read and fully paginated, including cross-repository blockers. A blocker is terminal only when its GitHub issue state is `CLOSED`; unknown blocker state keeps the item non-dispatchable. GraphQL errors, transport/status failures, malformed payloads, rate limits, and missing cursors fail the read safely.
-- The adapter is read-only. It does not mutate Project status or enroll repositories, and it does not advertise a provider-native tool. Workspace checkout for a multi-repository project belongs in workflow hooks or a separate generic hook-context integration.
-
-### Jira Cloud adapter
-
-- Config: use `tracker.kind: jira` with provider `base_url`, `email`, `api_token`, and required
-  `project_key`; the first three default to `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN`
-  and accept `$VAR`. Set explicit Jira-native `active_states` and `terminal_states`.
-- Issues and reads: candidate reads and ID refreshes stay scoped to the configured project and
-  requested statuses; `issue.id` is Jira's immutable ID and `issue.identifier` is the issue key.
-- Blockers: inward `Blocks` links populate `blocked_by`; issues in Jira's `new` status category
-  wait until blockers reach configured terminal states, while in-progress categories keep running.
-- Tool: `jira_rest` sends relative `/rest/api/3/` requests host-side with configured Basic auth,
-  strips token environment variables from Codex, and can reach whatever the Jira credential can.
-
-### Asana adapter
-
-- Config: use `tracker.kind: asana` with required `tracker.provider.project_gid`, optional
-  `endpoint` (default `https://app.asana.com/api/1.0`), and `api_key` (defaults to `ASANA_PAT` and
-  accepts `$VAR`); `active_states` and `terminal_states` are project section names.
-- Scope: Symphony polls tasks in the configured project, treats their section as state, and omits
-  deleted or out-of-project tasks during ID refreshes.
-- Tool: `asana_api` sends relative Asana REST requests host-side with the configured auth; Symphony
-  strips `ASANA_PAT` and configured token variables from the Codex child, while raw tool calls are
-  not limited to the configured project.
-
-### GitLab adapter
-
-- Configure `tracker.kind: gitlab` with `tracker.provider.project_path`, optional `api_url`, and
-  `api_key` (default `GITLAB_PAT`); use `opened` and `closed` tracker states.
-- Symphony reads project issues by IID and exposes route-safe `GL-<iid>` identifiers.
-- `gitlab_api` forwards raw GitLab REST requests with host-side auth and keeps configured tracker
-  credentials and provider authentication aliases out of the Codex child.
-
-## Web dashboard
-
-The observability UI now runs on a minimal Phoenix stack:
-
-- LiveView for the dashboard at `/`
-- JSON API for operational debugging under `/api/v1/*`
-- Bandit as the HTTP server
-- Phoenix dependency static assets for the LiveView client bootstrap
-- Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
-
-The default **Live work** view groups current assignments by their PM and draws their
-ownership connections as a map. Select a task for its state, model and effort, worker host,
-latest report, and issue link. Observed model settings are labelled as running only while the
-worker is active; otherwise the configured settings are shown. Search and a list view are also available. Moving connections
-mean the runtime reports an active worker; PM registration and the assignment phase alone do
-not prove that a Codex task is running.
-
-Runtime and total tokens appear on task nodes and list rows; selecting a task also shows input
-and output tokens. Managed tokens use corrected assignment totals, while runtime adds saved
-attempt durations and current elapsed time. Details show the current run separately. Missing
-values say "Not recorded"; unavailable historical totals and partial telemetry are explicit.
-The live summary shows current-attempt tokens and running-worker time. Aggregate managed usage
-and raw thread counters are labelled separately in Runtime.
-
-Accepted and cancelled subtasks remain connected to the current PM, with assignment-state counts,
-so finishing a worker does not remove part of the PM's task. The selected PM is retained in the
-page URL, including after its final worker finishes, and a page refresh preserves that context.
-Completed subtasks do not animate or count as running, even with pending stop bookkeeping.
-Accepted assignments do not establish delivery of the user's parent task; delivery remains
-unverified without a parent delivery record.
-
-**History** contains completed assignments from earlier PMs, outside the current PM context.
-They are excluded from live counts and health. **Runtime** keeps the detailed
-worker, project, and ownership-transfer information. These views observe existing state and
-refresh through PubSub without changing ownership, dispatch, or worker execution.
-
-## Project Layout
-
-- `lib/`: application code and Mix tasks
-- `test/`: ExUnit coverage for runtime behavior
-- `WORKFLOW.md`: in-repo workflow contract used by local runs
-- `../.codex/`: repository-local Codex skills and setup helpers
-
-## Testing
-
-```bash
-make all
+```powershell
+cargo test --manifest-path native\symphony_worker_host\Cargo.toml
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File native\symphony_worker_host\tests\windows_job_regression.ps1
+mix test test\symphony_elixir\windows_workspace_safety_test.exs
+mix test test\symphony_elixir\managed_journal_test.exs test\symphony_elixir\managed_orchestrator_test.exs
 ```
 
-Run the real external end-to-end test only when you want Symphony to create disposable Linear
-resources and launch a real `codex app-server` session:
-
-```bash
-cd elixir
-export LINEAR_API_KEY=...
-make e2e
-```
-
-Optional environment variables:
-
-- `SYMPHONY_LIVE_LINEAR_TEAM_KEY` defaults to `SYME2E`
-- `SYMPHONY_LIVE_SSH_WORKER_HOSTS` uses those SSH hosts when set, as a comma-separated list
-
-`make e2e` runs two live scenarios:
-- one with a local worker
-- one with SSH workers
-
-If `SYMPHONY_LIVE_SSH_WORKER_HOSTS` is unset, the SSH scenario uses `docker compose` to start two
-disposable SSH workers on `localhost:<port>`. The live test generates a temporary SSH keypair,
-mounts the host `~/.codex/auth.json` into each worker, verifies that Symphony can talk to them
-over real SSH, then runs the same orchestration flow against those worker addresses. This keeps
-the transport representative without depending on long-lived external machines.
-
-Set `SYMPHONY_LIVE_SSH_WORKER_HOSTS` if you want `make e2e` to target real SSH hosts instead.
-
-The live test creates a temporary Linear project and issue, writes a temporary `WORKFLOW.md`, runs
-a real agent turn, verifies the workspace side effect, requires Codex to comment on and close the
-Linear issue, then marks the project completed so the run remains visible in Linear.
-
-Run the opt-in GitHub Issues live test with a disposable/scratch repository:
-
-```bash
-cd elixir
-export SYMPHONY_LIVE_GITHUB_REPO=owner/scratch-repo
-export GITHUB_TOKEN=...
-SYMPHONY_RUN_GITHUB_LIVE_E2E=1 mix test test/symphony_elixir/github_live_e2e_test.exs
-```
-
-Run the opt-in Jira Cloud live test against a disposable project whose credential can browse,
-create, comment on, transition, and delete issues:
-
-```bash
-cd elixir
-export JIRA_BASE_URL=https://your-site.atlassian.net
-export JIRA_EMAIL=...
-export JIRA_API_TOKEN=...
-export SYMPHONY_LIVE_JIRA_PROJECT_KEY=TEST
-SYMPHONY_RUN_JIRA_LIVE_E2E=1 mix test test/symphony_elixir/jira_live_e2e_test.exs
-```
-
-Run the opt-in Asana live E2E against disposable Asana resources:
-
-```bash
-cd elixir
-export ASANA_PAT=...
-export SYMPHONY_LIVE_ASANA_WORKSPACE_GID=...
-# Required only when the workspace is an organization:
-# export SYMPHONY_LIVE_ASANA_TEAM_GID=...
-SYMPHONY_RUN_ASANA_LIVE_E2E=1 mix test test/symphony_elixir/asana_live_e2e_test.exs
-```
-
-Run the opt-in GitLab live E2E against a disposable project:
-
-```bash
-cd elixir
-export GITLAB_PAT=...
-export SYMPHONY_LIVE_GITLAB_PROJECT_ID=...
-SYMPHONY_RUN_GITLAB_LIVE_E2E=1 mix test test/symphony_elixir/gitlab_live_e2e_test.exs
-```
-
-## FAQ
-
-Managed review with disposition `rework` or `waiting` reconciles the corresponding
-GitHub Project status through the existing durable transition path before the
-local phase changes. A failed provider update retains the prior phase and pending
-intent. `resume` removes a dispatch pause; use `rework` after resolving a WAITING
-failure to continue the retained assignment.
-
-### Why Elixir?
-
-Elixir is built on Erlang/BEAM/OTP, which is great for supervising long-running processes. It has an
-active ecosystem of tools and libraries. It also supports hot code reloading without stopping
-actively running subagents, which is very useful during development.
-
-### What's the easiest way to set this up for my own codebase?
-
-Launch `codex` in your repo, give it the URL to the Symphony repo, and ask it to set things up for
-you.
+See [`../SPEC.md`](../SPEC.md) for the runtime contract and the plugin repository for installation,
+upgrade, rollback, diagnostics, and managed PM usage.
 
 ## License
 
-This project is licensed under the [Apache License 2.0](../LICENSE).
-
-Managed transitions clear the retained stop flag only when the owned process has stopped and the provider transition commits. Failed provider reconciliation retains the prior stop state, so the successor cannot inherit a completed stop request.
+Apache License 2.0. See [`../LICENSE`](../LICENSE) and [`../NOTICE`](../NOTICE).

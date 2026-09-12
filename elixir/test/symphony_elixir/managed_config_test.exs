@@ -3,12 +3,12 @@ defmodule SymphonyElixir.ManagedConfigTest do
 
   alias SymphonyElixir.Config.Schema
 
-  test "managed changeset requires nonblank journal and token file paths" do
-    journal_changeset =
-      Schema.Managed.changeset(%Schema.Managed{}, %{journal_path: "   "})
+  test "managed changeset requires nonblank SQLite store and token file paths" do
+    store_changeset =
+      Schema.Managed.changeset(%Schema.Managed{}, %{store_path: "   "})
 
-    refute journal_changeset.valid?
-    assert journal_changeset.errors[:journal_path] == {"must not be blank", []}
+    refute store_changeset.valid?
+    assert store_changeset.errors[:store_path] == {"must not be blank", []}
 
     token_file_changeset =
       Schema.Managed.changeset(%Schema.Managed{}, %{control_token_file: " 	 "})
@@ -18,8 +18,8 @@ defmodule SymphonyElixir.ManagedConfigTest do
 
     valid_changeset =
       Schema.Managed.changeset(%Schema.Managed{}, %{
-        journal_path: "/tmp/managed-journal.log",
-        control_token_file: "/tmp/managed-token"
+        store_path: "C:/fixture/managed.sqlite3",
+        control_token_file: "C:/fixture/managed-token"
       })
 
     assert valid_changeset.valid?
@@ -55,30 +55,6 @@ defmodule SymphonyElixir.ManagedConfigTest do
     end
   end
 
-  test "managed config reports each required checkout path" do
-    base = %{managed: %{enabled: true, control_token: "direct-token"}}
-
-    assert {:error, {:invalid_workflow_config, message}} = Schema.parse(base)
-    assert message == "managed.enabled=true requires managed.checkout_node"
-
-    assert {:error, {:invalid_workflow_config, message}} =
-             Schema.parse(%{
-               managed: Map.put(base.managed, :checkout_node, "/srv/managed/node")
-             })
-
-    assert message == "managed.enabled=true requires managed.checkout_helper_path"
-
-    assert {:error, {:invalid_workflow_config, message}} =
-             Schema.parse(%{
-               managed:
-                 base.managed
-                 |> Map.put(:checkout_node, "/srv/managed/node")
-                 |> Map.put(:checkout_helper_path, "/srv/managed/helper")
-             })
-
-    assert message == "managed.enabled=true requires managed.checkout_policy_file"
-  end
-
   test "managed config loads the token file and normalizes managed settings" do
     test_root =
       Path.join(
@@ -88,7 +64,7 @@ defmodule SymphonyElixir.ManagedConfigTest do
 
     try do
       token_file = Path.join(test_root, "token")
-      journal_path = Path.join(test_root, "journal.log")
+      store_path = Path.join(test_root, "managed.sqlite3")
       File.mkdir_p!(test_root)
       File.write!(token_file, " file-token 
 ")
@@ -97,32 +73,34 @@ defmodule SymphonyElixir.ManagedConfigTest do
                Schema.parse(%{
                  managed: %{
                    enabled: true,
-                   journal_path: journal_path,
+                   store_path: store_path,
                    control_token: "fallback-token",
                    control_token_file: token_file,
                    control_token_env: "CUSTOM_MANAGED_TOKEN",
                    event_limit: 25,
                    event_wait_ms: 0,
-                   checkout_node: "/srv/managed/node",
-                   checkout_helper_path: "/srv/managed/helper",
-                   checkout_policy_file: "/srv/managed/policy",
-                   token_limit: 17
+                   usage_limit_tokens: 17
                  }
                })
 
       assert settings.managed.enabled
-      assert settings.managed.journal_path == journal_path
+      assert settings.managed.store_path == store_path
       assert settings.managed.control_token == "file-token"
       assert settings.managed.control_token_file == token_file
       assert settings.managed.event_limit == 25
       assert settings.managed.event_wait_ms == 0
-      assert settings.managed.checkout_node == "/srv/managed/node"
-      assert settings.managed.checkout_helper_path == "/srv/managed/helper"
-      assert settings.managed.checkout_policy_file == "/srv/managed/policy"
       assert settings.managed.usage_limit_tokens == 17
-      assert settings.managed.token_limit == 17
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "config rejects a missing launcher when APPDATA cannot supply the default" do
+    previous_app_data = System.get_env("APPDATA")
+    System.delete_env("APPDATA")
+    on_exit(fn -> restore_env("APPDATA", previous_app_data) end)
+
+    assert {:error, {:invalid_workflow_config, message}} = Schema.parse(%{})
+    assert message =~ "codex.launcher is required"
   end
 end

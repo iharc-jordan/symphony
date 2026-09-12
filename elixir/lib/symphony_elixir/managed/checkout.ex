@@ -1,157 +1,186 @@
 defmodule SymphonyElixir.Managed.Checkout do
   @moduledoc """
-  Prepares an enrolled checkout through the installed plugin's trusted helper.
+  Prepares an owned worker workspace directly with Git.
 
-  The orchestrator supplies assignment and attempt records after reserving their
-  ownership. Inputs are immutable, private files outside all worker workspaces;
-  they remain available when preparation fails or execution is interrupted.
+  Checkout authority is the provider identity and pinned commit already stored
+  on the managed assignment. No plugin, Node runtime, policy file, or staging
+  input participates in the checkout path.
   """
 
-  import Bitwise
-  alias SymphonyElixir.{HookContext, PathSafety}
+  alias SymphonyElixir.Workspace
 
-  @max_policy_bytes 16 * 1024
+  @default_timeout_ms 300_000
 
   @spec prepare(Path.t(), map(), map(), map(), keyword()) :: :ok | {:error, term()}
   def prepare(workspace, issue, assignment, attempt, opts) do
-    with {:ok, node} <- absolute_option(opts, :node_executable),
-         {:ok, helper} <- absolute_option(opts, :helper_path),
-         {:ok, policy_file} <- absolute_option(opts, :policy_file),
-         {:ok, policy} <- read_policy(policy_file),
-         {:ok, paths} <- resolve_paths(workspace, policy_file, helper, node, policy),
-         {:ok, input} <- attempt_input(paths.workspace, issue, assignment, attempt),
-         {:ok, context} <- HookContext.encode(issue),
-         {:ok, input_file} <- write_input(paths.input_root, input) do
-      invoke_helper(paths.node, paths.helper, paths.policy_file, input_file, paths.workspace, context)
+    base_commit = Map.get(assignment, :base_commit)
+
+    with {:ok, workspace} <- Workspace.validate_owned_workspace(workspace),
+         :ok <- validate_attempt(issue, assignment, attempt),
+         {:ok, repository_url} <- repository_url(opts, assignment),
+         {:ok, git} <- git_executable(opts) do
+      checkout_owned_workspace(workspace, git, repository_url, base_commit, opts)
     end
   rescue
     error in [ArgumentError, File.Error, ErlangError] ->
       {:error, {:managed_checkout_failed, error.__struct__}}
   end
 
-  defp absolute_option(opts, key) do
-    case Keyword.get(opts, key) do
-      path when is_binary(path) and path != "" ->
-        if Path.type(path) == :absolute, do: {:ok, path}, else: {:error, {:checkout_absolute_path_required, key}}
-
-      _ ->
-        {:error, {:checkout_configuration_missing, key}}
-    end
-  end
-
-  defp read_policy(path) do
-    with {:ok, %{type: :regular, size: size}} when size <= @max_policy_bytes <- File.stat(path),
-         {:ok, raw} <- File.read(path),
-         {:ok, %{"control_root" => control, "workspace_root" => workspaces} = policy}
-         when is_binary(control) and is_binary(workspaces) <- Jason.decode(raw),
-         true <- Path.type(control) == :absolute and Path.type(workspaces) == :absolute do
-      {:ok, policy}
-    else
-      _ -> {:error, :checkout_policy_invalid}
-    end
-  end
-
-  defp resolve_paths(workspace, policy_file, helper, node, policy) do
-    with true <- is_binary(workspace) and Path.type(workspace) == :absolute,
-         {:ok, control_root} <- PathSafety.canonicalize(policy["control_root"]),
-         {:ok, workspace_root} <- PathSafety.canonicalize(policy["workspace_root"]),
-         {:ok, workspace} <- PathSafety.canonicalize(workspace),
-         {:ok, policy_file} <- PathSafety.canonicalize(policy_file),
-         {:ok, helper} <- PathSafety.canonicalize(helper),
-         {:ok, node} <- PathSafety.canonicalize(node),
-         {:ok, input_root} <- PathSafety.canonicalize(Path.join(control_root, "attempts")),
-         true <- descendant?(workspace, workspace_root),
-         false <- within?(input_root, workspace_root),
-         false <- within?(policy_file, workspace_root),
-         false <- within?(helper, workspace_root),
-         false <- within?(node, workspace_root),
-         true <- descendant?(input_root, control_root) do
-      {:ok, %{workspace: workspace, input_root: input_root, node: node, helper: helper, policy_file: policy_file}}
-    else
-      _ -> {:error, :checkout_path_boundary_invalid}
-    end
-  end
-
-  defp descendant?(path, root), do: String.starts_with?(path, String.trim_trailing(root, "/") <> "/")
-  defp within?(path, root), do: path == root or descendant?(path, root)
-
-  defp attempt_input(workspace, issue, assignment, attempt) do
+  defp validate_attempt(issue, assignment, attempt) do
     id = Map.get(assignment, :assignment_id)
     attempt_id = Map.get(attempt, :attempt_id)
     base = Map.get(assignment, :base_commit)
     repository = Map.get(assignment, :repository)
 
-    if current_identity?(issue, assignment, attempt) and valid_attempt_fields?(attempt_id, base, repository, attempt) do
-      {:ok,
-       %{
-         "assignment_id" => id,
-         "attempt_id" => attempt_id,
-         "base_commit" => base,
-         "repository" => repository,
-         "workspace" => workspace,
-         "revision" => attempt.revision,
-         "generation" => attempt.generation
-       }}
+    if valid_assignment_identity?(id, issue, attempt) and
+         valid_revision_identity?(assignment, attempt) and
+         valid_attempt_identity?(attempt_id, attempt) and
+         valid_checkout_source?(base, repository) do
+      :ok
     else
       {:error, :checkout_attempt_identity_invalid}
     end
   end
 
-  defp current_identity?(issue, assignment, attempt) do
-    id = Map.get(assignment, :assignment_id)
+  defp valid_assignment_identity?(id, issue, attempt) do
+    is_binary(id) and id != "" and id == Map.get(issue, :id) and
+      id == Map.get(attempt, :assignment_id)
+  end
+
+  defp valid_revision_identity?(assignment, attempt) do
     revision = Map.get(assignment, :revision)
-
-    is_binary(id) and id != "" and id == Map.get(issue, :id) and id == Map.get(attempt, :assignment_id) and
-      is_integer(revision) and revision >= 0 and revision == Map.get(attempt, :revision)
+    is_integer(revision) and revision >= 0 and revision == Map.get(attempt, :revision)
   end
 
-  defp valid_attempt_fields?(attempt_id, base, repository, attempt) do
+  defp valid_attempt_identity?(attempt_id, attempt) do
+    generation = Map.get(attempt, :generation)
+
     is_binary(attempt_id) and byte_size(attempt_id) in 1..150 and
-      is_binary(base) and Regex.match?(~r/\A(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\z/, base) and
-      is_binary(repository) and repository != "" and
-      is_integer(Map.get(attempt, :generation)) and attempt.generation >= 0
+      is_integer(generation) and generation >= 0
   end
 
-  defp write_input(root, input) do
-    name = Base.url_encode64(input["attempt_id"], padding: false) <> ".json"
-    path = Path.join(root, name)
+  defp valid_checkout_source?(base, repository) do
+    is_binary(base) and Regex.match?(~r/\A(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\z/, base) and
+      is_binary(repository) and String.trim(repository) != ""
+  end
 
-    with :ok <- File.mkdir_p(root),
-         :ok <- File.chmod(root, 0o700) do
-      create_or_reuse_input(path, input)
+  defp repository_url(opts, assignment) do
+    url = Keyword.get(opts, :repository_url)
+
+    cond do
+      is_binary(url) and String.trim(url) != "" and safe_repository_url?(url) -> {:ok, String.trim(url)}
+      is_binary(url) -> {:error, :checkout_repository_url_invalid}
+      true -> {:error, {:checkout_repository_url_missing, Map.get(assignment, :repository)}}
     end
   end
 
-  defp create_or_reuse_input(path, input) do
-    if File.exists?(path) do
-      existing_input(path, input)
+  # Provider-authorized HTTPS URLs and configured local mirrors are the only
+  # checkout inputs used by the local Windows worker.
+  defp safe_repository_url?(url) do
+    String.starts_with?(url, "https://") or
+      String.starts_with?(url, "http://") or
+      Path.type(url) == :absolute
+  end
+
+  defp git_executable(opts) do
+    case Keyword.get(opts, :git_executable, System.find_executable("git")) do
+      executable when is_binary(executable) and executable != "" -> {:ok, executable}
+      _ -> {:error, :git_not_found}
+    end
+  end
+
+  defp checkout_owned_workspace(workspace, git, repository_url, base_commit, opts) do
+    case File.ls(workspace) do
+      {:ok, []} -> initialize_checkout(workspace, git, repository_url, base_commit, opts)
+      {:ok, _entries} -> validate_existing_checkout(workspace, git, repository_url, base_commit, opts)
+      {:error, reason} -> {:error, {:checkout_workspace_unreadable, reason}}
+    end
+  end
+
+  defp initialize_checkout(workspace, git, repository_url, base_commit, opts) do
+    with :ok <- git!(git, ["init"], workspace, opts),
+         :ok <- git!(git, ["remote", "add", "origin", repository_url], workspace, opts),
+         :ok <- git!(git, ["fetch", "--no-tags", "origin", base_commit], workspace, opts),
+         :ok <- git!(git, ["checkout", "--detach", "--force", base_commit], workspace, opts),
+         :ok <- verify_checkout(workspace, git, repository_url, base_commit, opts) do
+      :ok
     else
-      with :ok <- File.write(path, Jason.encode!(input) <> "\n", [:write, :exclusive]),
-           :ok <- File.chmod(path, 0o600) do
-        {:ok, path}
-      end
+      {:error, _reason} = error -> error
     end
   end
 
-  defp existing_input(path, expected) do
-    with {:ok, %{type: :regular, mode: mode}} <- File.lstat(path),
-         true <- band(mode, 0o077) == 0,
-         {:ok, raw} <- File.read(path),
-         {:ok, ^expected} <- Jason.decode(raw) do
-      {:ok, path}
+  defp validate_existing_checkout(workspace, git, repository_url, base_commit, opts) do
+    with :ok <- git!(git, ["rev-parse", "--is-inside-work-tree"], workspace, opts),
+         :ok <- verify_checkout(workspace, git, repository_url, base_commit, opts),
+         :ok <- ensure_clean_checkout(workspace, git, opts) do
+      :ok
     else
-      _ -> {:error, :checkout_input_conflict}
+      {:error, {:checkout_command_failed, _command, _status, _output}} ->
+        {:error, :checkout_workspace_conflict}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  defp invoke_helper(node, helper, policy, input, workspace, context) do
-    case System.cmd(node, [helper, "checkout", "--input", input, "--policy", policy],
-           cd: workspace,
-           env: [{HookContext.env_name(), context}],
-           stderr_to_stdout: true
-         ) do
-      {_output, 0} -> :ok
-      {_output, status} -> {:error, {:checkout_helper_failed, status}}
+  defp verify_checkout(workspace, git, repository_url, base_commit, opts) do
+    with {:ok, actual_url} <- git_output(git, ["remote", "get-url", "origin"], workspace, opts),
+         true <- same_repository_url?(actual_url, repository_url),
+         {:ok, actual_commit} <- git_output(git, ["rev-parse", "HEAD"], workspace, opts),
+         true <- String.downcase(String.trim(actual_commit)) == String.downcase(base_commit) do
+      :ok
+    else
+      false -> {:error, :checkout_identity_or_commit_mismatch}
+      {:error, _reason} = error -> error
     end
   end
+
+  defp ensure_clean_checkout(workspace, git, opts) do
+    with {:ok, status} <- git_output(git, ["status", "--porcelain=v1", "--untracked-files=all"], workspace, opts),
+         true <- String.trim(status) == "" do
+      :ok
+    else
+      false -> {:error, :checkout_workspace_has_unaccepted_work}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp git!(git, arguments, workspace, opts) do
+    case git_output(git, arguments, workspace, opts) do
+      {:ok, _output} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp git_output(git, arguments, workspace, opts) do
+    timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
+
+    task = Task.async(fn -> System.cmd(git, arguments, cd: workspace, stderr_to_stdout: true) end)
+
+    case Task.yield(task, timeout_ms) do
+      {:ok, {output, 0}} ->
+        {:ok, output}
+
+      {:ok, {output, status}} ->
+        {:error, {:checkout_command_failed, arguments, status, trim_output(output)}}
+
+      nil ->
+        Task.shutdown(task, :brutal_kill)
+        {:error, {:checkout_command_timeout, arguments, timeout_ms}}
+    end
+  end
+
+  defp same_repository_url?(actual, expected) do
+    normalize_repository_url(actual) == normalize_repository_url(expected)
+  end
+
+  defp normalize_repository_url(value) do
+    value
+    |> String.trim()
+    |> String.replace("\\", "/")
+    |> String.trim_trailing("/")
+    |> String.downcase()
+  end
+
+  defp trim_output(output) when is_binary(output), do: output |> String.trim() |> String.slice(0, 2_048)
 end

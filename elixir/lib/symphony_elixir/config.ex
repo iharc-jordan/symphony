@@ -85,6 +85,11 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec server_host() :: String.t()
+  def server_host do
+    Application.get_env(:symphony_elixir, :server_host_override) || settings!().server.host
+  end
+
   @doc false
   @spec managed_enabled?() :: {:ok, boolean()} | {:error, term()}
   def managed_enabled? do
@@ -103,8 +108,22 @@ defmodule SymphonyElixir.Config do
 
   @spec local_workspace_root() :: Path.t()
   def local_workspace_root do
-    workflow_dir = Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
-    Path.expand(settings!().workspace.root, workflow_dir)
+    case Application.get_env(:symphony_elixir, :workspace_root_override) do
+      root when is_binary(root) ->
+        Path.expand(root)
+
+      _ ->
+        workflow_dir = Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
+        Path.expand(settings!().workspace.root, workflow_dir)
+    end
+  end
+
+  @spec managed_store_path() :: Path.t()
+  def managed_store_path do
+    case Application.get_env(:symphony_elixir, :managed_state_root) do
+      root when is_binary(root) -> Path.join(Path.expand(root), "managed.sqlite3")
+      _ -> settings!().managed.store_path
+    end
   end
 
   @spec validate!() :: :ok | {:error, term()}
@@ -112,12 +131,11 @@ defmodule SymphonyElixir.Config do
     WorkflowStore.force_reload()
   end
 
-  @spec codex_runtime_settings(Path.t() | nil, keyword()) ::
-          {:ok, codex_runtime_settings()} | {:error, term()}
-  def codex_runtime_settings(workspace \\ nil, opts \\ []) do
+  @spec codex_runtime_settings(Path.t() | nil) :: {:ok, codex_runtime_settings()} | {:error, term()}
+  def codex_runtime_settings(workspace \\ nil) do
     with {:ok, settings} <- settings() do
       with {:ok, turn_sandbox_policy} <-
-             Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
+             Schema.resolve_runtime_turn_sandbox_policy(settings, workspace) do
         {:ok,
          %{
            approval_policy: settings.codex.approval_policy,
