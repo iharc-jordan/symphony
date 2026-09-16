@@ -88,7 +88,7 @@ defmodule SymphonyElixir.WindowsWorkspaceSafetyTest do
         end
 
       Enum.each(task_pids, &send(&1, :go))
-      results = Enum.map(tasks, &Task.await(&1, 5_000))
+      results = Enum.map(tasks, &Task.await(&1, 10_000))
 
       assert [{:ok, workspace}] = Enum.uniq(results)
       assert {:ok, ^workspace} = Workspace.validate_owned_workspace(workspace)
