@@ -207,7 +207,7 @@ defmodule SymphonyElixir.ManagedJournalTest do
     )
 
     try do
-      {_output, 0} = System.cmd(elixir_executable!(), beam_args(script, path, result_path), stderr_to_stdout: true)
+      {_output, 0} = run_fresh_beam(beam_args(script, path, result_path))
       result_path |> File.read!() |> :erlang.binary_to_term([:used]) |> elem(0)
     after
       File.rm(script)
@@ -231,7 +231,7 @@ defmodule SymphonyElixir.ManagedJournalTest do
     )
 
     try do
-      {_output, 0} = System.cmd(elixir_executable!(), beam_args(script, path, encoded), stderr_to_stdout: true)
+      {_output, 0} = run_fresh_beam(beam_args(script, path, encoded))
     after
       File.rm(script)
     end
@@ -259,7 +259,7 @@ defmodule SymphonyElixir.ManagedJournalTest do
     )
 
     try do
-      {_output, status} = System.cmd(elixir_executable!(), beam_args(script, path, encoded), stderr_to_stdout: true)
+      {_output, status} = run_fresh_beam(beam_args(script, path, encoded))
       status
     after
       File.rm(script)
@@ -274,8 +274,26 @@ defmodule SymphonyElixir.ManagedJournalTest do
     |> Kernel.++([script, first, second])
   end
 
-  defp elixir_executable! do
-    System.find_executable("elixir") || raise "elixir executable is required"
+  defp run_fresh_beam(args) do
+    {executable, command_args} = fresh_beam_command(args)
+    System.cmd(executable, command_args, stderr_to_stdout: true)
+  end
+
+  defp fresh_beam_command(args) do
+    case :os.type() do
+      {:win32, _} ->
+        elixir = System.find_executable("elixir.bat") || raise "elixir executable is required"
+        elixir_root = elixir |> Path.dirname() |> Path.join("../lib") |> Path.expand()
+        elixir_ebin = Path.join([elixir_root, "elixir", "ebin"])
+        erl = System.find_executable("erl.exe") || raise "erl executable is required"
+
+        {erl,
+         ["-noshell", "-elixir_root", elixir_root, "-pa", elixir_ebin, "-s", "elixir", "start_cli", "-extra"] ++
+           args}
+
+      _ ->
+        {System.find_executable("elixir") || raise("elixir executable is required"), args}
+    end
   end
 
   defp database_footprint(path) do
