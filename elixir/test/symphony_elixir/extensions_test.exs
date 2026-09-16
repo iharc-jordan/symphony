@@ -734,8 +734,13 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Needs a project manager"
     assert html =~ ~s(data-metric="runtime")
     assert html =~ ~s(data-metric="tokens")
-    assert html =~ ~s(data-metric="tokens">Tokens <strong>1,803</strong>)
-    assert html =~ ~s(data-metric="tokens">Tokens <strong>55</strong>)
+
+    assert html =~
+             ~s(data-metric="tokens" title="Managed-worker telemetry only; not full PM + Astra use or billed dollars">Worker telemetry <strong>1,803</strong>)
+
+    assert html =~
+             ~s(data-metric="tokens" title="Managed-worker telemetry only; not full PM + Astra use or billed dollars">Worker telemetry <strong>55</strong>)
+
     assert html =~ "Unavailable"
     refute html =~ "Finished history"
     refute html =~ "Cancelled history"
@@ -785,10 +790,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Build alpha"
     assert html =~ ~r|<dt>Runtime</dt><dd>2h 47m [0-9]+s</dd>|
     assert html =~ ~r|<dt>Current run</dt><dd>1m [0-9]+s</dd>|
-    assert html =~ ~s(<dt>Total tokens</dt><dd>1,803</dd>)
-    assert html =~ ~s(<dt>Input tokens</dt><dd>901</dd>)
-    assert html =~ ~s(<dt>Output tokens</dt><dd>902</dd>)
-    refute html =~ "<dt>Total tokens</dt><dd>12</dd>"
+    assert html =~ ~s(<dt>Managed-worker total tokens</dt><dd>1,803</dd>)
+    assert html =~ ~s(<dt>Managed-worker input tokens</dt><dd>901</dd>)
+    assert html =~ ~s(<dt>Managed-worker output tokens</dt><dd>902</dd>)
+    assert html =~ "Managed-worker telemetry excludes full PM + Astra use and is not billed dollars."
+    refute html =~ "<dt>Managed-worker total tokens</dt><dd>12</dd>"
     assert html =~ ~s(href="https://github.com/org/repo-alpha/issues/11")
     assert html =~ ~s(target="_blank")
     refute html =~ "javascript:"
@@ -801,7 +807,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     html = render(view)
     assert html =~ "<dt>Runtime</dt><dd>9m 16s (partial history)</dd>"
-    assert html =~ ~s(<dt>Total tokens</dt><dd>Unavailable</dd>)
+    assert html =~ ~s(<dt>Managed-worker total tokens</dt><dd>Unavailable</dd>)
     refute html =~ "120,000,000"
 
     view
@@ -810,9 +816,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     html = render(view)
     assert html =~ ~s(<dt>Runtime</dt><dd>2m 3s</dd>)
-    assert html =~ ~s(<dt>Total tokens</dt><dd>55</dd>)
-    assert html =~ ~s(<dt>Input tokens</dt><dd>21</dd>)
-    assert html =~ ~s(<dt>Output tokens</dt><dd>34</dd>)
+    assert html =~ ~s(<dt>Managed-worker total tokens</dt><dd>55</dd>)
+    assert html =~ ~s(<dt>Managed-worker input tokens</dt><dd>21</dd>)
+    assert html =~ ~s(<dt>Managed-worker output tokens</dt><dd>34</dd>)
 
     view
     |> element(~s(button[data-assignment-id="assign-review"]))
@@ -879,7 +885,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert has_element?(view, ~s([data-assignment-id="assign-accepted"]))
     html = render(view)
-    assert html =~ ~s(data-metric="tokens">Tokens <strong>15</strong>)
+
+    assert html =~
+             ~s(data-metric="tokens" title="Managed-worker telemetry only; not full PM + Astra use or billed dollars">Worker telemetry <strong>15</strong>)
 
     view
     |> element(~s(button[data-assignment-id="assign-accepted"]))
@@ -887,9 +895,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     html = render(view)
     assert html =~ ~s(<dt>Runtime</dt><dd>1m 4s</dd>)
-    assert html =~ ~s(<dt>Total tokens</dt><dd>15</dd>)
-    assert html =~ ~s(<dt>Input tokens</dt><dd>7</dd>)
-    assert html =~ ~s(<dt>Output tokens</dt><dd>8</dd>)
+    assert html =~ ~s(<dt>Managed-worker total tokens</dt><dd>15</dd>)
+    assert html =~ ~s(<dt>Managed-worker input tokens</dt><dd>7</dd>)
+    assert html =~ ~s(<dt>Managed-worker output tokens</dt><dd>8</dd>)
 
     view
     |> element("button.manager-option", "Earlier unassigned work")
@@ -903,7 +911,8 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     html = render(view)
     assert html =~ "Runtime details"
-    assert html =~ ~s(<dt>Managed tokens</dt><dd>Unavailable</dd>)
+    assert html =~ ~s(<dt>Managed-worker telemetry</dt><dd>Unavailable</dd>)
+    assert html =~ ~s(<dt>Current managed-worker attempt</dt><dd>Unavailable</dd>)
     assert html =~ "Projects and repositories"
     assert html =~ "Project 4"
     assert html =~ "org/repo-alpha"

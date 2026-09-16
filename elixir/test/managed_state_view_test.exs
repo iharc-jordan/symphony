@@ -13,12 +13,19 @@ defmodule SymphonyElixirWeb.ManagedStateViewTest do
       summary: String.duplicate("x", 600),
       evidence: [%{secret: "omitted from summary"}],
       source: "worker",
-      attempt_id: "attempt-1"
+      attempt_id: "attempt-1",
+      updated_at: ~U[2026-09-16 16:00:00Z]
     }
 
     state =
       state_with_assignments(%{
-        "active" => assignment("active", "PVT_one", @pm, :ready, last_report: report),
+        "active" =>
+          assignment("active", "PVT_one", @pm, :ready,
+            last_report: report,
+            worker_active: true,
+            worker_activity: "running verification",
+            escalation_reason: "Requires a connected-runtime diagnosis"
+          ),
         "accepted-sibling" => assignment("accepted-sibling", "PVT_one", @pm, :accepted),
         "terminal-only" => assignment("terminal-only", "PVT_two", @pm, :cancelled),
         "other-owner" => assignment("other-owner", "PVT_one", @other_pm, :active)
@@ -37,10 +44,14 @@ defmodule SymphonyElixirWeb.ManagedStateViewTest do
     assert summary.report_id == "report-1"
     assert summary.source == "worker"
     assert summary.attempt_id == "attempt-1"
+    assert summary.updated_at == "2026-09-16T16:00:00Z"
+    assert summary.truncated
     assert payload.assignments["active"].attempt.attempt_id == "attempt-active"
     assert payload.assignments["active"].attempt.revision == 1
     assert byte_size(summary.summary) == 500
     refute Map.has_key?(summary, :evidence)
+    assert payload.assignments["active"].worker.activity == "running verification"
+    assert payload.assignments["active"].route.escalation_reason == "Requires a connected-runtime diagnosis"
     assert payload.usage["future_unknown"] == true
   end
 

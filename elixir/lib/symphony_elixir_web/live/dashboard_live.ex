@@ -159,7 +159,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <span><i class="state-dot state-review"></i><strong>{@work_counts.review}</strong> need review</span>
             <span><i class="state-dot state-waiting"></i><strong>{@work_counts.waiting}</strong> waiting</span>
             <span><i class="state-dot state-ready"></i><strong>{@work_counts.queued}</strong> queued</span>
-            <span class="summary-usage"><strong>{format_tokens(@payload.managed.usage, :inflight_tokens)}</strong> current-attempt tokens</span>
+            <span class="summary-usage"><strong>{format_tokens(@payload.managed.usage, :inflight_tokens)}</strong> managed-worker telemetry</span>
             <span><strong>{format_duration(running_seconds(@payload, @now))}</strong> running-worker time</span>
           </div>
 
@@ -253,19 +253,22 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <div><dt>Worker</dt><dd>{if worker_running?(@selected_task), do: "Running", else: "Not running"}</dd></div>
                         <div><dt>Runtime</dt><dd>{format_task_runtime(@selected_task, @payload, @now)}</dd></div>
                         <div :if={worker_running?(@selected_task)}><dt>Current run</dt><dd>{format_duration(current_run_seconds(@selected_task, @payload, @now))}</dd></div>
-                        <div><dt>Total tokens</dt><dd>{format_tokens(@selected_task.usage, :total_tokens)}</dd></div>
-                        <div><dt>Input tokens</dt><dd>{format_tokens(@selected_task.usage, :input_tokens)}</dd></div>
-                        <div :if={@selected_task.usage[:cached_input_tokens]}><dt>Cached input tokens</dt><dd>{format_tokens(@selected_task.usage, :cached_input_tokens)}</dd></div>
-                        <div><dt>Output tokens</dt><dd>{format_tokens(@selected_task.usage, :output_tokens)}</dd></div>
+                        <div><dt>Managed-worker total tokens</dt><dd>{format_tokens(@selected_task.usage, :total_tokens)}</dd></div>
+                        <div><dt>Managed-worker input tokens</dt><dd>{format_tokens(@selected_task.usage, :input_tokens)}</dd></div>
+                        <div :if={@selected_task.usage[:cached_input_tokens]}><dt>Cached managed-worker input tokens</dt><dd>{format_tokens(@selected_task.usage, :cached_input_tokens)}</dd></div>
+                        <div><dt>Managed-worker output tokens</dt><dd>{format_tokens(@selected_task.usage, :output_tokens)}</dd></div>
                         <div :if={@selected_task.worker.host}><dt>Worker host</dt><dd>{@selected_task.worker.host}</dd></div>
                         <div><dt>{if @selected_task.route[:source] == "running", do: "Running model & effort", else: "Configured model & effort"}</dt><dd>{route_label(@selected_task)}</dd></div>
+                        <div :if={@selected_task.route[:escalation_reason]}><dt>Escalation reason</dt><dd>{@selected_task.route.escalation_reason}</dd></div>
+                        <div :if={@selected_task.worker[:activity]}><dt>Worker activity</dt><dd>{@selected_task.worker.activity}</dd></div>
                         <div><dt>Repository</dt><dd>{@selected_task[:repository] || "Not recorded"}</dd></div>
                       </dl>
+                      <p class="detail-note">Managed-worker telemetry excludes full PM + Astra use and is not billed dollars. Worker activity does not confirm parent delivery.</p>
                       <p :if={@selected_task[:blocked_reason]} class="waiting-reason"><strong>Waiting reason</strong>{@selected_task.blocked_reason}</p>
                       <p :if={@selected_task.projection.status == "failed"} class="waiting-reason"><strong>Project update failed</strong>{@selected_task.projection.error}</p>
                       <p :if={@selected_task[:stop_pending] == true} class="detail-note">Process reconciliation is pending.</p>
                       <%= if get_in(@selected_task, [:last_report, :summary]) do %>
-                        <section class="report-preview"><h4>Latest report</h4><p>{@selected_task.last_report[:summary]}</p>
+                        <section class="report-preview"><h4>Latest report · {@selected_task.last_report[:updated_at] || "timestamp unavailable"}</h4><p>{@selected_task.last_report[:summary]}</p>
                           <details :if={@selected_task.last_report[:evidence] not in [nil, []]}><summary>Evidence</summary><ul><li :for={item <- @selected_task.last_report.evidence}>{item}</li></ul></details>
                         </section>
                       <% end %>
@@ -318,8 +321,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
       <div class="runtime-heading"><h2>Runtime details</h2><p>Session activity and service diagnostics.</p></div>
       <dl class="service-totals" aria-label="Service totals including completed sessions">
         <%= if @payload[:managed] do %>
-          <div><dt>Managed tokens</dt><dd>{format_tokens(@payload.managed.usage, :cumulative_tokens)}</dd></div>
-          <div><dt>Current-attempt tokens</dt><dd>{format_tokens(@payload.managed.usage, :inflight_tokens)}</dd></div>
+          <div><dt>Managed-worker telemetry</dt><dd>{format_tokens(@payload.managed.usage, :cumulative_tokens)}</dd></div>
+          <div><dt>Current managed-worker attempt</dt><dd>{format_tokens(@payload.managed.usage, :inflight_tokens)}</dd></div>
         <% else %>
           <div><dt>Total tokens</dt><dd>{format_count(@payload.codex_totals.total_tokens)}</dd></div>
           <div><dt>Input tokens</dt><dd>{format_count(@payload.codex_totals.input_tokens)}</dd></div>
@@ -333,7 +336,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <p class="detail-note">Per-state overrides: <code>{format_limits(get_in(@payload, [:managed, :diagnostics, :concurrency, :by_state]))}</code></p>
         </section>
       <% end %>
-      <p class="detail-note">Service totals include completed sessions. Unavailable totals indicate incomplete historical accounting.</p>
+      <p class="detail-note">Managed-worker telemetry excludes full PM + Astra use and is not billed dollars. Service totals include completed sessions; unavailable totals indicate incomplete historical accounting.</p>
       <section class="runtime-section"><h3>Running sessions <span>{length(@payload.running)}</span></h3>
         <p :if={@payload.running == []} class="empty-copy">No workers are running.</p>
         <article :for={entry <- @payload.running} class="session-row">
@@ -377,7 +380,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
     ~H"""
     <span class="task-metrics">
       <span data-metric="runtime" title="Recorded assignment runtime plus the current worker run">Runtime <strong>{format_task_runtime(@task, @payload, @now)}</strong></span>
-      <span data-metric="tokens">Tokens <strong>{format_tokens(@task.usage, :total_tokens)}</strong></span>
+      <span data-metric="tokens" title="Managed-worker telemetry only; not full PM + Astra use or billed dollars">Worker telemetry <strong>{format_tokens(@task.usage, :total_tokens)}</strong></span>
     </span>
     """
   end
@@ -573,8 +576,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp task_activity(%{worker: %{active: true}} = task, payload) do
     case Enum.find(payload.running, &(&1.issue_id == task.assignment_id)) do
-      nil -> task.worker.activity || "Worker is running"
-      active -> display_activity(active.last_message)
+      nil -> worker_activity(task.worker.activity)
+      active -> worker_activity(display_activity(active.last_message))
     end
   end
 
@@ -592,6 +595,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp task_activity(_task, _payload), do: "Worker is not running"
+
+  defp worker_activity(nil), do: "Worker activity: no update recorded"
+  defp worker_activity(activity), do: "Worker activity: #{activity}"
 
   defp display_activity(nil), do: "Worker is running"
 

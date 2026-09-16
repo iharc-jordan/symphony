@@ -48,6 +48,7 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
           turn_model: "gpt-5.6-luna",
           turn_effort: "xhigh",
           route: %{model: "gpt-5.6-terra", effort: "max"},
+          escalation_reason: "Requires a connected-runtime diagnosis",
           started_at: terminal_projection_time,
           usage: %{
             input_tokens: 901,
@@ -60,7 +61,8 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
           last_report: %{
             kind: "checkpoint",
             summary: "<safe summary>",
-            evidence: ["check passed", %{private: "must not be exposed"}]
+            evidence: ["check passed", %{private: "must not be exposed"}],
+            updated_at: now
           },
           reports: %{
             {"attempt-1", "report-1"} => %{attempt_id: "attempt-1", report_id: "report-1", kind: "checkpoint", summary: "first"},
@@ -162,8 +164,15 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
     assignments = payload.managed.assignments
 
     assert assignments["active"].ownership.display_name == "PM <One>"
-    assert assignments["active"].route == %{model: "gpt-5.6-luna", effort: "xhigh", source: "running"}
-    assert assignments["queued"].route == %{model: "gpt-5.6-terra", effort: "max", source: "configured"}
+
+    assert assignments["active"].route == %{
+             model: "gpt-5.6-luna",
+             effort: "xhigh",
+             escalation_reason: "Requires a connected-runtime diagnosis",
+             source: "running"
+           }
+
+    assert assignments["queued"].route == %{model: "gpt-5.6-terra", effort: "max", escalation_reason: nil, source: "configured"}
     assert assignments["active"].started_at == DateTime.to_iso8601(terminal_projection_time)
 
     assert assignments["active"].usage == %{
@@ -209,7 +218,8 @@ defmodule SymphonyElixirWeb.PresenterManagedDashboardTest do
     assert assignments["active"].last_report == %{
              kind: "checkpoint",
              summary: "<safe summary>",
-             evidence: ["check passed"]
+             evidence: ["check passed"],
+             updated_at: DateTime.to_iso8601(now)
            }
 
     assert Enum.map(assignments["active"].reports, & &1.report_id) |> Enum.sort() == ["report-1", "report-2"]

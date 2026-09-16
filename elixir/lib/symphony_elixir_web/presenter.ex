@@ -549,11 +549,22 @@ defmodule SymphonyElixirWeb.Presenter do
     route = field_value(assignment, :route) || %{}
     turn_model = text_value(field_value(assignment, :turn_model))
     active = nonterminal_assignment?(assignment) and field_value(assignment, :worker_active) == true
+    escalation_reason = safe_text(field_value(assignment, :escalation_reason) || field_value(route, :escalation_reason))
 
     if active and not is_nil(turn_model) do
-      %{model: turn_model, effort: text_value(field_value(assignment, :turn_effort)), source: "running"}
+      %{
+        model: turn_model,
+        effort: text_value(field_value(assignment, :turn_effort)),
+        escalation_reason: escalation_reason,
+        source: "running"
+      }
     else
-      %{model: text_value(field_value(route, :model)), effort: text_value(field_value(route, :effort)), source: "configured"}
+      %{
+        model: text_value(field_value(route, :model)),
+        effort: text_value(field_value(route, :effort)),
+        escalation_reason: escalation_reason,
+        source: "configured"
+      }
     end
   end
 
@@ -565,7 +576,8 @@ defmodule SymphonyElixirWeb.Presenter do
       attempt_id: safe_report_text(field_value(report, :attempt_id)),
       kind: safe_report_text(field_value(report, :kind)),
       summary: safe_report_text(field_value(report, :summary)),
-      evidence: safe_report_evidence(field_value(report, :evidence))
+      evidence: safe_report_evidence(field_value(report, :evidence)),
+      updated_at: iso8601(field_value(report, :updated_at))
     })
   end
 

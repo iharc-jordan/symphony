@@ -385,7 +385,8 @@ defmodule SymphonyElixirWeb.ManagedStateView do
     compact(%{
       id: text_value(field(assignment, :worker_id)),
       host: text_value(field(assignment, :worker_host)),
-      active: worker_active?(assignment)
+      active: worker_active?(assignment),
+      activity: text_value(field(assignment, :worker_activity))
     })
   end
 
@@ -397,6 +398,7 @@ defmodule SymphonyElixirWeb.ManagedStateView do
     compact(%{
       model: text_value(field(route, :model) || field(assignment, :turn_model)),
       effort: text_value(field(route, :effort) || field(assignment, :turn_effort)),
+      escalation_reason: text_value(field(assignment, :escalation_reason) || field(route, :escalation_reason)),
       source: if(worker_active?(assignment), do: "running", else: "configured")
     })
   end
@@ -418,15 +420,19 @@ defmodule SymphonyElixirWeb.ManagedStateView do
   defp report_summary(nil), do: nil
 
   defp report_summary(report) when is_map(report) do
+    summary = report |> field(:summary) |> report_text()
+
     compact(%{
       report_id: report_id_from(report),
       kind: text_value(field(report, :kind)),
-      summary: report |> field(:summary) |> report_text() |> String.slice(0, @summary_report_limit),
+      summary: String.slice(summary, 0, @summary_report_limit),
+      truncated: String.length(summary) > @summary_report_limit,
       source: text_value(field(report, :source) || field(report, :source_id)),
       source_assignment_id: text_value(field(report, :source_assignment_id)),
       source_attempt_id: text_value(field(report, :source_attempt_id)),
       attempt_id: text_value(field(report, :attempt_id)),
-      attempt: scalar(field(report, :attempt))
+      attempt: scalar(field(report, :attempt)),
+      updated_at: timestamp(field(report, :updated_at))
     })
   end
 
