@@ -4,7 +4,7 @@ This directory contains the native Windows 11 x64 Symphony runtime paired with t
 Orchestration plugin. Symphony polls or receives managed work, creates one local workspace per
 assignment, and runs Codex App Server inside an owned Windows Job Object.
 
-The supported installed path is the paired `0.3.0` plugin and runtime release. End users do not
+The supported installed path is the paired `0.4.0` plugin and runtime release. End users do not
 install Erlang, Elixir, Rust, WSL, SSH services, or a second Codex copy. The plugin resolves the
 installed `%APPDATA%\npm\codex.cmd`, creates the protected local configuration, installs the hidden
 least-privilege Task Scheduler task, and downloads the pinned Windows runtime ZIP.
