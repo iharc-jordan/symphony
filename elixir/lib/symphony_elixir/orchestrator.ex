@@ -1580,13 +1580,12 @@ defmodule SymphonyElixir.Orchestrator do
       }
 
       case Map.get(reports, report_key) do
-        ^canonical ->
-          {:ok, data}
-
         existing when is_map(existing) ->
-          {:error, :report_id_conflict, %{attempt_id: attempt_id, report_id: report_id}}
+          existing_managed_report(existing, canonical, data, attempt_id, report_id)
 
         nil ->
+          canonical = Map.put(canonical, :updated_at, DateTime.utc_now())
+
           updated =
             assignment
             |> Map.put(:reports, Map.put(reports, report_key, canonical))
@@ -1610,6 +1609,14 @@ defmodule SymphonyElixir.Orchestrator do
     else
       :error -> {:error, :assignment_not_found, %{assignment_id: assignment_id}}
       {:error, code, details} -> {:error, code, details}
+    end
+  end
+
+  defp existing_managed_report(existing, canonical, data, attempt_id, report_id) do
+    if Map.drop(existing, [:updated_at]) == canonical do
+      {:ok, data}
+    else
+      {:error, :report_id_conflict, %{attempt_id: attempt_id, report_id: report_id}}
     end
   end
 

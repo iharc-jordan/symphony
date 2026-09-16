@@ -565,6 +565,7 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     assert assignment.turns_reserved == 2
     assert assignment.last_report.report_id == "r1"
     assert assignment.last_report.summary == "done"
+    assert %DateTime{} = assignment.last_report.updated_at
   end
 
   test "managed run options use the assignment lifetime budget without the default twenty-turn ceiling" do
@@ -660,6 +661,7 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
     assert map_size(reports) == 2
     assert snapshot.assignments["item-1"].last_report.attempt_id == "attempt-2"
     assert snapshot.assignments["item-1"].last_report.summary == "second result"
+    assert %DateTime{} = snapshot.assignments["item-1"].last_report.updated_at
   end
 
   test "stale managed worker telemetry cannot charge its replacement attempt" do
