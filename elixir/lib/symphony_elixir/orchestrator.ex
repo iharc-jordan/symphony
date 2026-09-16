@@ -2317,15 +2317,30 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp execute_managed_transition(%State{} = state, assignment, intent, _response) do
-    with :ok <- managed_binding_unchanged(state, assignment, intent[:binding]),
-         {:ok, provider_assignment} <- managed_transition_provider_assignment(state, assignment, intent),
-         {:ok, reconciled_state} <- managed_apply_provider_transition(state, provider_assignment, intent.target) do
-      commit_managed_transition(reconciled_state, intent)
+    if managed_transition_waiting_for_stop?(state, intent) do
+      {:reply,
+       {:ok,
+        %{
+          pending: true,
+          stop_pending: true,
+          request_id: intent.request_id
+        }}, state}
     else
-      {:error, %State{} = failed_state, reason} -> fail_managed_transition(failed_state, intent, reason)
-      {:error, reason} -> fail_managed_transition(state, intent, reason)
-      {:error, code, details} -> fail_managed_transition(state, intent, {code, details})
+      with :ok <- managed_binding_unchanged(state, assignment, intent[:binding]),
+           {:ok, provider_assignment} <- managed_transition_provider_assignment(state, assignment, intent),
+           {:ok, reconciled_state} <- managed_apply_provider_transition(state, provider_assignment, intent.target) do
+        commit_managed_transition(reconciled_state, intent)
+      else
+        {:error, %State{} = failed_state, reason} -> fail_managed_transition(failed_state, intent, reason)
+        {:error, reason} -> fail_managed_transition(state, intent, reason)
+        {:error, code, details} -> fail_managed_transition(state, intent, {code, details})
+      end
     end
+  end
+
+  defp managed_transition_waiting_for_stop?(state, intent) do
+    is_map(intent[:request]) and get_in(intent, [:context, :stop_reconciled]) == false and
+      Map.has_key?(state.running, intent.assignment_id)
   end
 
   defp managed_transition_provider_assignment(state, assignment, %{request: request, assignment_id: assignment_id} = intent) do

@@ -1075,6 +1075,103 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
     {pid, path}
   end
 
+  test "poll recovery waits for a managed worker stop before replaying an explicit transition" do
+    {pid, _path} = managed_server()
+
+    assert {:ok, _} =
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{
+               request_id: "bind",
+               operation: :bind_project,
+               args: binding_args()
+             })
+
+    assert {:ok, _} =
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{
+               request_id: "enroll",
+               operation: :enroll,
+               args: enrollment_args()
+             })
+
+    parent = self()
+
+    fake_pid =
+      spawn(fn ->
+        receive do
+          message ->
+            send(parent, {:worker_control, message})
+            Process.sleep(:infinity)
+        end
+      end)
+
+    on_exit(fn -> if Process.alive?(fake_pid), do: Process.exit(fake_pid, :kill) end)
+    ref = make_ref()
+    attempt = %{assignment_id: "item-1", revision: 1, generation: 1, attempt_id: "attempt-1"}
+
+    :sys.replace_state(pid, fn state ->
+      assignment =
+        Map.merge(state.managed.data.assignments["item-1"], %{
+          phase: :review,
+          board_state: :review,
+          generation: 1,
+          attempt_id: "attempt-1",
+          transition_observer: parent
+        })
+
+      running = %{
+        pid: fake_pid,
+        ref: ref,
+        issue: %SymphonyElixir.Tracker.Issue{id: "item-1", identifier: "acme/example#5"},
+        identifier: "acme/example#5",
+        session_id: nil,
+        worker_host: nil,
+        workspace_path: nil,
+        managed_attempt: attempt,
+        codex_input_tokens: 0,
+        codex_output_tokens: 0,
+        codex_total_tokens: 0,
+        started_at: DateTime.utc_now()
+      }
+
+      data = put_in(state.managed.data, [:assignments, "item-1"], assignment)
+
+      %{
+        state
+        | managed: %{state.managed | data: data, effects: SymphonyElixir.ManagedCountingTransitionStub},
+          running: %{"item-1" => running}
+      }
+    end)
+
+    assert {:ok, %{pending: true, stop_pending: true}} =
+             SymphonyElixir.ManagedOrchestratorTestControl.submit(pid, %{
+               request_id: "review-rework-running",
+               operation: :review,
+               args: %{
+                 project_id: "PVT_test",
+                 assignment_id: "item-1",
+                 expected_revision: 1,
+                 expected_ownership_revision: 1,
+                 disposition: :rework,
+                 reason: "apply revision after the worker stops"
+               }
+             })
+
+    assert_receive {:worker_control, {:symphony_stop, :managed_stop_pending}}, 1_000
+
+    recovered = Orchestrator.recover_managed_transitions_for_test(:sys.get_state(pid))
+    refute_receive {:managed_transition_effect, "item-1", :ready}, 100
+    assert recovered.managed.data.effect_intents["review-rework-running"].status == :pending
+    assert recovered.managed.data.assignments["item-1"].phase == :review
+    assert recovered.managed.data.assignments["item-1"].stop_pending == true
+    :sys.replace_state(pid, fn _ -> recovered end)
+
+    send(pid, {:DOWN, ref, :process, fake_pid, {:managed_agent_guard_stop, :managed_stop_pending}})
+    assert {:ok, snapshot} = Control.state(pid)
+    assert_receive {:managed_transition_effect, "item-1", :ready}, 1_000
+    assert snapshot.assignments["item-1"].phase == :ready
+    assert snapshot.assignments["item-1"].stop_pending == false
+    assert :sys.get_state(pid).managed.data.effect_intents["review-rework-running"].status == :committed
+  end
+
   test "startup recovery replays automatic provider intents with no control request" do
     name = Module.concat(__MODULE__, :"server_#{System.unique_integer([:positive])}")
     path = Path.join(System.tmp_dir!(), "managed-recovery-#{System.unique_integer([:positive])}.log")
