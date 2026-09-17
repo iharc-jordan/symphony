@@ -1593,8 +1593,6 @@ defmodule SymphonyElixir.Managed.Rules do
     end
   end
 
-  defp project_requirement_metadata(_context), do: {:error, :project_requirements_snapshot_required, %{}}
-
   defp current_project_requirements(assignment, context) do
     case Map.get(context, :project_requirements, Map.get(context, "project_requirements")) do
       nil ->

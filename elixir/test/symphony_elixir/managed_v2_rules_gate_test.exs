@@ -302,6 +302,34 @@ defmodule SymphonyElixir.ManagedV2RulesGateTest do
 
     assert revised.assignments["requirements"].project_requirements_fingerprint == refreshed_fingerprint
     assert enrolled.assignments["requirements"].project_requirements_fingerprint == initial_fingerprint
+
+    review_state =
+      put_in(enrolled, [:assignments, "requirements"], %{
+        enrolled.assignments["requirements"]
+        | phase: :review,
+          board_state: :review,
+          revision: 2
+      })
+
+    review =
+      envelope("review-requirements", :review, %{
+        assignment_id: "requirements",
+        project_id: @project_id,
+        expected_revision: 2,
+        expected_ownership_revision: 1,
+        disposition: :accepted,
+        evidence: ["verified"]
+      })
+
+    assert {:error, :managed_project_requirements_changed, %{}} =
+             Rules.prepare_review(
+               review_state,
+               review,
+               %{principal: @pm, project_requirements: %{fingerprint: "sha256:requirements-stale"}}
+             )
+
+    assert {:error, :managed_project_requirements_changed, %{}} =
+             Rules.prepare_review(review_state, review, %{principal: @pm, project_requirements: :invalid})
   end
 
   test "malformed contexts and project shapes fail closed while free resources remain available" do

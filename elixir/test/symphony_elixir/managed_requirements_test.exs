@@ -61,4 +61,41 @@ defmodule SymphonyElixir.ManagedRequirementsTest do
 
     assert {:error, :project_requirements_not_regular_file} = Requirements.read(%{requirements_path: path})
   end
+
+  test "reports unreadable requirements while another process holds an exclusive file lock" do
+    directory = Path.join(System.tmp_dir!(), "symphony-locked-requirements-#{System.unique_integer([:positive])}")
+    path = Path.join(directory, "REQUIREMENTS.md")
+    File.mkdir_p!(directory)
+    File.write!(path, "# Requirements\n")
+    on_exit(fn -> File.rm_rf(directory) end)
+
+    script =
+      "$stream = [IO.File]::Open($env:REQUIREMENTS_TEST_PATH, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None); " <>
+        "try { [Console]::Out.WriteLine('locked'); [Console]::In.ReadLine() | Out-Null } finally { $stream.Dispose() }"
+
+    port =
+      Port.open({:spawn_executable, System.find_executable("powershell.exe")}, [
+        :binary,
+        :exit_status,
+        :use_stdio,
+        :hide,
+        :stderr_to_stdout,
+        args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        env: [{~c"REQUIREMENTS_TEST_PATH", String.to_charlist(path)}]
+      ])
+
+    try do
+      assert_receive {^port, {:data, ready}}, 10_000
+      assert String.contains?(ready, "locked")
+      assert {:error, :project_requirements_unreadable} = Requirements.read(%{requirements_path: path})
+    after
+      if Port.info(port), do: Port.command(port, "release\n")
+
+      receive do
+        {^port, {:exit_status, _status}} -> :ok
+      after
+        5_000 -> if Port.info(port), do: Port.close(port)
+      end
+    end
+  end
 end
