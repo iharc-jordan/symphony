@@ -25,6 +25,7 @@ defmodule SymphonyElixir.ManagedRequirementsTest do
     assert {:ok, %{content: ^content}} = Requirements.read(%{"requirements_path" => path})
     assert {:error, :project_requirements_path_invalid} = Requirements.read(%{})
     assert {:error, :project_requirements_path_invalid} = Requirements.read(:invalid)
+    assert {:error, :project_requirements_path_invalid} = Requirements.path(:invalid)
   end
 
   test "reports a missing bound requirements file" do

@@ -1326,6 +1326,21 @@ defmodule SymphonyElixir.CoreTest do
     assert reason_only_prompt =~ "- No evidence supplied."
   end
 
+  test "prompt builder injects the current project requirements with their fingerprint" do
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: "Resolve the assigned ticket.")
+
+    issue = %Issue{identifier: "MT-REQUIREMENTS", title: "Honor current requirements", state: "Ready", labels: []}
+
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        project_requirements: %{content: "- Keep MFA disabled.\n", fingerprint: "sha256:requirements-current"}
+      )
+
+    assert prompt =~ "CURRENT PROJECT REQUIREMENTS"
+    assert prompt =~ "Revision: sha256:requirements-current"
+    assert prompt =~ "- Keep MFA disabled."
+  end
+
   test "prompt builder marks peer reports as non-authoritative reference material" do
     write_workflow_file!(Workflow.workflow_file_path(), prompt: "Resolve the assigned ticket.")
 
