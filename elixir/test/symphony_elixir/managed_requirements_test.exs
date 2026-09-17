@@ -26,7 +26,8 @@ defmodule SymphonyElixir.ManagedRequirementsTest do
     assert {:error, :project_requirements_path_invalid} = Requirements.read(%{})
     assert {:error, :project_requirements_path_invalid} = Requirements.read(:invalid)
     assert {:error, :project_requirements_path_invalid} = Requirements.path(:invalid)
-end
+  end
+
   test "reports a missing bound requirements file" do
     path = Path.join(System.tmp_dir!(), "symphony-missing-#{System.unique_integer([:positive])}") |> Path.join("REQUIREMENTS.md")
 

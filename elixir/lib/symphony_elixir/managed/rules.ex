@@ -35,7 +35,8 @@ defmodule SymphonyElixir.Managed.Rules do
     {attempt_id, report_id}
     |> :erlang.term_to_binary()
     |> Base.url_encode64(padding: false)
-end
+  end
+
   @spec peer_report_context(state(), map()) :: {:ok, [map()]} | {:unavailable, map()}
   def peer_report_context(state, assignment) when is_map(state) and is_map(assignment) do
     refs = get_in(assignment, [:review_feedback, :peer_report_refs]) || []
