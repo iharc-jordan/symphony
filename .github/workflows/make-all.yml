@@ -43,9 +43,9 @@ jobs:
             }
           }
 
-          Invoke-Mix deps.get
-          Invoke-Mix compile --warnings-as-errors
-          Invoke-Mix format --check-formatted
-          Invoke-Mix lint
-          Invoke-Mix test --cover
-          Invoke-Mix dialyzer --format short
+          Invoke-Mix -MixArgs @('deps.get')
+          Invoke-Mix -MixArgs @('compile', '--warnings-as-errors')
+          Invoke-Mix -MixArgs @('format', '--check-formatted')
+          Invoke-Mix -MixArgs @('lint')
+          Invoke-Mix -MixArgs @('test', '--cover')
+          Invoke-Mix -MixArgs @('dialyzer', '--format', 'short')
