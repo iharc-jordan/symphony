@@ -403,8 +403,8 @@ defmodule SymphonyElixir.Orchestrator do
 
       with true <- is_map(binding),
            {:ok, project_requirements} <- Requirements.read(binding),
-           {:ok, source_identity} <- managed_enrollment_source_identity(state, binding, args, assignment_id),
-           do: {:ok, %{source_identity: source_identity, project_requirements: project_requirements}}
+           {:ok, source_identity} <- managed_enrollment_source_identity(state, binding, args, assignment_id) do
+        {:ok, %{source_identity: source_identity, project_requirements: project_requirements}}
       else
         {:error, reason} when is_atom(reason) ->
           {:error, reason, %{assignment_id: assignment_id}}
