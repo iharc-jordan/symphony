@@ -36,9 +36,16 @@ jobs:
       - name: Verify make all
         shell: pwsh
         run: |
-          mix deps.get
-          mix compile --warnings-as-errors
-          mix format --check-formatted
-          mix lint
-          mix test --cover
-          mix dialyzer --format short
+          function Invoke-Mix([string[]]$MixArgs) {
+            & mix @MixArgs
+            if ($LASTEXITCODE -ne 0) {
+              throw "mix $($MixArgs -join ' ') failed with exit code $LASTEXITCODE"
+            }
+          }
+
+          Invoke-Mix deps.get
+          Invoke-Mix compile --warnings-as-errors
+          Invoke-Mix format --check-formatted
+          Invoke-Mix lint
+          Invoke-Mix test --cover
+          Invoke-Mix dialyzer --format short
