@@ -34,6 +34,18 @@ defmodule SymphonyElixir.ManagedRequirementsTest do
     assert {:error, :project_requirements_missing} = Requirements.read(%{requirements_path: path})
   end
 
+  test "reports an unreadable requirements path" do
+    directory = Path.join(System.tmp_dir!(), "symphony-unreadable-requirements-#{System.unique_integer([:positive])}")
+    parent = Path.join(directory, "not-a-directory")
+    path = Path.join(parent, "REQUIREMENTS.md")
+    File.mkdir_p!(directory)
+    File.write!(parent, "not a directory")
+
+    on_exit(fn -> File.rm_rf(directory) end)
+
+    assert {:error, :project_requirements_unreadable} = Requirements.read(%{requirements_path: path})
+  end
+
   test "rejects oversized and invalid requirement sources" do
     directory = Path.join(System.tmp_dir!(), "symphony-invalid-requirements-#{System.unique_integer([:positive])}")
     path = Path.join(directory, "REQUIREMENTS.md")
