@@ -21,6 +21,7 @@ defmodule SymphonyElixir.Managed.Requirements do
          :ok <- valid_content(content) do
       {:ok, %{path: path, content: content, fingerprint: fingerprint(content)}}
     else
+      {:error, :project_requirements_path_invalid} -> {:error, :project_requirements_path_invalid}
       {:error, :enoent} -> {:error, :project_requirements_missing}
       {:error, _reason} -> {:error, :project_requirements_unreadable}
       {:invalid, reason} -> {:error, reason}

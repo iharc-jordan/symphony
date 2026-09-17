@@ -22,6 +22,9 @@ defmodule SymphonyElixir.ManagedRequirementsTest do
     assert PathSafety.same_path?(resolved_path, path)
     assert fingerprint == Requirements.fingerprint(content)
     assert {:error, :project_requirements_path_invalid} = Requirements.read(%{requirements_path: Path.join(directory, "notes.md")})
+    assert {:ok, %{content: ^content}} = Requirements.read(%{"requirements_path" => path})
+    assert {:error, :project_requirements_path_invalid} = Requirements.read(%{})
+    assert {:error, :project_requirements_path_invalid} = Requirements.read(:invalid)
   end
 
   test "reports a missing bound requirements file" do
@@ -46,5 +49,15 @@ defmodule SymphonyElixir.ManagedRequirementsTest do
 
     File.write!(path, <<255, 254>>)
     assert {:error, :project_requirements_invalid_encoding} = Requirements.read(%{requirements_path: path})
+  end
+
+  test "rejects a requirements path that is not a regular file" do
+    directory = Path.join(System.tmp_dir!(), "symphony-requirements-directory-#{System.unique_integer([:positive])}")
+    path = Path.join(directory, "REQUIREMENTS.md")
+    File.mkdir_p!(path)
+
+    on_exit(fn -> File.rm_rf(directory) end)
+
+    assert {:error, :project_requirements_not_regular_file} = Requirements.read(%{requirements_path: path})
   end
 end
