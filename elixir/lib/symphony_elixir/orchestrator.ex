@@ -4004,6 +4004,7 @@ defmodule SymphonyElixir.Orchestrator do
     assignment = get_in(data, [:assignments, issue.id])
     turn_limit = assignment.turn_limit
     turns_reserved = assignment.turns_reserved
+    project_requirements = managed_project_requirements_snapshot!(state, assignment)
 
     resume_options = managed_resume_options(assignment)
     workspace_preparer = managed_workspace_preparer(issue, assignment, attempt)
@@ -4017,7 +4018,7 @@ defmodule SymphonyElixir.Orchestrator do
         review_feedback: attempt[:review_feedback],
         peer_reports: attempt[:peer_reports],
         peer_report_notice: attempt[:peer_report_notice],
-        project_requirements: attempt[:project_requirements],
+        project_requirements: project_requirements,
         max_turns: turn_limit,
         remaining_turns: max(turn_limit - turns_reserved, 0),
         workspace_preparer: workspace_preparer,
@@ -4026,6 +4027,13 @@ defmodule SymphonyElixir.Orchestrator do
         before_turn: fn context -> managed_callback_call(owner, {:managed_before_turn, context}) end,
         report_callback: fn payload -> managed_callback_call(owner, {:managed_report, payload}) end
       ]
+  end
+
+  defp managed_project_requirements_snapshot!(state, assignment) do
+    case managed_project_requirements_snapshot(state, assignment) do
+      {:ok, snapshot} -> snapshot
+      {:error, reason} -> raise "managed_project_requirements_unavailable: #{inspect(reason)}"
+    end
   end
 
   defp managed_issue_state_fetcher(state, assignment) do
