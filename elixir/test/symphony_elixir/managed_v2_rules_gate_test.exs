@@ -693,7 +693,6 @@ defmodule SymphonyElixir.ManagedV2RulesGateTest do
     state
   end
 end
-
 defmodule SymphonyElixir.ManagedV2GitHubEffectsGateTest do
   use SymphonyElixir.TestSupport
 
