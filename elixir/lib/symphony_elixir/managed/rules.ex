@@ -1598,7 +1598,13 @@ defmodule SymphonyElixir.Managed.Rules do
   defp current_project_requirements(assignment, context) do
     case Map.get(context, :project_requirements, Map.get(context, "project_requirements")) do
       nil -> :ok
-      %{fingerprint: fingerprint} when fingerprint == assignment[:project_requirements_fingerprint] -> :ok
+      %{fingerprint: fingerprint} ->
+        if fingerprint == assignment[:project_requirements_fingerprint] do
+          :ok
+        else
+          {:error, :managed_project_requirements_changed, %{}}
+        end
+
       _ -> {:error, :managed_project_requirements_changed, %{}}
     end
   end
