@@ -431,7 +431,7 @@ defmodule SymphonyElixir.StatusDashboard do
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
 
   defp dashboard_url do
-    dashboard_url(Config.settings!().server.host, Config.server_port(), HttpServer.bound_port())
+    dashboard_url(Config.server_host(), Config.server_port(), HttpServer.bound_port())
   end
 
   defp dashboard_url(_host, nil, _bound_port), do: nil
@@ -1106,24 +1106,6 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp humanize_codex_event(:turn_input_required, _message, _payload), do: "turn blocked: waiting for user input"
-
-  defp humanize_codex_event(:approval_auto_approved, message, payload) do
-    method =
-      map_value(payload, ["method", :method]) ||
-        map_path(message, ["payload", "method"]) ||
-        map_path(message, [:payload, :method])
-
-    decision = map_value(message, ["decision", :decision])
-
-    base =
-      if is_binary(method) do
-        "#{humanize_codex_method(method, payload)} (auto-approved)"
-      else
-        "approval request auto-approved"
-      end
-
-    if is_binary(decision), do: "#{base}: #{decision}", else: base
-  end
 
   defp humanize_codex_event(:tool_call_completed, _message, payload),
     do: humanize_dynamic_tool_event("dynamic tool call completed", payload)

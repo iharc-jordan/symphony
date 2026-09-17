@@ -11,3 +11,9 @@ Distributed under the License is distributed on an “AS IS” BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 Limitations under the License.
+
+Windows binary releases include Microsoft Visual C++ Runtime files sourced
+from the licensed Visual Studio Build Tools REDIST directory for app-local
+deployment. Those files are redistributed under the applicable Microsoft
+Visual Studio license. See:
+https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files

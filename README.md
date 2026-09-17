@@ -1,41 +1,52 @@
-# Symphony
+# Codex Orchestration Symphony
 
-Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
-work instead of supervising coding agents.
+This public fork packages the Symphony scheduler used by the Codex Orchestration plugin. The managed product has one supported host: Windows 11 x64.
 
-[![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
+The desktop Codex task remains the delivery PM. It talks to a loopback-only MCP bridge; Symphony owns scheduling and recovery; native Windows Codex app-server workers execute assignments in isolated local workspaces.
 
-_In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._
+## Supported product path
 
-> [!WARNING]
-> Symphony is a low-key engineering preview for testing in trusted environments.
+- Windows 11 x64.
+- GitHub Projects and repository issues as the managed work source.
+- A standard Mix release ZIP built on Windows with Erlang/OTP 28, Elixir 1.19, native dependencies, and the small Windows worker-host helper included.
+- `%LOCALAPPDATA%\CodexOrchestration` for versioned releases, configuration, state, logs, and workspaces.
+- One hidden least-privilege Task Scheduler logon task installed by the plugin.
+- A single SQLite snapshot connection for managed state.
+- Per-attempt Windows Job Objects for worker and hook process trees.
 
-## Running Symphony
+End users do not need Erlang, Elixir, Rust, a compiler, WSL, or a second Codex installation. WSL may still be used independently as repository tooling, but it is not an orchestration runtime or fallback. Managed SSH and Linux release targets are not supported.
 
-### Requirements
+Other upstream tracker adapters remain source-level Symphony components. They are not exposed as alternate managed-product paths.
 
-Symphony works best in codebases that have adopted
-[harness engineering](https://openai.com/index/harness-engineering/). Symphony is the next step --
-moving from managing coding agents to managing work that needs to get done.
+## Install
 
-### Option 1. Make your own
+Install the paired `0.5.0` Codex Orchestration plugin release. Its lifecycle commands download the pinned Windows runtime manifest or accept the same release ZIP offline with an explicit SHA-256 digest. The installer verifies the archive, stages an immutable version directory, and switches the stable launcher only after the prior runtime has stopped.
 
-Tell your favorite coding agent to build Symphony in a programming language of your choice:
+Runtime controls and setup are documented in the plugin repository: <https://github.com/iharc-jordan/codex-orchestration>.
 
-> Implement Symphony according to the following spec:
-> https://github.com/openai/symphony/blob/main/SPEC.md
+## Build from source
 
-### Option 2. Use our experimental reference implementation
+Source builds require Windows x64, Erlang/OTP `28.5.0.6`, Elixir `1.19.6`, Rust, Git, and PowerShell 7:
 
-Check out [elixir/README.md](elixir/README.md) for instructions on how to set up your environment
-and run the Elixir-based Symphony implementation. You can also ask your favorite coding agent to
-help with the setup:
+```powershell
+cd elixir
+mix deps.get
+mix test
+.\scripts\build-windows-release.ps1
+```
 
-> Set up Symphony for my repository based on
-> https://github.com/openai/symphony/blob/main/elixir/README.md
+The build emits a ZIP, checksum, and release manifest under `elixir\dist`. The ZIP contains the standard Mix release tree, embedded ERTS, `bin\symphony.bat`, `bin\symphony-worker-host.exe`, the license, and notices.
 
----
+See [the implementation guide](elixir/README.md) for configuration and focused validation.
+
+## Operational boundaries
+
+- The HTTP control endpoint binds only to `127.0.0.1` and requires the protected local token.
+- WORKFLOW.md owns managed policy and prompts. The installed launcher resolves machine paths before the OTP application supervisor starts.
+- SQLite keeps one versioned snapshot row; the existing bounded event list stays inside that state.
+- Worker shutdown first uses the app-server protocol, then terminates only the verified owned Job Object after the bounded grace period.
+- Browser-capable workers use their own installed tools. Shared browser state is serialized through managed resource claims; there is no browser relay.
 
 ## License
 
-This project is licensed under the [Apache License 2.0](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

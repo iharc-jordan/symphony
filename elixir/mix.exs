@@ -4,7 +4,7 @@ defmodule SymphonyElixir.MixProject do
   def project do
     [
       app: :symphony_elixir,
-      version: "0.0.2",
+      version: "0.5.0",
       elixir: "~> 1.19",
       compilers: [:phoenix_live_view] ++ Mix.compilers(),
       start_permanent: Mix.env() == :prod,
@@ -19,6 +19,14 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.GitLab.Client,
           SymphonyElixir.Jira.Client,
           SymphonyElixir.Linear.Client,
+          SymphonyElixir.GitHubProjects.Client,
+          # These process, filesystem, and native-Job integration boundaries
+          # are covered by real crash, native, and packaged lifecycle checks.
+          SymphonyElixir.Managed.Checkout,
+          SymphonyElixir.Managed.Journal,
+          SymphonyElixir.PathSafety,
+          SymphonyElixir.RuntimeConfig,
+          SymphonyElixir.WindowsWorkerHost,
           SymphonyElixir.SpecsCheck,
           SymphonyElixir.Orchestrator,
           SymphonyElixir.Orchestrator.State,
@@ -62,25 +70,26 @@ defmodule SymphonyElixir.MixProject do
   def application do
     [
       mod: {SymphonyElixir.Application, []},
-      extra_applications: [:logger]
+      extra_applications: [:logger, :crypto]
     ]
   end
 
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:bandit, "~> 1.8"},
+      {:bandit, "~> 1.12"},
       {:floki, ">= 0.30.0", only: :test},
       {:lazy_html, ">= 0.1.0", only: :test},
-      {:phoenix, "~> 1.8.0"},
+      {:phoenix, "~> 1.8.13"},
       {:phoenix_html, "~> 4.2"},
-      {:phoenix_live_view, "~> 1.1.0"},
-      {:req, "~> 0.5"},
-      {:jason, "~> 1.4"},
+      {:phoenix_live_view, "~> 1.1.33"},
+      {:req, "~> 0.7.4"},
+      {:jason, "~> 1.4.5"},
       {:yaml_elixir, "~> 2.12"},
-      {:solid, "~> 1.2"},
-      {:ecto, "~> 3.13"},
-      {:burrito, "~> 1.5", only: :prod, runtime: false},
+      {:toml_elixir, "3.1.0"},
+      {:solid, "~> 1.3"},
+      {:ecto, "~> 3.14"},
+      {:exqlite, "~> 0.40.0"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
     ]
@@ -106,15 +115,9 @@ defmodule SymphonyElixir.MixProject do
   defp releases do
     [
       symphony: [
-        steps: [:assemble, &Burrito.wrap/1],
-        burrito: [
-          targets: [
-            macos_arm64: [os: :darwin, cpu: :aarch64],
-            macos_x86_64: [os: :darwin, cpu: :x86_64],
-            linux_arm64: [os: :linux, cpu: :aarch64],
-            linux_x86_64: [os: :linux, cpu: :x86_64]
-          ]
-        ]
+        include_erts: true,
+        include_executables_for: [:windows],
+        strip_beams: true
       ]
     ]
   end

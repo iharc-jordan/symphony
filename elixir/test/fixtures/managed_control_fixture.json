@@ -1,0 +1,410 @@
+{
+  "workflow_managed": {
+    "enabled": true,
+    "store_path": "C:\\Users\\example\\AppData\\Local\\CodexOrchestration\\state\\managed.sqlite3",
+    "control_token_file": "C:\\Users\\example\\AppData\\Local\\CodexOrchestration\\config\\control.token",
+    "event_limit": 100,
+    "event_wait_ms": 5000
+  },
+  "route_cases": [
+    {"route":{"model":"gpt-5.6-luna","effort":"xhigh"},"accepted":true},
+    {"route":{"model":"gpt-5.6-terra","effort":"max"},"escalation_reason":"Fixture requires additional reasoning depth","accepted":true},
+    {"route":{"model":"gpt-5.6-terra","effort":"max"},"accepted":false},
+    {"route":{"model":"gpt-5.6-sol","effort":"xhigh"},"escalation_reason":"Connected runtime fencing requires the stronger route","accepted":true},
+    {"route":{"model":"gpt-5.6-sol","effort":"max"},"escalation_reason":"Exceptional connected runtime review requires maximum depth","accepted":true},
+    {"route":{"model":"gpt-5.6-sol","effort":"xhigh"},"accepted":false},
+    {"route":{"model":"gpt-5.6-sol","effort":"max"},"accepted":false},
+    {"route":{"model":"gpt-6-astra","effort":"xhigh"},"escalation_reason":"Not an allowed worker route","accepted":false}
+  ],
+  "http": {
+    "state": {
+      "method": "GET",
+      "path": "/api/v1/managed/state",
+      "authorization": "Bearer <token-file-value>",
+      "response": {
+        "revision": 0,
+        "cursor": 0,
+        "paused": false,
+        "disabled": false,
+        "projects": {},
+        "assignments": {}
+      }
+    },
+    "state_views": {
+      "summary": {
+        "method": "GET",
+        "path": "/api/v1/managed/state?view=summary&project_id=PVT_one",
+        "authorization": "Bearer <token-file-value>",
+        "response": {
+          "revision": 4,
+          "cursor": 9,
+          "control_revision": 4,
+          "principal": {"principal_id": "00000000-0000-4000-8000-000000000001"},
+          "projects": {"PVT_one": {"project_id": "PVT_one", "project_number": 1, "repositories": ["acme/one"], "revision": 2}},
+          "usage": {"cumulative_tokens": 1200, "inflight_tokens": 0},
+          "assignments": {
+            "item-one": {
+              "assignment_id": "item-one",
+              "phase": "ready",
+              "ownership": {"pm_id": "00000000-0000-4000-8000-000000000001", "status": "owned", "ownership_revision": 1},
+              "route": {"model": "gpt-5.6-luna", "effort": "xhigh"},
+              "wait_reason": null,
+              "last_report": {"report_id": "report-fixture-1", "attempt_id": "managed-item-one-attempt-1"}
+            }
+          }
+        }
+      },
+      "detail": {
+        "method": "GET",
+        "path": "/api/v1/managed/state?view=detail&project_id=PVT_one&assignment_id=item-one&include_history=true",
+        "authorization": "Bearer <token-file-value>",
+        "response": {
+          "revision": 4,
+          "cursor": 9,
+          "control_revision": 4,
+          "assignment": {
+            "assignment_id": "item-one",
+            "phase": "ready",
+            "reports": {"report-fixture-1": {"kind": "result", "summary": "Sourced fixture report"}}
+          },
+          "project": {"project_id": "PVT_one", "project_number": 1, "repositories": ["acme/one"], "revision": 2}
+        }
+      },
+      "full": {
+        "method": "GET",
+        "path": "/api/v1/managed/state?view=full&include_history=true",
+        "authorization": "Bearer <token-file-value>",
+        "response": {
+          "revision": 4,
+          "cursor": 9,
+          "control_revision": 4,
+          "projects": {"PVT_one": {"project_id": "PVT_one", "project_number": 1, "repositories": ["acme/one"], "revision": 2}},
+          "assignments": {"item-one": {"assignment_id": "item-one", "reports": {"report-fixture-1": {"kind": "result"}}}},
+          "events": [{"cursor": 9, "event": "report_recorded"}]
+        }
+      }
+    },
+    "events": {
+      "method": "GET",
+      "path": "/api/v1/managed/events?after=0&wait_ms=1000&limit=100",
+      "authorization": "Bearer <token-file-value>",
+      "response": {"after": 0, "events": [], "cursor": 0}
+    },
+    "bind_project": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "bind-project-1",
+        "operation": "bind_project",
+        "args": {
+          "expected_revision": 0,
+          "project": {
+            "project_id": "PVT_one",
+            "project_number": 1,
+            "status_field_id": "status-field-one",
+            "status_options": {
+              "READY": "option-ready",
+              "ACTIVE": "option-active",
+              "REVIEW": "option-review",
+              "ACCEPTED": "option-accepted",
+              "WAITING": "option-waiting",
+              "CANCELLED": "option-cancelled"
+            },
+            "repositories": ["acme/one"]
+          }
+        }
+      },
+      "response": {
+        "operation": "bind_project",
+        "project": {
+          "project_id": "PVT_one",
+          "project_number": 1,
+          "status_field_id": "status-field-one",
+          "status_options": {
+            "READY": "option-ready",
+            "ACTIVE": "option-active",
+            "REVIEW": "option-review",
+            "ACCEPTED": "option-accepted",
+            "WAITING": "option-waiting",
+            "CANCELLED": "option-cancelled"
+          },
+          "repositories": ["acme/one"]
+        },
+        "revision": 1
+      }
+    },
+    "register_pm": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "register-pm-b-1",
+        "operation": "register_pm",
+        "args": {"display_name": "PM B"}
+      },
+      "response": {
+        "operation": "register_pm",
+        "principal_id": "00000000-0000-4000-8000-000000000002",
+        "registered": true
+      }
+    },
+    "claim": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "claim-fixture-1",
+        "operation": "claim",
+        "args": {
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
+          "expected_revision": 1,
+          "expected_ownership_revision": 0
+        }
+      },
+      "response": {
+        "operation": "claim",
+        "assignment_id": "item-one",
+        "revision": 1,
+        "ownership_revision": 1,
+        "phase": "ready"
+      }
+    },
+    "enroll": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "enroll-fixture-1",
+        "operation": "enroll",
+        "args": {
+          "expected_revision": 1,
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
+          "repository": "acme/one",
+          "issue_number": 1,
+          "base_commit": "0123456789abcdef0123456789abcdef01234567",
+          "board_state": "READY",
+          "resources": [
+            {"kind":"repository","authority":"github.com","identity":"acme/one","access":"write"}
+          ],
+          "dependencies": [],
+          "route": {"model": "gpt-5.6-luna", "effort": "xhigh"},
+          "requirements_fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "requirements_revision": 1
+        }
+      },
+      "response": {
+        "operation": "enroll",
+        "assignment_id": "item-one",
+        "revision": 1,
+        "phase": "ready",
+        "project_id": "PVT_one",
+        "control_revision": 2
+      }
+    },
+    "revise": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "revise-fixture-1",
+        "operation": "revise",
+        "args": {
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
+          "expected_revision": 1,
+          "expected_ownership_revision": 1,
+          "changes": {
+            "base_commit": "fedcba9876543210fedcba9876543210fedcba98",
+            "requirements_fingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "requirements_revision": 2,
+            "turn_limit": 30,
+            "turn_limit_reason": "Complete the connected recovery validation"
+          }
+        }
+      },
+      "response": {
+        "operation": "revise",
+        "assignment_id": "item-one",
+        "revision": 2,
+        "phase": "ready",
+        "turn_limit": 30,
+        "turn_limit_reason": "Complete the connected recovery validation"
+      }
+    },
+    "pause": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "pause-fixture-1",
+        "operation": "pause",
+        "args": {
+          "scope": "assignments",
+          "project_id": "PVT_one",
+          "assignments": [
+            {"assignment_id":"item-one","expected_revision":1,"expected_ownership_revision":1}
+          ],
+          "reason": "fixture pause"
+        }
+      },
+      "response": {
+        "operation": "pause",
+        "scope": "assignments",
+        "project_id": "PVT_one",
+        "assignment_ids": ["item-one"],
+        "revision": 3
+      }
+    },
+    "resume": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "resume-fixture-1",
+        "operation": "resume",
+        "args": {
+          "scope": "assignments",
+          "project_id": "PVT_one",
+          "assignments": [
+            {"assignment_id":"item-one","expected_revision":1,"expected_ownership_revision":1}
+          ],
+          "reason": "fixture resume"
+        }
+      },
+      "response": {
+        "operation": "resume",
+        "scope": "assignments",
+        "project_id": "PVT_one",
+        "assignment_ids": ["item-one"],
+        "revision": 4
+      }
+    },
+    "interrupt": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "interrupt-fixture-1",
+        "operation": "interrupt",
+        "args": {
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
+          "expected_revision": 1,
+          "expected_ownership_revision": 1,
+          "reason": "fixture interruption"
+        }
+      },
+      "response": {"operation": "interrupt", "assignment_id": "item-one", "revision": 2, "phase": "waiting", "reason": "fixture interruption"}
+    },
+    "cancel": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "cancel-fixture-1",
+        "operation": "cancel",
+        "args": {
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
+          "expected_revision": 1,
+          "expected_ownership_revision": 1,
+          "reason": "fixture cancellation"
+        }
+      },
+      "response": {"operation": "cancel", "assignment_id": "item-one", "revision": 2, "phase": "cancelled", "reason": "fixture cancellation"}
+    },
+    "review": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "review-fixture-1",
+        "operation": "review",
+        "args": {
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
+          "expected_revision": 1,
+          "expected_ownership_revision": 1,
+          "disposition": "accepted",
+          "evidence": ["https://example.invalid/evidence/fixture-1"]
+        }
+      },
+      "response": {
+        "operation": "review",
+        "assignment_id": "item-one",
+        "revision": 2,
+        "phase": "accepted",
+        "disposition": "accepted",
+        "issue_close": "ok"
+      }
+    },
+    "review_peer_refs": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "review-rework-fixture-1",
+        "operation": "review",
+        "args": {
+          "project_id": "PVT_one",
+          "assignment_id": "item-one",
+          "expected_revision": 1,
+          "expected_ownership_revision": 1,
+          "disposition": "rework",
+          "reason": "Apply the referenced peer finding before the next review.",
+          "evidence": ["https://example.invalid/evidence/fixture-1"],
+          "peer_report_refs": [
+            {
+              "source_assignment_id": "item-one",
+              "source_attempt_id": "managed-item-one-attempt-1",
+              "report_id": "report-fixture-1"
+            }
+          ]
+        }
+      },
+      "response": {
+        "operation": "review",
+        "assignment_id": "item-one",
+        "revision": 2,
+        "phase": "ready",
+        "disposition": "rework"
+      }
+    },
+    "handoff": {
+      "method": "POST",
+      "path": "/api/v1/managed/control",
+      "body": {
+        "request_id": "handoff-fixture-1",
+        "operation": "handoff",
+        "args": {
+          "project_id": "PVT_one",
+          "assignments": [
+            {"assignment_id":"item-one","expected_revision":1,"expected_ownership_revision":1}
+          ],
+          "destination_pm_id": "00000000-0000-4000-8000-000000000002",
+          "reason": "fixture coverage"
+        }
+      },
+      "response": {
+        "operation": "handoff",
+        "handoff_id": "handoff-fixture-1",
+        "assignment_ids": ["item-one"],
+        "source_pm_id": "00000000-0000-4000-8000-000000000001",
+        "destination_pm_id": "00000000-0000-4000-8000-000000000002",
+        "target_principal_id": "00000000-0000-4000-8000-000000000002",
+        "reason": "fixture coverage",
+        "status": "complete"
+      }
+    },
+    "errors": {
+      "stale_revision": {
+        "status": 409,
+        "body": {"error": {"code": "stale_revision", "message": "Managed request failed"}}
+      },
+      "stale_ownership_revision": {
+        "status": 409,
+        "body": {"error": {"code": "stale_ownership_revision", "message": "Managed request failed"}}
+      },
+      "ownership_conflict": {
+        "status": 409,
+        "body": {"error": {"code": "ownership_conflict", "message": "Managed request failed"}}
+      },
+      "unauthorized": {
+        "status": 401,
+        "body": {"error": {"code": "unauthorized", "message": "Unauthorized"}}
+      }
+    }
+  }
+}

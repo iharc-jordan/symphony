@@ -1,0 +1,72 @@
+name: windows-release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    defaults:
+      run:
+        working-directory: elixir
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up OTP and Elixir
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        with:
+          otp-version: "28.5.0.6"
+          elixir-version: "1.19.6"
+
+      - name: Verify tag matches project version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $match = Select-String -LiteralPath mix.exs -Pattern '^\s*version:\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $match -or $env:GITHUB_REF_NAME -ne "v$($match.Matches[0].Groups[1].Value)") {
+            throw "Release tag $env:GITHUB_REF_NAME does not match mix.exs."
+          }
+
+      - name: Build standard Windows release
+        shell: pwsh
+        run: .\scripts\build-windows-release.ps1
+
+      - name: Verify embedded runtime
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem -LiteralPath dist -Filter 'symphony-*-windows-x64.zip' | Select-Object -First 1
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath "$env:RUNNER_TEMP\symphony-smoke"
+          $targets = @(
+            Get-ChildItem -LiteralPath "$env:RUNNER_TEMP\symphony-smoke" -Recurse -File |
+              Where-Object { $_.Extension -in '.dll', '.exe' } |
+              Select-Object -ExpandProperty FullName
+          )
+          $imports = @(& node.exe .\scripts\inspect-pe-imports.mjs @targets)
+          foreach ($line in $imports) {
+            $entry = $line | ConvertFrom-Json
+            foreach ($dependency in @($entry.imports | Where-Object { $_ -match '(?i)^(msvcp|vcruntime|concrt)\d.*\.dll$' })) {
+              if (-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $entry.file) $dependency) -PathType Leaf)) {
+                throw "Missing app-local dependency $dependency beside $($entry.file)"
+              }
+            }
+          }
+          & "$env:RUNNER_TEMP\symphony-smoke\bin\symphony.bat" version
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged release version check failed.' }
+
+      - name: Upload Windows verification artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-x64
+          path: |
+            elixir/dist/*.zip
+            elixir/dist/*.sha256
+            elixir/dist/release-manifest.json
+          if-no-files-found: error

@@ -40,6 +40,9 @@ erl_crash.dump
 /burrito_out/
 /dist/
 
+# Standalone Windows worker-host build output.
+/native/symphony_worker_host/target/
+
 # Local environment and auth artifacts.
 .env
 .env.*

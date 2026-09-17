@@ -441,6 +441,21 @@ Fields:
   - Invalid values fail configuration validation.
   - Changes SHOULD be re-applied at runtime for future hook executions.
 
+Hook environment contract:
+
+- Each configured workspace hook receives `SYMPHONY_ISSUE_CONTEXT` as UTF-8 JSON with exactly
+  `id`, `identifier`, and `native_ref` keys.
+- `id` and `identifier` carry the normalized issue identity. `native_ref` is an optional provider
+  reference containing only non-secret identity/location metadata. Provider adapters MUST NOT put
+  titles, bodies, payloads, commands, executable strings, credentials, authentication material, or
+  user details in this reference. Symphony rejects a native reference containing those reserved
+  fields (including nested fields) instead of passing it to the hook.
+- Native references use JSON-compatible values only. The serialized context is limited to 16 KiB;
+  an oversized value is rejected rather than truncated.
+- `before_remove` runs without an issue context and receives `{"id":null,"identifier":null,"native_ref":null}`.
+- Context rejection follows the existing hook failure policy: `after_create` and `before_run`
+  fail their operation, while `after_run` and `before_remove` log and ignore hook failures.
+
 #### 5.3.5 `agent` (object)
 
 Fields:
@@ -472,10 +487,11 @@ hand-maintained enum in this spec. To inspect the installed Codex schema, run
 by `v2/ThreadStartParams.json` and `v2/TurnStartParams.json`. Implementations MAY validate these
 fields locally if they want stricter startup checks.
 
-- `command` (string shell command)
-  - Default: `codex app-server`
-  - The runtime launches this command via `bash -lc` in the workspace directory.
-  - The launched process MUST speak a compatible app-server protocol over stdio.
+- `launcher` (absolute Windows path)
+  - Default: `%APPDATA%\npm\codex.cmd`.
+  - An explicit override MUST be an absolute path naming `codex.cmd`.
+  - The runtime constructs the fixed App Server arguments; workflow content cannot supply a shell
+    command or arbitrary launcher arguments.
 - `approval_policy` (Codex `AskForApproval` value)
   - Default: implementation-defined.
 - `thread_sandbox` (Codex `SandboxMode` value)
@@ -600,7 +616,7 @@ Validation checks:
 - `tracker.kind` is present and supported.
 - The selected adapter accepts `tracker.provider` after documented defaults and `$VAR`
   resolution.
-- `codex.command` is present and non-empty.
+- `codex.launcher` resolves to an absolute path naming `codex.cmd`.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
@@ -624,12 +640,13 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
-- `codex.command`: shell command string, default `codex app-server`
+- `codex.launcher`: absolute Windows `codex.cmd` path, default `%APPDATA%\npm\codex.cmd`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
 - `codex.turn_timeout_ms`: integer, default `3600000`
-- `codex.read_timeout_ms`: integer, default `5000`
+- `codex.read_timeout_ms`: integer, default `60000` (60 seconds for session start/resume reads;
+  stop/interrupt reads remain separately bounded at 10000 ms)
 - `codex.stall_timeout_ms`: integer, default `300000`
 
 ## 7. Orchestration State Machine
@@ -911,10 +928,8 @@ Supported hooks:
 
 Execution contract:
 
-- Execute in a local shell context appropriate to the host OS, with the workspace directory as
-  `cwd`.
-- On POSIX systems, `sh -lc <script>` (or a stricter equivalent such as `bash -lc <script>`) is a
-  conforming default.
+- Execute as a non-interactive PowerShell command with the workspace directory as `cwd`.
+- Run the hook process tree in the same owned Windows Job Object boundary used for Codex workers.
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
 - Log hook start, failures, and timeouts.
 
@@ -967,14 +982,16 @@ Protocol source of truth:
 
 Subprocess launch parameters:
 
-- Command: `codex.command`
-- Invocation: `bash -lc <codex.command>`
+- Launcher: `codex.launcher`
+- Invocation: the runtime-owned structured Windows command processor invocation of
+  `<codex.launcher> app-server`; managed workers add only the fixed
+  `-c features.multi_agent=false -c features.multi_agent_v2=false` arguments.
 - Working directory: workspace path
 - Transport/framing: the protocol transport required by the targeted Codex app-server version
 
 Notes:
 
-- The default command is `codex app-server`.
+- The default launcher is `%APPDATA%\npm\codex.cmd`.
 - Approval policy, sandbox policy, cwd, prompt input, and OPTIONAL tool declarations are supplied
   using fields supported by the targeted Codex app-server version.
 
@@ -1056,7 +1073,6 @@ Important emitted events include, for example:
 - `turn_cancelled`
 - `turn_ended_with_error`
 - `turn_input_required`
-- `approval_auto_approved`
 - `unsupported_tool_call`
 - `notification`
 - `other_message`
@@ -1074,11 +1090,9 @@ Policy requirements:
   implementation MAY either satisfy them, surface them to an operator, auto-resolve them, or
   fail the run according to its documented policy.
 
-Example high-trust behavior:
-
-- Auto-approve command execution approvals for the session.
-- Auto-approve file-change approvals for the session.
-- Treat user-input-required turns as hard failure.
+The managed implementation passes configured approval and sandbox policies to Codex. It does not
+answer command, file-change, or user-input protocol requests; each ends the run and returns the
+request to the orchestrator as a blocker.
 
 Unsupported dynamic tool calls:
 
@@ -1106,7 +1120,7 @@ Optional provider-native agent tool extension:
   without teaching the orchestrator provider semantics.
 - Tracker credentials SHOULD NOT be inherited by the coding-agent child process. An adapter that
   resolves credentials from environment variables MUST declare authentication-related environment
-  names for removal from local and remote child environments. Implementations SHOULD consult current
+  names for removal from local child environments. Implementations SHOULD consult current
   provider and client documentation when identifying credential names and aliases, as these can
   change over time. Literal credentials in a repo-owned `WORKFLOW.md` remain readable to a child
   with workspace access and SHOULD NOT be used when this isolation matters.
@@ -1152,7 +1166,9 @@ Error mapping (RECOMMENDED normalized categories):
 
 - `codex_not_found`
 - `invalid_workspace_cwd`
-- `response_timeout`
+- `response_timeout` (include the pending method, initialization/request stage,
+  elapsed milliseconds, and configured timeout; unrelated stream output must
+  not extend a request's deadline)
 - `turn_timeout`
 - `port_exit`
 - `response_error`
@@ -1561,7 +1577,7 @@ Minimum endpoints:
       "issue_id": "abc123",
       "status": "running",
       "workspace": {
-        "path": "/tmp/symphony_workspaces/MT-649"
+        "path": "C:\\\\ProgramData\\\\CodexOrchestration\\\\workspaces\\\\w-a83f5d41f552ab7c62d3511c"
       },
       "attempts": {
         "restart_count": 1,
@@ -1753,13 +1769,13 @@ RECOMMENDED additional hardening for ports:
 - Execute provider-native tracker tools in the Symphony host process with the configured adapter
   credential.
 - Do not pass tracker credentials through the coding-agent child environment. Adapters MUST declare
-  secret environment names so local and remote launchers can remove them from child environments.
+  secret environment names so the local launcher can remove them from child environments.
 - Do not place literal tracker credentials in a repo-owned `WORKFLOW.md` when the child can read
   that workspace; use host-side secret references instead.
 
 ### 15.4 Hook Script Safety
 
-Workspace hooks are arbitrary shell scripts from `WORKFLOW.md`.
+Workspace hooks are arbitrary PowerShell scripts from `WORKFLOW.md`.
 
 Implications:
 
@@ -2078,7 +2094,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `tracker.provider` preserves adapter-owned keys and validates them through the selected adapter
 - `$VAR` resolution works for documented adapter secret keys and path values
 - `~` path expansion works
-- `codex.command` is preserved as a shell command string
+- `codex.launcher` accepts only an absolute path naming `codex.cmd`
 - Per-state concurrency override map normalizes state names and ignores invalid values
 - Prompt template renders `issue` and `attempt`
 - Prompt rendering fails on unknown variables (strict mode)
@@ -2119,6 +2135,19 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Error mapping covers config, request, non-success response, malformed payload, pagination, and
   rate limiting, including documented category/message mappings for language-native errors
 
+### GitHub Projects V2 profile
+
+The Elixir implementation's `github_projects` adapter scopes reads to one user or organization
+Project V2 board selected by `tracker.provider.owner_type`, `owner`, and `project_number`.
+The selected Status field defaults to `Status`; `active_states`, `terminal_states`, and
+`required_labels` remain tracker-level settings. The ProjectV2Item node ID is the opaque
+dispatch ID, while `identifier` is `owner/repository#number` and `native_ref` retains
+non-secret project, item, underlying issue, repository, number, and content-type fields. GraphQL
+item, field, label, and blocker connections are fully paginated. Archived, draft, missing-status,
+and malformed records are omitted from candidate reads and fail ID refreshes; pull requests are
+never dispatchable. GitHub issue blockers are terminal only when their underlying state is
+`CLOSED`. The adapter is read-only and does not choose a workspace repository.
+
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
 - Dispatch sort order is priority then oldest creation time
@@ -2140,7 +2169,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.5 Coding-Agent App-Server Client
 
-- Launch command uses workspace cwd and invokes `bash -lc <codex.command>`
+- Fixed Windows App Server launch uses the workspace cwd and the validated absolute `codex.cmd`
+  path
 - Session startup follows the targeted Codex app-server protocol.
 - Client identity/capability payloads are valid when the targeted Codex app-server protocol requires
   them.
@@ -2221,7 +2251,7 @@ Use the same validation profiles as Section 17:
 - Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
 - Hook timeout config (`hooks.timeout_ms`, default `60000`)
 - Coding-agent app-server subprocess client with the targeted transport/framing protocol
-- Codex launch command config (`codex.command`, default `codex app-server`)
+- Codex launcher config (`codex.launcher`, default `%APPDATA%\npm\codex.cmd`)
 - Strict prompt rendering with `issue` and `attempt` variables
 - Exponential retry queue with continuation retries after normal exit
 - Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
@@ -2249,64 +2279,57 @@ Use the same validation profiles as Section 17:
 - If the OPTIONAL HTTP server is shipped, verify the configured port behavior and loopback/default
   bind expectations on the target environment.
 
-## Appendix A. SSH Worker Extension (OPTIONAL)
+## Appendix A. Optional managed PM control profile
 
-This appendix describes a common extension profile in which Symphony keeps one central
-orchestrator but executes worker runs on one or more remote hosts over SSH.
+An implementation MAY expose a managed control plane in addition to tracker polling.
+This profile MUST preserve the single authoritative orchestrator and its durable journal.
+Each registered Project binding identifies allowed repositories and provider field identities;
+managed reads and writes MUST use that assignment's binding rather than a mutable default.
 
-Extension config:
+PM mutations MUST carry a server-authenticated principal, explicit Project scope, and the
+applicable work and ownership revisions. An assignment has at most one responsible PM.
+Explicit handoff changes ownership without replacing a healthy worker or its attempt identity.
+Assignment-scoped pause prevents new dispatch without invalidating a running worker's report.
+Operator-level service controls are distinct from PM controls.
 
-- `worker.ssh_hosts` (list of SSH host strings, OPTIONAL)
-  - When omitted, work runs locally.
-- `worker.max_concurrent_agents_per_host` (positive integer, OPTIONAL)
-  - Shared per-host cap applied across configured SSH hosts.
+Enrollment MUST verify the provider item and its ready state and prevent duplicate underlying
+issue enrollment across Project cards. Resource claims MUST use canonical references and
+preserve write conflicts. Pending external effects MUST retain their originating identity,
+binding, and revision fences across restart. The managed state schema is version two; an
+implementation MUST reject older state rather than migrate, replay, or reconcile it.
 
-### A.1 Execution Model
+Optional Project card summaries are derived projections of journal state. Projection failures
+MUST be visible and MUST NOT be reported as synchronized. Summary writes MUST NOT replace issue
+requirements or workflow status. A terminal worker report revokes further tool execution;
+a bounded drain MAY collect final usage, with incomplete accounting explicitly marked.
 
-- The orchestrator remains the single source of truth for polling, claims, retries, and
-  reconciliation.
-- `worker.ssh_hosts` provides the candidate SSH destinations for remote execution.
-- Each worker run is assigned to one host at a time, and that host becomes part of the run's
-  effective execution identity along with the issue workspace.
-- `workspace.root` is interpreted on the remote host, not on the orchestrator host.
-- The coding-agent app-server is launched over SSH stdio instead of as a local subprocess, so the
-  orchestrator still owns the session lifecycle even though commands execute remotely.
-- Continuation turns inside one worker lifetime SHOULD stay on the same host and workspace.
-- A remote host SHOULD satisfy the same basic contract as a local worker environment: reachable
-  shell, writable workspace root, coding-agent executable, and any required auth or repository
-  prerequisites.
+Managed report identity MUST include the trusted attempt and the local report ID. Identical
+replays are idempotent; conflicting content under the same identity is rejected. A successful
+terminal report and worker exit MUST NOT duplicate a successful provider projection.
 
-### A.2 Scheduling Notes
+Optional peer findings MUST reference canonical reports by source assignment, source attempt,
+and report ID. References MUST validate the current Project, PM ownership, and target revision
+fences. Resolve a bounded block for the next turn, treat it as evidence without authority, and
+clear references together with obsolete feedback on material scope revision.
 
-- SSH hosts MAY be treated as a pool for dispatch.
-- Implementations MAY prefer the previously used host on retries when that host is still
-  available.
-- `worker.max_concurrent_agents_per_host` is an OPTIONAL shared per-host cap across configured SSH
-  hosts.
-- When all SSH hosts are at capacity, dispatch SHOULD wait rather than silently falling back to a
-  different execution mode.
-- Implementations MAY fail over to another host when the original host is unavailable before work
-  has meaningfully started.
-- Once a run has already produced side effects, a transparent rerun on another host SHOULD be
-  treated as a new attempt, not as invisible failover.
+The managed route MAY select the `gpt-5.6-sol` Sol route; implementations MUST preserve the
+selected model and effort in the attempt metadata and reject silent substitutions. A
+  `context_needed` report places the assignment in `WAITING`; if the PM now has the missing
+  completion evidence, accepting that outcome uses the existing review fields with non-empty
+  `evidence` and expected revision, ownership-revision, and Project fences. Waiting acceptance MUST
+  reject `peer_report_refs` and does not require `reason`; it is terminal acceptance. If the missing
+  context is not yet resolved, use `rework` to return the retained assignment to dispatchable work.
 
-### A.3 Problems to Consider
+Managed assignments start with an absolute turn limit of 20. The `revise` operation MAY set
+`changes.turn_limit` to an absolute value in the inclusive range `1..100` strictly above the
+current limit only when a non-empty `changes.turn_limit_reason` accompanies it.
 
-- Remote environment drift:
-  - Each host needs the expected shell environment, coding-agent executable, auth, and repository
-    prerequisites.
-- Workspace locality:
-  - Workspaces are usually host-local, so moving an issue to a different host is typically a cold
-    restart unless shared storage exists.
-- Path and command safety:
-  - Remote path resolution, shell quoting, and workspace-boundary checks matter more once execution
-    crosses a machine boundary.
-- Startup and failover semantics:
-  - Implementations SHOULD distinguish host-connectivity/startup failures from in-workspace agent
-    failures so the same ticket is not accidentally re-executed on multiple hosts.
-- Host health and saturation:
-  - A dead or overloaded host SHOULD reduce available capacity, not cause duplicate execution or an
-    accidental fallback to local work.
-- Cleanup and observability:
-  - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
-    happened on the right machine.
+Managed diagnostics MUST expose the effective global concurrency limit, configured per-state
+overrides, and the global fallback used by states without an override. Compact and detail projections SHOULD expose validated peer report
+references, while historical raw token values MUST carry an explicit unavailable or unreliable
+diagnostic label and MUST NOT be treated as valid spend or accounting.
+
+Managed usage MUST persist source-thread raw watermarks independently from corrected assignment
+totals. Reconnects, resumes, duplicate notifications, and restarts must count only new usage.
+Completed-attempt duration is additive and distinct from the current run. Historical totals
+without enough durable evidence MUST remain unavailable and MUST NOT authorize token-cap headroom.

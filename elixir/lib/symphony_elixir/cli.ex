@@ -5,8 +5,7 @@ defmodule SymphonyElixir.CLI do
 
   alias SymphonyElixir.LogFile
 
-  @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
-  @switches [{@acknowledgement_switch, :boolean}, logs_root: :string, port: :integer]
+  @switches [managed: :boolean, logs_root: :string, port: :integer]
 
   @type ensure_started_result :: {:ok, [atom()]} | {:error, term()}
   @type deps :: %{
@@ -14,7 +13,8 @@ defmodule SymphonyElixir.CLI do
           set_workflow_file_path: (String.t() -> :ok | {:error, term()}),
           set_logs_root: (String.t() -> :ok | {:error, term()}),
           set_server_port_override: (non_neg_integer() | nil -> :ok | {:error, term()}),
-          ensure_all_started: (-> ensure_started_result())
+          ensure_all_started: (-> ensure_started_result()),
+          managed_enabled?: (-> {:ok, boolean()} | {:error, term()})
         }
 
   @spec main([String.t()]) :: no_return()
@@ -39,17 +39,15 @@ defmodule SymphonyElixir.CLI do
   def evaluate(args, deps \\ runtime_deps()) do
     case OptionParser.parse(args, strict: @switches) do
       {opts, [], []} ->
-        with :ok <- require_guardrails_acknowledgement(opts),
-             :ok <- maybe_set_logs_root(opts, deps),
+        with :ok <- maybe_set_logs_root(opts, deps),
              :ok <- maybe_set_server_port(opts, deps) do
-          run(Path.expand("WORKFLOW.md"), deps)
+          run(Path.expand("WORKFLOW.md"), deps, Keyword.get(opts, :managed, false))
         end
 
       {opts, [workflow_path], []} ->
-        with :ok <- require_guardrails_acknowledgement(opts),
-             :ok <- maybe_set_logs_root(opts, deps),
+        with :ok <- maybe_set_logs_root(opts, deps),
              :ok <- maybe_set_server_port(opts, deps) do
-          run(workflow_path, deps)
+          run(workflow_path, deps, Keyword.get(opts, :managed, false))
         end
 
       _ ->
@@ -57,28 +55,39 @@ defmodule SymphonyElixir.CLI do
     end
   end
 
-  @spec run(String.t(), deps()) :: :ok | {:error, String.t()}
-  def run(workflow_path, deps) do
+  @spec run(String.t(), deps(), boolean()) :: :ok | {:error, String.t()}
+  def run(workflow_path, deps, managed \\ false) do
     expanded_path = Path.expand(workflow_path)
 
     if deps.file_regular?.(expanded_path) do
       :ok = deps.set_workflow_file_path.(expanded_path)
 
-      case deps.ensure_all_started.() do
-        {:ok, _started_apps} ->
-          :ok
-
-        {:error, reason} ->
-          {:error, "Failed to start Symphony with workflow #{expanded_path}: #{inspect(reason)}"}
-      end
+      start_application(expanded_path, deps, managed)
     else
       {:error, "Workflow file not found: #{expanded_path}"}
     end
   end
 
+  defp start_application(workflow_path, deps, managed) do
+    with :ok <- maybe_require_managed_workflow(deps, managed),
+         :ok <- maybe_set_managed_mode(managed) do
+      ensure_started(workflow_path, deps)
+    end
+  end
+
+  defp ensure_started(workflow_path, deps) do
+    case deps.ensure_all_started.() do
+      {:ok, _started_apps} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, "Failed to start Symphony with workflow #{workflow_path}: #{inspect(reason)}"}
+    end
+  end
+
   @spec usage_message() :: String.t()
   defp usage_message do
-    "Usage: symphony [--logs-root <path>] [--port <port>] [path-to-WORKFLOW.md]"
+    "Usage: symphony [--managed] [--logs-root <path>] [--port <port>] [path-to-WORKFLOW.md]"
   end
 
   @spec runtime_deps() :: deps()
@@ -88,7 +97,8 @@ defmodule SymphonyElixir.CLI do
       set_workflow_file_path: &SymphonyElixir.Workflow.set_workflow_file_path/1,
       set_logs_root: &set_logs_root/1,
       set_server_port_override: &set_server_port_override/1,
-      ensure_all_started: ensure_all_started
+      ensure_all_started: ensure_all_started,
+      managed_enabled?: &SymphonyElixir.Config.managed_enabled?/0
     }
   end
 
@@ -108,46 +118,18 @@ defmodule SymphonyElixir.CLI do
     end
   end
 
-  defp require_guardrails_acknowledgement(opts) do
-    if Keyword.get(opts, @acknowledgement_switch, false) do
-      :ok
-    else
-      {:error, acknowledgement_banner()}
+  defp maybe_require_managed_workflow(_deps, false), do: :ok
+
+  defp maybe_require_managed_workflow(deps, true) do
+    case Map.get(deps, :managed_enabled?, fn -> {:error, :managed_workflow_check_unavailable} end).() do
+      {:ok, true} -> :ok
+      {:ok, false} -> {:error, "--managed requires a workflow with managed.enabled=true"}
+      {:error, reason} -> {:error, "Unable to validate managed workflow: #{inspect(reason)}"}
     end
   end
 
-  @spec acknowledgement_banner() :: String.t()
-  defp acknowledgement_banner do
-    lines = [
-      "This Symphony implementation is a low key engineering preview.",
-      "Codex will run without any guardrails.",
-      "SymphonyElixir is not a supported product and is presented as-is.",
-      "To proceed, start with `--i-understand-that-this-will-be-running-without-the-usual-guardrails` CLI argument"
-    ]
-
-    width = Enum.max(Enum.map(lines, &String.length/1))
-    border = String.duplicate("─", width + 2)
-    top = "╭" <> border <> "╮"
-    bottom = "╰" <> border <> "╯"
-    spacer = "│ " <> String.duplicate(" ", width) <> " │"
-
-    content =
-      [
-        top,
-        spacer
-        | Enum.map(lines, fn line ->
-            "│ " <> String.pad_trailing(line, width) <> " │"
-          end)
-      ] ++ [spacer, bottom]
-
-    [
-      IO.ANSI.red(),
-      IO.ANSI.bright(),
-      Enum.join(content, "\n"),
-      IO.ANSI.reset()
-    ]
-    |> IO.iodata_to_binary()
-  end
+  defp maybe_set_managed_mode(true), do: Application.put_env(:symphony_elixir, :managed_mode, true)
+  defp maybe_set_managed_mode(false), do: :ok
 
   defp set_logs_root(logs_root) do
     Application.put_env(:symphony_elixir, :log_file, LogFile.default_log_file(logs_root))

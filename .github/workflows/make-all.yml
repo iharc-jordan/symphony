@@ -8,7 +8,7 @@ on:
 
 jobs:
   make-all:
-    runs-on: ubuntu-latest
+    runs-on: windows-2025
     defaults:
       run:
         working-directory: elixir
@@ -17,12 +17,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Set up mise tools
-        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+      - name: Set up OTP and Elixir
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
-          install: true
-          cache: true
-          working_directory: elixir
+          otp-version: "28.5.0.6"
+          elixir-version: "1.19.6"
 
       - name: Cache deps and build
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -35,4 +34,30 @@ jobs:
             ${{ runner.os }}-mix-
 
       - name: Verify make all
-        run: make all
+        shell: pwsh
+        run: |
+          function Invoke-Mix([string[]]$MixArgs) {
+            & mix @MixArgs
+            if ($LASTEXITCODE -ne 0) {
+              throw "mix $($MixArgs -join ' ') failed with exit code $LASTEXITCODE"
+            }
+          }
+
+          Invoke-Mix -MixArgs @('deps.get')
+          & cargo.exe build --locked --manifest-path native/symphony_worker_host/Cargo.toml
+          if ($LASTEXITCODE -ne 0) {
+            throw 'cargo build for symphony-worker-host failed.'
+          }
+          Invoke-Mix -MixArgs @('compile', '--warnings-as-errors')
+          Invoke-Mix -MixArgs @('format', '--check-formatted')
+          Invoke-Mix -MixArgs @('lint')
+          Invoke-Mix -MixArgs @('test', '--cover')
+          Invoke-Mix -MixArgs @('dialyzer', '--format', 'short')
+
+      - name: Upload coverage diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-diagnostics
+          path: elixir/cover
+          if-no-files-found: warn

@@ -121,25 +121,6 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
-  defmodule Worker do
-    @moduledoc false
-    use Ecto.Schema
-    import Ecto.Changeset
-
-    @primary_key false
-    embedded_schema do
-      field(:ssh_hosts, {:array, :string}, default: [])
-      field(:max_concurrent_agents_per_host, :integer)
-    end
-
-    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
-    def changeset(schema, attrs) do
-      schema
-      |> cast(attrs, [:ssh_hosts, :max_concurrent_agents_per_host], empty_values: [])
-      |> validate_number(:max_concurrent_agents_per_host, greater_than: 0)
-    end
-  end
-
   defmodule Agent do
     @moduledoc false
     use Ecto.Schema
@@ -178,22 +159,14 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
-      field(:command, :string, default: "codex app-server")
+      field(:launcher, :string)
 
-      field(:approval_policy, StringOrMap,
-        default: %{
-          "reject" => %{
-            "sandbox_approval" => true,
-            "rules" => true,
-            "mcp_elicitations" => true
-          }
-        }
-      )
+      field(:approval_policy, StringOrMap, default: "never")
 
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
       field(:turn_timeout_ms, :integer, default: 3_600_000)
-      field(:read_timeout_ms, :integer, default: 5_000)
+      field(:read_timeout_ms, :integer, default: 60_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
     end
 
@@ -203,7 +176,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> cast(
         attrs,
         [
-          :command,
+          :launcher,
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
@@ -213,17 +186,29 @@ defmodule SymphonyElixir.Config.Schema do
         ],
         empty_values: []
       )
-      |> validate_required([:command])
-      |> validate_change(:command, fn :command, command ->
-        if command != "" and String.trim(command) == "" do
-          [command: "can't be blank"]
-        else
-          []
-        end
-      end)
+      |> validate_change(:launcher, &validate_codex_launcher/2)
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    end
+
+    defp validate_codex_launcher(:launcher, launcher) do
+      cond do
+        not is_binary(launcher) or String.trim(launcher) == "" ->
+          [launcher: "can't be blank"]
+
+        Path.type(launcher) != :absolute ->
+          [launcher: "must be an absolute Windows path"]
+
+        String.downcase(Path.basename(launcher)) != "codex.cmd" ->
+          [launcher: "must name codex.cmd"]
+
+        String.contains?(launcher, ["\"", "\r", "\n", <<0>>]) ->
+          [launcher: "contains invalid characters"]
+
+        true ->
+          []
+      end
     end
   end
 
@@ -270,6 +255,55 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Managed do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: false)
+      field(:store_path, :string, default: Path.join(System.tmp_dir!(), "symphony_managed/managed.sqlite3"))
+      field(:control_token, :string)
+      field(:control_token_file, :string)
+      field(:control_token_env, :string, default: "SYMPHONY_MANAGED_TOKEN")
+      field(:event_limit, :integer, default: 100)
+      field(:event_wait_ms, :integer, default: 5_000)
+      field(:usage_limit_tokens, :integer)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :enabled,
+          :store_path,
+          :control_token,
+          :control_token_file,
+          :control_token_env,
+          :event_limit,
+          :event_wait_ms,
+          :usage_limit_tokens
+        ],
+        empty_values: []
+      )
+      |> validate_number(:event_limit, greater_than: 0, less_than_or_equal_to: 100)
+      |> validate_number(:event_wait_ms, greater_than_or_equal_to: 0, less_than_or_equal_to: 60_000)
+      |> validate_number(:usage_limit_tokens, greater_than: 0)
+      |> validate_required([:store_path])
+      |> validate_change(:store_path, fn :store_path, value ->
+        if is_binary(value) and String.trim(value) != "", do: [], else: [store_path: "must not be blank"]
+      end)
+      |> validate_change(:control_token_file, fn :control_token_file, value ->
+        if is_nil(value) or (is_binary(value) and String.trim(value) != ""),
+          do: [],
+          else: [control_token_file: "must not be blank"]
+      end)
+    end
+  end
+
   defmodule Server do
     @moduledoc false
     use Ecto.Schema
@@ -293,12 +327,12 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
-    embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:managed, Managed, on_replace: :update, defaults_to_struct: true)
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -310,7 +344,14 @@ defmodule SymphonyElixir.Config.Schema do
     |> apply_action(:validate)
     |> case do
       {:ok, settings} ->
-        {:ok, finalize_settings(settings)}
+        settings = finalize_settings(settings)
+
+        with :ok <- validate_codex_settings(settings.codex),
+             :ok <- validate_managed_settings(settings.managed) do
+          {:ok, settings}
+        else
+          {:error, message} -> {:error, {:invalid_workflow_config, message}}
+        end
 
       {:error, changeset} ->
         {:error, {:invalid_workflow_config, format_errors(changeset)}}
@@ -331,9 +372,9 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
-  @spec resolve_runtime_turn_sandbox_policy(%__MODULE__{}, Path.t() | nil, keyword()) ::
+  @spec resolve_runtime_turn_sandbox_policy(%__MODULE__{}, Path.t() | nil) ::
           {:ok, map()} | {:error, term()}
-  def resolve_runtime_turn_sandbox_policy(settings, workspace \\ nil, opts \\ []) do
+  def resolve_runtime_turn_sandbox_policy(settings, workspace \\ nil) do
     case settings.codex.turn_sandbox_policy do
       %{} = policy ->
         {:ok, policy}
@@ -341,7 +382,7 @@ defmodule SymphonyElixir.Config.Schema do
       _ ->
         workspace
         |> default_workspace_root(settings.workspace.root)
-        |> default_runtime_turn_sandbox_policy(opts)
+        |> default_runtime_turn_sandbox_policy()
     end
   end
 
@@ -387,55 +428,18 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
-    |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> cast_embed(:managed, with: &Managed.changeset/2)
   end
 
   defp finalize_settings(settings) do
     provider = normalize_optional_map(settings.tracker.provider) || %{}
-
-    {api_key, assignee, provider, secret_environment_names} =
-      case settings.tracker.kind do
-        "linear" ->
-          linear_provider =
-            provider
-            |> Map.put_new("endpoint", settings.tracker.endpoint || @linear_endpoint)
-            |> Map.put_new("api_key", settings.tracker.api_key)
-            |> Map.put_new("project_slug", settings.tracker.project_slug)
-            |> Map.put_new("assignee", settings.tracker.assignee)
-
-          resolved_api_key =
-            resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
-
-          resolved_assignee =
-            resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
-
-          {
-            resolved_api_key,
-            resolved_assignee,
-            linear_provider,
-            ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
-          }
-
-        _ ->
-          {settings.tracker.api_key, settings.tracker.assignee, provider, []}
-      end
-
-    {active_states, terminal_states} =
-      case settings.tracker.kind do
-        kind when kind in ["linear", "memory"] ->
-          {
-            settings.tracker.active_states || @linear_active_states,
-            settings.tracker.terminal_states || @linear_terminal_states
-          }
-
-        _ ->
-          {settings.tracker.active_states, settings.tracker.terminal_states}
-      end
+    {api_key, assignee, provider, secret_environment_names} = finalize_tracker(settings.tracker, provider)
+    {active_states, terminal_states} = finalize_tracker_states(settings.tracker)
 
     tracker = %{
       settings.tracker
@@ -454,13 +458,154 @@ defmodule SymphonyElixir.Config.Schema do
       | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
     }
 
+    managed = %{
+      settings.managed
+      | store_path:
+          resolve_path_value(
+            settings.managed.store_path,
+            Path.join(System.tmp_dir!(), "symphony_managed/managed.sqlite3")
+          ),
+        control_token_file: effective_control_token_file(settings.managed),
+        control_token: managed_control_token(settings.managed)
+    }
+
     codex = %{
       settings.codex
-      | approval_policy: normalize_keys(settings.codex.approval_policy),
+      | launcher: resolve_codex_launcher(settings.codex.launcher),
+        approval_policy: normalize_keys(settings.codex.approval_policy),
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, managed: managed}
+  end
+
+  defp resolve_codex_launcher(value) when is_binary(value), do: Path.expand(value)
+
+  defp resolve_codex_launcher(_value) do
+    case System.get_env("APPDATA") do
+      app_data when is_binary(app_data) and app_data != "" ->
+        Path.join([app_data, "npm", "codex.cmd"]) |> Path.expand()
+
+      _ ->
+        nil
+    end
+  end
+
+  defp finalize_tracker(tracker, provider) do
+    case tracker.kind do
+      "linear" ->
+        linear_provider =
+          provider
+          |> Map.put_new("endpoint", tracker.endpoint || @linear_endpoint)
+          |> Map.put_new("api_key", tracker.api_key)
+          |> Map.put_new("project_slug", tracker.project_slug)
+          |> Map.put_new("assignee", tracker.assignee)
+
+        resolved_api_key = resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
+        resolved_assignee = resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
+
+        {
+          resolved_api_key,
+          resolved_assignee,
+          linear_provider,
+          ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
+        }
+
+      _ ->
+        {tracker.api_key, tracker.assignee, provider, []}
+    end
+  end
+
+  defp finalize_tracker_states(tracker) do
+    case tracker.kind do
+      kind when kind in ["linear", "memory"] ->
+        {
+          tracker.active_states || @linear_active_states,
+          tracker.terminal_states || @linear_terminal_states
+        }
+
+      _ ->
+        {tracker.active_states, tracker.terminal_states}
+    end
+  end
+
+  defp validate_codex_settings(%Codex{launcher: launcher}) do
+    cond do
+      not present_string?(launcher) ->
+        {:error, "codex.launcher is required; install Codex at %APPDATA%\\npm\\codex.cmd or configure an absolute codex.cmd path"}
+
+      Path.type(launcher) != :absolute ->
+        {:error, "codex.launcher must be an absolute Windows path"}
+
+      String.downcase(Path.basename(launcher)) != "codex.cmd" ->
+        {:error, "codex.launcher must name codex.cmd"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_managed_settings(%Managed{enabled: false}), do: :ok
+
+  defp validate_managed_settings(%Managed{} = managed) do
+    case managed_validation_token(managed) do
+      token when is_binary(token) and token != "" -> validate_managed_paths(managed)
+      _ -> {:error, "managed.enabled=true requires a readable non-empty control_token_file or control_token"}
+    end
+  end
+
+  defp managed_validation_token(%Managed{} = managed) do
+    token_from_file =
+      case effective_control_token_file(managed) do
+        file when is_binary(file) ->
+          case File.read(file) do
+            {:ok, value} -> String.trim(value)
+            {:error, _reason} -> nil
+          end
+
+        _ ->
+          nil
+      end
+
+    token_from_file || managed.control_token
+  end
+
+  defp validate_managed_paths(%Managed{}), do: :ok
+
+  defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_string?(_value), do: false
+
+  defp managed_control_token(%Managed{} = managed) do
+    token_from_file =
+      case effective_control_token_file(managed) do
+        file when is_binary(file) ->
+          case File.read(file) do
+            {:ok, value} -> String.trim(value)
+            _ -> nil
+          end
+
+        _ ->
+          nil
+      end
+
+    token_from_file ||
+      resolve_secret_setting(
+        managed.control_token,
+        System.get_env(managed.control_token_env || "SYMPHONY_MANAGED_TOKEN")
+      )
+  end
+
+  # RuntimeConfig installs the launcher-provided absolute path before the
+  # workflow store starts. It intentionally overrides any workflow value so a
+  # task file cannot redirect the managed control credential.
+  defp effective_control_token_file(%Managed{} = managed) do
+    case Application.get_env(:symphony_elixir, :control_token_file_override) do
+      path when is_binary(path) ->
+        if String.trim(path) != "", do: Path.expand(path), else: resolve_path_value(managed.control_token_file, nil)
+
+      _ ->
+        resolve_path_value(managed.control_token_file, nil)
+    end
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -513,6 +658,8 @@ defmodule SymphonyElixir.Config.Schema do
         path
     end
   end
+
+  defp resolve_path_value(_value, default), do: default
 
   defp resolve_env_value(value, fallback) when is_binary(value) do
     case env_reference_name(value) do
@@ -578,18 +725,14 @@ defmodule SymphonyElixir.Config.Schema do
     }
   end
 
-  defp default_runtime_turn_sandbox_policy(workspace_root, opts) when is_binary(workspace_root) do
-    if Keyword.get(opts, :remote, false) do
-      {:ok, default_turn_sandbox_policy(workspace_root)}
-    else
-      with expanded_workspace_root <- expand_local_workspace_root(workspace_root),
-           {:ok, canonical_workspace_root} <- PathSafety.canonicalize(expanded_workspace_root) do
-        {:ok, default_turn_sandbox_policy(canonical_workspace_root)}
-      end
+  defp default_runtime_turn_sandbox_policy(workspace_root) when is_binary(workspace_root) do
+    with expanded_workspace_root <- expand_local_workspace_root(workspace_root),
+         {:ok, canonical_workspace_root} <- PathSafety.canonicalize(expanded_workspace_root) do
+      {:ok, default_turn_sandbox_policy(canonical_workspace_root)}
     end
   end
 
-  defp default_runtime_turn_sandbox_policy(workspace_root, _opts) do
+  defp default_runtime_turn_sandbox_policy(workspace_root) do
     {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, workspace_root}}}
   end
 
