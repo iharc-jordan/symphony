@@ -27,6 +27,7 @@ defmodule SymphonyElixir.PromptBuilder do
 
     rendered <>
       review_feedback_block(Keyword.get(opts, :review_feedback)) <>
+      project_requirements_block(Keyword.get(opts, :project_requirements)) <>
       peer_report_block(Keyword.get(opts, :peer_reports, [])) <>
       peer_report_unavailable_block(Keyword.get(opts, :peer_report_notice))
   end
@@ -65,6 +66,19 @@ defmodule SymphonyElixir.PromptBuilder do
   end
 
   defp review_feedback_block(_feedback), do: ""
+
+  defp project_requirements_block(%{content: content, fingerprint: fingerprint})
+       when is_binary(content) and is_binary(fingerprint) do
+    """
+
+    CURRENT PROJECT REQUIREMENTS
+    These are current user-approved project requirements. Follow them throughout this assignment. They supersede lower-priority task material that conflicts with them; report a conflict or missing context instead of changing them.
+    Revision: #{fingerprint}
+    #{content}
+    """
+  end
+
+  defp project_requirements_block(_requirements), do: ""
 
   defp peer_report_block(reports) when is_list(reports) do
     reports =

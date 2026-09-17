@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Managed.Rules do
   the returned state and persists it through the managed journal.
   """
 
-  alias SymphonyElixir.Managed.{Ownership, Resources}
+  alias SymphonyElixir.Managed.{Ownership, Requirements, Resources}
 
   @version 2
   @operations ~w(bind_project register_pm enroll claim handoff operator_takeover revise pause resume interrupt cancel review)a
@@ -213,6 +213,7 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp validate_review_intent(_state, assignment, :accepted, args, context) do
     with :ok <- accepted_review_source(assignment, context),
+         :ok <- current_project_requirements(assignment, context),
          :ok <- peer_report_refs_absent?(args) do
       evidence_present(Map.get(args, :evidence, []))
     end
@@ -909,6 +910,7 @@ defmodule SymphonyElixir.Managed.Rules do
     with :ok <- expected_revision(state, args, :global),
          {:ok, binding} <- fetch_project_binding(state, project_id),
          {:ok, assignment} <- assignment_from_args(args, []),
+         {:ok, project_requirements} <- project_requirement_metadata(context),
          assignment <- merge_source_identity(assignment, context),
          :ok <- repository_in_binding(binding, assignment.repository),
          :ok <- duplicate_identity_free?(state, assignment),
@@ -917,6 +919,7 @@ defmodule SymphonyElixir.Managed.Rules do
         assignment
         |> Map.put(:project_id, project_id)
         |> Map.put(:revision, 1)
+        |> Map.merge(project_requirements)
         |> maybe_assign_owner(principal)
 
       assignments = Map.put(state.assignments, assignment.assignment_id, assignment)
@@ -945,7 +948,7 @@ defmodule SymphonyElixir.Managed.Rules do
          {:ok, changes} <- revision_changes(args),
          :ok <- validate_turn_limit_extension(assignment, changes),
          {:ok, route} <- maybe_route(changes),
-         {:ok, revised} <- revise_assignment(assignment, changes, route),
+         {:ok, revised} <- revise_assignment(assignment, changes, route, context),
          :ok <- duplicate_identity_free_after_revision?(state, assignment_id, revised),
          :ok <- resources_free?(state, revised.resources, assignment_id) do
       assignments = Map.put(state.assignments, assignment_id, revised)
@@ -1003,6 +1006,7 @@ defmodule SymphonyElixir.Managed.Rules do
 
   defp review_accepted(assignment, provider_state, evidence, state, context) do
     with :ok <- accepted_review_source(assignment, context),
+         :ok <- current_project_requirements(assignment, context),
          :ok <- provider_phase_is(provider_state, :review),
          :ok <- evidence_present(evidence),
          :ok <- dependencies_accepted(assignment, state),
@@ -1128,11 +1132,13 @@ defmodule SymphonyElixir.Managed.Rules do
     projection_field_value = Map.get(project, :projection_field_id, Map.get(project, "projection_field_id"))
     projection_field_id = text_value(project, :projection_field_id)
     project_number = number_value(project, :project_number)
+    requirements_path = text_value(project, :requirements_path)
 
     with :ok <- present(project_id, :project_id),
          :ok <- present(status_field_id, :status_field_id),
          :ok <- positive(project_number, :project_number),
          :ok <- optional_text_value(projection_field_value, :projection_field_id),
+         {:ok, requirements_path} <- optional_requirements_path(requirements_path),
          {:ok, options} <- status_options(project),
          {:ok, repositories} <- repository_allowlist(project) do
       {:ok,
@@ -1143,7 +1149,8 @@ defmodule SymphonyElixir.Managed.Rules do
          status_options: options,
          repositories: repositories
        }
-       |> maybe_put(:projection_field_id, projection_field_id)}
+       |> maybe_put(:projection_field_id, projection_field_id)
+       |> maybe_put(:requirements_path, requirements_path)}
     end
   end
 
@@ -1384,7 +1391,9 @@ defmodule SymphonyElixir.Managed.Rules do
     end
   end
 
-  defp revise_assignment(assignment, changes, route) do
+  defp revise_assignment(assignment, changes, route, context) do
+    project_requirements = Map.get(context, :project_requirements, %{})
+
     revised =
       assignment
       |> Map.merge(Map.drop(changes, [:assignment_id, :expected_revision]))
@@ -1396,6 +1405,7 @@ defmodule SymphonyElixir.Managed.Rules do
       |> Map.put(:retry_count, 0)
       |> Map.drop([:blocked_reason, :review_feedback])
       |> Map.put(:route, route || assignment.route)
+      |> maybe_put(:project_requirements_fingerprint, project_requirements[:fingerprint])
       |> reset_changed_route_session(assignment.route)
 
     {:ok, revised}
@@ -1567,6 +1577,34 @@ defmodule SymphonyElixir.Managed.Rules do
          |> maybe_put(:requirements_revision, revision)}
     end
   end
+
+  defp project_requirement_metadata(context) when is_map(context) do
+    snapshot = Map.get(context, :project_requirements, Map.get(context, "project_requirements"))
+
+    case snapshot do
+      %{fingerprint: fingerprint} when is_binary(fingerprint) and fingerprint != "" ->
+        {:ok, %{project_requirements_fingerprint: fingerprint}}
+
+      nil ->
+        {:ok, %{}}
+
+      _ ->
+        {:error, :project_requirements_snapshot_required, %{}}
+    end
+  end
+
+  defp project_requirement_metadata(_context), do: {:error, :project_requirements_snapshot_required, %{}}
+
+  defp current_project_requirements(assignment, context) do
+    case Map.get(context, :project_requirements, Map.get(context, "project_requirements")) do
+      nil -> :ok
+      %{fingerprint: fingerprint} when fingerprint == assignment[:project_requirements_fingerprint] -> :ok
+      _ -> {:error, :managed_project_requirements_changed, %{}}
+    end
+  end
+
+  defp optional_requirements_path(nil), do: {:ok, nil}
+  defp optional_requirements_path(path), do: Requirements.path(%{requirements_path: path})
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)

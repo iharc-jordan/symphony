@@ -20,7 +20,7 @@ Other upstream tracker adapters remain source-level Symphony components. They ar
 
 ## Install
 
-Install the paired `0.4.0` Codex Orchestration plugin release. Its lifecycle commands download the pinned Windows runtime manifest or accept the same release ZIP offline with an explicit SHA-256 digest. The installer verifies the archive, stages an immutable version directory, and switches the stable launcher only after the prior runtime has stopped.
+Install the paired `0.5.0` Codex Orchestration plugin release. Its lifecycle commands download the pinned Windows runtime manifest or accept the same release ZIP offline with an explicit SHA-256 digest. The installer verifies the archive, stages an immutable version directory, and switches the stable launcher only after the prior runtime has stopped.
 
 Runtime controls and setup are documented in the plugin repository: <https://github.com/iharc-jordan/codex-orchestration>.
 

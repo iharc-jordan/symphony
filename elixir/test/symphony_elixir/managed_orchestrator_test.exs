@@ -96,7 +96,8 @@ defmodule SymphonyElixir.ManagedOrchestratorTest do
         project_number: 4,
         status_field_id: "PVTSSF_test",
         status_options: %{"READY" => "ready", "ACTIVE" => "active", "REVIEW" => "review", "ACCEPTED" => "accepted", "WAITING" => "waiting", "CANCELLED" => "cancelled"},
-        repositories: ["acme/example"]
+        repositories: ["acme/example"],
+        requirements_path: Path.expand("../fixtures/REQUIREMENTS.md", __DIR__)
       }
     }
   end
@@ -820,7 +821,8 @@ defmodule SymphonyElixir.ManagedOrchestratorDeferredReportTest do
           "WAITING" => "waiting",
           "CANCELLED" => "cancelled"
         },
-        repositories: ["acme/example"]
+        repositories: ["acme/example"],
+        requirements_path: Path.expand("../fixtures/REQUIREMENTS.md", __DIR__)
       }
     }
   end
@@ -1033,7 +1035,8 @@ defmodule SymphonyElixir.ManagedOrchestratorRecoveryTest do
           "WAITING" => "waiting",
           "CANCELLED" => "cancelled"
         },
-        repositories: ["acme/example"]
+        repositories: ["acme/example"],
+        requirements_path: Path.expand("../fixtures/REQUIREMENTS.md", __DIR__)
       }
     }
   end
@@ -2104,7 +2107,8 @@ defmodule SymphonyElixir.ManagedOrchestratorSourceReconciliationTest do
           "WAITING" => "waiting",
           "CANCELLED" => "cancelled"
         },
-        repositories: ["acme/example"]
+        repositories: ["acme/example"],
+        requirements_path: Path.expand("../fixtures/REQUIREMENTS.md", __DIR__)
       }
     }
   end
@@ -2317,7 +2321,8 @@ defmodule SymphonyElixir.ManagedOperatorTakeoverRecoveryTest do
           "WAITING" => "waiting",
           "CANCELLED" => "cancelled"
         },
-        repositories: ["acme/example"]
+        repositories: ["acme/example"],
+        requirements_path: Path.expand("../fixtures/REQUIREMENTS.md", __DIR__)
       }
     }
   end

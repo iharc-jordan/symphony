@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.GitHubProjects.Client
-  alias SymphonyElixir.Managed.{Checkout, Journal, Principal, Projection, Rules, Usage}
+  alias SymphonyElixir.Managed.{Checkout, Journal, Principal, Projection, Requirements, Rules, Usage}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -361,7 +361,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp managed_principal_context(state), do: Map.get(state.managed, :control_context, %{})
 
   defp apply_managed_rules(state, envelope, context) do
-    Rules.apply(state.managed.data, envelope, Map.merge(managed_principal_context(state), context))
+    with {:ok, requirements_context} <- managed_requirements_context(state, envelope) do
+      Rules.apply(
+        state.managed.data,
+        envelope,
+        managed_principal_context(state) |> Map.merge(context) |> Map.merge(requirements_context)
+      )
+    end
   end
 
   defp prepare_managed_review(state, envelope, context \\ %{}) do
@@ -370,6 +376,14 @@ defmodule SymphonyElixir.Orchestrator do
       |> Map.merge(context)
       |> Map.merge(managed_review_process_context(state, envelope))
 
+    with {:ok, requirements_context} <- managed_requirements_context(state, envelope) do
+      prepare_managed_review_rules(state, envelope, Map.merge(principal_context, requirements_context))
+    else
+      {:error, code, details} -> {:error, code, details}
+    end
+  end
+
+  defp prepare_managed_review_rules(state, envelope, principal_context) do
     case Rules.prepare_review(state.managed.data, envelope, principal_context) do
       {:ok, intent} ->
         {:ok, intent |> Map.put(:principal_context, principal_context) |> Map.put(:binding, managed_assignment_binding(state, intent.assignment))}
@@ -380,7 +394,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp validate_managed_enrollment(state, envelope) do
-    if map_value(envelope, :operation) in [:enroll, "enroll"] and managed_source_fetch_enabled?() and
+    if map_value(envelope, :operation) in [:enroll, "enroll"] and
          not Map.has_key?(state.managed.data.requests, map_value(envelope, :request_id)) do
       args = map_value(envelope, :args) || %{}
       project_id = map_value(args, :project_id)
@@ -388,42 +402,47 @@ defmodule SymphonyElixir.Orchestrator do
       assignment_id = map_value(args, :assignment_id)
 
       with true <- is_map(binding),
-           {:ok, [%Issue{} = issue]} <- fetch_managed_enrollment_source(state, binding, assignment_id),
+           {:ok, project_requirements} <- Requirements.read(binding),
+           {:ok, source_identity} <- managed_enrollment_source_identity(state, binding, args, assignment_id),
+           do: {:ok, %{source_identity: source_identity, project_requirements: project_requirements}}
+    else
+      {:error, reason} when is_atom(reason) ->
+        {:error, reason, %{assignment_id: map_value(map_value(envelope, :args) || %{}, :assignment_id)}}
+
+      false ->
+        args = map_value(envelope, :args) || %{}
+        {:error, :managed_project_not_bound, %{project_id: map_value(args, :project_id)}}
+    end
+  end
+
+  defp managed_enrollment_source_identity(state, binding, args, assignment_id) do
+    if managed_source_fetch_enabled?() do
+      with {:ok, [%Issue{} = issue]} <- fetch_managed_enrollment_source(state, binding, assignment_id),
            :ok <- managed_source_identity_matches?(atomize_enrollment_identity(args), issue),
            :ok <- managed_source_material_matches?(atomize_enrollment_identity(args), issue),
            true <- issue.dispatchable == true and issue_state_ready?(issue.state) do
-        identity = %{
-          native_issue_id: source_native_value(issue, :issue_id),
-          native_repository_id: source_native_repository_id(issue),
-          title: issue.title,
-          issue_url: issue.url,
-          requirements_fingerprint: managed_material_fingerprint(issue.description)
-        }
-
-        {:ok, %{source_identity: identity}}
+        {:ok,
+         %{
+           native_issue_id: source_native_value(issue, :issue_id),
+           native_repository_id: source_native_repository_id(issue),
+           title: issue.title,
+           issue_url: issue.url,
+           requirements_fingerprint: managed_material_fingerprint(issue.description)
+         }}
       else
-        false ->
-          {:error, :managed_enrollment_not_ready, %{project_id: project_id, assignment_id: assignment_id}}
-
-        {:ok, []} ->
-          {:error, :managed_project_item_not_found, %{project_id: project_id, assignment_id: assignment_id}}
-
-        {:error, :github_projects_missing_item_status} ->
-          {:error, :managed_project_status_required, %{project_id: project_id, assignment_id: assignment_id}}
-
-        {:error, reason} when is_atom(reason) ->
-          {:error, reason, %{assignment_id: assignment_id}}
-
-        {:error, _reason} ->
-          {:error, :managed_enrollment_fetch_failed, %{assignment_id: assignment_id}}
-
-        _ ->
-          {:error, :managed_project_item_ambiguous, %{assignment_id: assignment_id}}
+        false -> {:error, :managed_enrollment_not_ready}
+        {:ok, []} -> {:error, :managed_project_item_not_found}
+        {:error, :github_projects_missing_item_status} -> {:error, :managed_project_status_required}
+        {:error, reason} when is_atom(reason) -> {:error, reason}
+        {:error, _reason} -> {:error, :managed_enrollment_fetch_failed}
+        _ -> {:error, :managed_project_item_ambiguous}
       end
     else
       {:ok, %{}}
     end
   end
+
+  defp validate_managed_enrollment(_state, _envelope), do: {:ok, %{}}
 
   defp fetch_managed_enrollment_source(state, binding, assignment_id) do
     case state.managed[:source_fetcher] do
@@ -452,6 +471,55 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp managed_assignment_binding(_state, _assignment), do: nil
+
+  defp managed_requirements_context(state, envelope) do
+    if map_value(envelope, :operation) in [:revise, "revise", :review, "review"] do
+      assignment_id = map_value(map_value(envelope, :args) || %{}, :assignment_id)
+
+      with assignment when is_map(assignment) <- get_in(state.managed.data, [:assignments, assignment_id]),
+           binding when is_map(binding) <- managed_assignment_binding(state, assignment),
+           {:ok, snapshot} <- Requirements.read(binding) do
+        {:ok, %{project_requirements: snapshot}}
+      else
+        nil -> {:error, :assignment_not_found, %{assignment_id: assignment_id}}
+        {:error, code} -> {:error, code, %{assignment_id: assignment_id}}
+      end
+    else
+      {:ok, %{}}
+    end
+  end
+
+  defp managed_project_requirements_snapshot(state, assignment) do
+    with binding when is_map(binding) <- managed_assignment_binding(state, assignment),
+         {:ok, snapshot} <- Requirements.read(binding),
+         :ok <- managed_project_requirements_match(assignment, snapshot) do
+      {:ok, snapshot}
+    else
+      nil -> {:error, :managed_project_not_bound}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp managed_project_requirements_match(assignment, snapshot) do
+    if assignment[:project_requirements_fingerprint] == snapshot.fingerprint do
+      :ok
+    else
+      {:error, :managed_project_requirements_changed}
+    end
+  end
+
+  defp managed_turn_requirements_current(state, turn_context) do
+    attempt = map_value(turn_context, :attempt) || turn_context
+    assignment_id = map_value(attempt, :assignment_id)
+
+    with assignment when is_map(assignment) <- get_in(state.managed.data, [:assignments, assignment_id]),
+         {:ok, _snapshot} <- managed_project_requirements_snapshot(state, assignment) do
+      :ok
+    else
+      nil -> {:error, :managed_assignment_not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defp managed_binding_unchanged(state, assignment, binding) do
     if managed_assignment_binding(state, assignment) == binding do
@@ -842,9 +910,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp accepted_external_effects?(_reconciliation), do: false
 
   defp managed_start_assignment(%State{} = state, %Issue{} = issue, assignment) do
-    case managed_checkout_options(issue, assignment) do
-      {:ok, _options} ->
-        managed_start_assignment_ready(state, issue, assignment)
+    case managed_project_requirements_snapshot(state, assignment) do
+      {:ok, project_requirements} ->
+        managed_start_assignment_with_requirements(state, issue, assignment, project_requirements)
 
       {:error, reason} ->
         Logger.error("Managed dispatch blocked: #{inspect(reason)}")
@@ -852,7 +920,18 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp managed_start_assignment_ready(%State{} = state, %Issue{id: issue_id} = issue, assignment) do
+  defp managed_start_assignment_with_requirements(state, issue, assignment, project_requirements) do
+    case managed_checkout_options(issue, assignment) do
+      {:ok, _options} ->
+        managed_start_assignment_ready(state, issue, assignment, project_requirements)
+
+      {:error, reason} ->
+        Logger.error("Managed dispatch blocked: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp managed_start_assignment_ready(%State{} = state, %Issue{id: issue_id} = issue, assignment, project_requirements) do
     generation =
       if assignment[:recovery_generation_pending] == true,
         do: Map.get(assignment, :generation, 0),
@@ -867,7 +946,8 @@ defmodule SymphonyElixir.Orchestrator do
       attempt_id: attempt_id,
       model: route_value(assignment.route, :model),
       effort: route_value(assignment.route, :effort),
-      escalation_reason: assignment[:escalation_reason]
+      escalation_reason: assignment[:escalation_reason],
+      project_requirements: project_requirements
     }
 
     updated_assignment =
@@ -1487,11 +1567,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp managed_before_turn(%State{managed: %{data: _data}} = state, turn_context) do
     case managed_source_reconcile(state, turn_context) do
       {:ok, reconciled_state, :unchanged} ->
-        decision =
-          case managed_usage_block_reason(reconciled_state.managed.data) do
-            nil -> managed_before_turn_decision(reconciled_state.managed.data, turn_context)
-            reason -> {:stop, reason}
-          end
+        decision = managed_before_turn_requirements_decision(reconciled_state, turn_context)
 
         case decision do
           :allow -> managed_reserve_turn(reconciled_state, turn_context)
@@ -1507,6 +1583,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp managed_before_turn(state, _turn_context), do: {{:stop, :managed_mode_disabled}, state}
+
+  defp managed_before_turn_requirements_decision(state, turn_context) do
+    with :ok <- managed_turn_requirements_current(state, turn_context) do
+      case managed_usage_block_reason(state.managed.data) do
+        nil -> managed_before_turn_decision(state.managed.data, turn_context)
+        reason -> {:stop, reason}
+      end
+    else
+      {:error, reason} -> {:stop, reason}
+    end
+  end
 
   defp managed_reserve_turn(%State{managed: %{data: data}} = state, turn_context) do
     attempt = map_value(turn_context, :attempt)
@@ -3930,6 +4017,7 @@ defmodule SymphonyElixir.Orchestrator do
         review_feedback: attempt[:review_feedback],
         peer_reports: attempt[:peer_reports],
         peer_report_notice: attempt[:peer_report_notice],
+        project_requirements: attempt[:project_requirements],
         max_turns: turn_limit,
         remaining_turns: max(turn_limit - turns_reserved, 0),
         workspace_preparer: workspace_preparer,
