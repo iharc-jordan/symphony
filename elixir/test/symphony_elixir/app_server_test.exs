@@ -10,6 +10,11 @@ defmodule SymphonyElixir.AppServerTest do
            ]
   end
 
+  test "managed launcher marks only managed worker child environments" do
+    assert AppServer.managed_worker_environment(%{}) == [{~c"SYMPHONY_MANAGED_WORKER", ~c"1"}]
+    assert AppServer.managed_worker_environment(nil) == []
+  end
+
   test "managed route rejects unsupported models, unreasoned escalation, and stale metadata before launch" do
     root = Path.join(System.tmp_dir!(), "managed-route-#{System.unique_integer([:positive])}")
     write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root)

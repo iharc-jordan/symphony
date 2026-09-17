@@ -566,7 +566,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         executable,
         arguments,
         managed_attempt_identity(managed_config),
-        tracker_secret_port_env(dynamic_tool_binding)
+        tracker_secret_port_env(dynamic_tool_binding, managed_config)
       )
     end
   end
@@ -595,10 +595,16 @@ defmodule SymphonyElixir.Codex.AppServer do
     ["-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false"]
   end
 
-  defp tracker_secret_port_env(dynamic_tool_binding) do
+  @doc false
+  @spec managed_worker_environment(map() | nil) :: [{charlist(), charlist()}]
+  def managed_worker_environment(managed_config) when is_map(managed_config), do: [{~c"SYMPHONY_MANAGED_WORKER", ~c"1"}]
+  def managed_worker_environment(_managed_config), do: []
+
+  defp tracker_secret_port_env(dynamic_tool_binding, managed_config) do
     dynamic_tool_binding.secret_environment_names
     |> valid_environment_names()
     |> Enum.map(fn name -> {String.to_charlist(name), false} end)
+    |> Kernel.++(managed_worker_environment(managed_config))
   end
 
   defp valid_environment_names(names) do
