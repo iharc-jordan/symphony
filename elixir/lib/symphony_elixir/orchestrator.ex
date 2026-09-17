@@ -444,8 +444,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp validate_managed_enrollment(_state, _envelope), do: {:ok, %{}}
-
   defp fetch_managed_enrollment_source(state, binding, assignment_id) do
     case state.managed[:source_fetcher] do
       fetcher when is_function(fetcher, 1) -> safe_managed_source_fetch(fetcher, [assignment_id])
