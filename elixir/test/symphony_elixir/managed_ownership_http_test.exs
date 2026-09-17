@@ -212,6 +212,7 @@ defmodule SymphonyElixir.ManagedOwnershipHttpTest do
       project_number: 1,
       status_field_id: "status-#{id}",
       repositories: [repository],
+      requirements_path: Path.expand("../fixtures/REQUIREMENTS.md", __DIR__),
       status_options: Map.new(~w(READY ACTIVE REVIEW ACCEPTED WAITING CANCELLED), &{&1, String.downcase(&1)})
     }
   end

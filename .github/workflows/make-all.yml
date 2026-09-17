@@ -44,6 +44,10 @@ jobs:
           }
 
           Invoke-Mix -MixArgs @('deps.get')
+          & cargo.exe build --locked --manifest-path native/symphony_worker_host/Cargo.toml
+          if ($LASTEXITCODE -ne 0) {
+            throw 'cargo build for symphony-worker-host failed.'
+          }
           Invoke-Mix -MixArgs @('compile', '--warnings-as-errors')
           Invoke-Mix -MixArgs @('format', '--check-formatted')
           Invoke-Mix -MixArgs @('lint')

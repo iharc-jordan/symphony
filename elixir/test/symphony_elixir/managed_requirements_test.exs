@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.ManagedRequirementsTest do
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.Managed.Requirements
+  alias SymphonyElixir.{Managed.Requirements, PathSafety}
 
   test "reads and fingerprints only a canonical absolute REQUIREMENTS.md binding" do
     directory = Path.join(System.tmp_dir!(), "symphony-requirements-#{System.unique_integer([:positive])}")
@@ -16,9 +16,10 @@ defmodule SymphonyElixir.ManagedRequirementsTest do
       File.rmdir(directory)
     end)
 
-    assert {:ok, %{path: ^path, content: ^content, fingerprint: fingerprint}} =
+    assert {:ok, %{path: resolved_path, content: ^content, fingerprint: fingerprint}} =
              Requirements.read(%{requirements_path: path})
 
+    assert PathSafety.same_path?(resolved_path, path)
     assert fingerprint == Requirements.fingerprint(content)
     assert {:error, :project_requirements_path_invalid} = Requirements.read(%{requirements_path: Path.join(directory, "notes.md")})
   end
