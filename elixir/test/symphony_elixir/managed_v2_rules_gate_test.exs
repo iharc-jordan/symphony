@@ -250,6 +250,60 @@ defmodule SymphonyElixir.ManagedV2RulesGateTest do
              Rules.apply(state, invalid, %{principal: @pm})
   end
 
+  test "project requirement snapshots fence enrollment and refresh on revision" do
+    requirements_path = Path.expand("../fixtures/REQUIREMENTS.md", __DIR__)
+    binding = put_in(binding_args(), [:project, :requirements_path], requirements_path)
+
+    assert {:ok, bound, _} =
+             Rules.apply(Rules.new(), envelope("bind-requirements", :bind_project, binding), %{principal: @operator})
+
+    assert {:error, :project_requirements_path_invalid, %{}} =
+             Rules.apply(
+               Rules.new(),
+               envelope("bind-invalid-requirements", :bind_project, put_in(binding_args(), [:project, :requirements_path], "relative/REQUIREMENTS.md")),
+               %{principal: @operator}
+             )
+
+    initial_fingerprint = "sha256:requirements-one"
+
+    assert {:ok, enrolled, _} =
+             Rules.apply(
+               bound,
+               envelope("enroll-requirements", :enroll, enrollment_args("requirements", 1)),
+               %{"project_requirements" => %{fingerprint: initial_fingerprint}, principal: @pm}
+             )
+
+    assert enrolled.assignments["requirements"].project_requirements_fingerprint == initial_fingerprint
+
+    assert {:error, :project_requirements_snapshot_required, %{}} =
+             Rules.apply(
+               bound,
+               envelope("enroll-requirements-missing", :enroll, enrollment_args("requirements-missing", 1)),
+               %{principal: @pm, project_requirements: %{}}
+             )
+
+    refreshed_fingerprint = "sha256:requirements-two"
+
+    revise =
+      envelope("revise-requirements", :revise, %{
+        assignment_id: "requirements",
+        project_id: @project_id,
+        expected_revision: 1,
+        expected_ownership_revision: 1,
+        changes: %{base_commit: "refreshed-base"}
+      })
+
+    assert {:ok, revised, _} =
+             Rules.apply(
+               enrolled,
+               revise,
+               %{principal: @pm, project_requirements: %{fingerprint: refreshed_fingerprint}}
+             )
+
+    assert revised.assignments["requirements"].project_requirements_fingerprint == refreshed_fingerprint
+    assert enrolled.assignments["requirements"].project_requirements_fingerprint == initial_fingerprint
+  end
+
   test "malformed contexts and project shapes fail closed while free resources remain available" do
     request = envelope("malformed-context", :pause, %{expected_revision: 0})
 
