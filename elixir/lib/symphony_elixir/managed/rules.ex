@@ -1613,7 +1613,13 @@ defmodule SymphonyElixir.Managed.Rules do
   end
 
   defp optional_requirements_path(nil), do: {:ok, nil}
-  defp optional_requirements_path(path), do: Requirements.path(%{requirements_path: path})
+
+  defp optional_requirements_path(path) do
+    case Requirements.path(%{requirements_path: path}) do
+      {:ok, requirements_path} -> {:ok, requirements_path}
+      {:error, reason} -> {:error, reason, %{}}
+    end
+  end
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)

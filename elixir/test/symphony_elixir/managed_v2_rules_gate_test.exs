@@ -257,7 +257,7 @@ defmodule SymphonyElixir.ManagedV2RulesGateTest do
     assert {:ok, bound, _} =
              Rules.apply(Rules.new(), envelope("bind-requirements", :bind_project, binding), %{principal: @operator})
 
-    assert {:error, :project_requirements_path_invalid} =
+    assert {:error, :project_requirements_path_invalid, %{}} =
              Rules.apply(
                Rules.new(),
                envelope("bind-invalid-requirements", :bind_project, put_in(binding_args(), [:project, :requirements_path], "relative/REQUIREMENTS.md")),
