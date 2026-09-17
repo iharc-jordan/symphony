@@ -376,10 +376,12 @@ defmodule SymphonyElixir.Orchestrator do
       |> Map.merge(context)
       |> Map.merge(managed_review_process_context(state, envelope))
 
-    with {:ok, requirements_context} <- managed_requirements_context(state, envelope) do
-      prepare_managed_review_rules(state, envelope, Map.merge(principal_context, requirements_context))
-    else
-      {:error, code, details} -> {:error, code, details}
+    case managed_requirements_context(state, envelope) do
+      {:ok, requirements_context} ->
+        prepare_managed_review_rules(state, envelope, Map.merge(principal_context, requirements_context))
+
+      {:error, code, details} ->
+        {:error, code, details}
     end
   end
 
@@ -1585,13 +1587,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp managed_before_turn(state, _turn_context), do: {{:stop, :managed_mode_disabled}, state}
 
   defp managed_before_turn_requirements_decision(state, turn_context) do
-    with :ok <- managed_turn_requirements_current(state, turn_context) do
-      case managed_usage_block_reason(state.managed.data) do
-        nil -> managed_before_turn_decision(state.managed.data, turn_context)
-        reason -> {:stop, reason}
-      end
-    else
-      {:error, reason} -> {:stop, reason}
+    case managed_turn_requirements_current(state, turn_context) do
+      :ok ->
+        case managed_usage_block_reason(state.managed.data) do
+          nil -> managed_before_turn_decision(state.managed.data, turn_context)
+          reason -> {:stop, reason}
+        end
+
+      {:error, reason} ->
+        {:stop, reason}
     end
   end
 
